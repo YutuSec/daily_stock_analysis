@@ -125,6 +125,17 @@ def test_manager_accepts_zero_concentration_chip_distribution():
     assert flow_events[0]["node_id"] == flow_events[1]["node_id"]
 
 
+def test_manager_skips_etf_chip_providers_before_fetching():
+    fetcher = _ChipFetcher("ShouldNotRunFetcher", 0, None)
+    manager = DataFetcherManager(fetchers=[fetcher])
+
+    with patch("src.config.get_config", return_value=SimpleNamespace(enable_chip_distribution=True)):
+        chip = manager.get_chip_distribution("510300.SH")
+
+    assert chip is None
+    assert fetcher.calls == 0
+
+
 def test_manager_records_failed_chip_attempt_and_falls_back_to_next_fetcher():
     get_chip_circuit_breaker().reset()
     valid_chip = ChipDistribution(

@@ -888,25 +888,123 @@ def _has_meaningful_chip_data(chip_data: Any) -> bool:
     )
 
 
-def _mark_chip_structure_unavailable(result: "AnalysisResult", language: str) -> None:
-    if not result or not isinstance(result.dashboard, dict):
+def _chip_not_applicable_text(language: str) -> str:
+    return _localized_text(
+        language,
+        zh="指数/ETF不适用个股筹码分布指标，本项不参与数据质量或风险判断。",
+        en=(
+            "Stock-specific chip distribution is not applicable to an index/ETF; "
+            "this is not treated as missing or negative evidence."
+        ),
+        ko=(
+            "지수/ETF에는 개별 종목 칩 분포 지표가 적용되지 않으며 "
+            "결측 또는 부정적 근거로 처리하지 않습니다."
+        ),
+    )
+
+
+def _mark_chip_structure_unavailable(
+    result: "AnalysisResult",
+    language: str,
+    *,
+    not_applicable: bool = False,
+) -> None:
+    if not result:
         return
+    if not isinstance(getattr(result, "dashboard", None), dict):
+        result.dashboard = {}
     data_perspective = result.dashboard.get("data_perspective")
     if not isinstance(data_perspective, dict):
-        return
+        data_perspective = {}
+        result.dashboard["data_perspective"] = data_perspective
     data_perspective["chip_structure"] = {}
-    data_perspective["chip_unavailable_reason"] = get_chip_unavailable_text(language)
+    data_perspective["chip_applicability"] = "not_applicable" if not_applicable else "missing"
+    data_perspective["chip_unavailable_reason"] = (
+        _chip_not_applicable_text(language)
+        if not_applicable
+        else get_chip_unavailable_text(language)
+    )
 
 
-def normalize_chip_structure_availability(result: "AnalysisResult", chip_data: Any) -> None:
-    """Fill valid chip metrics or collapse placeholder-only chip fields to one fallback line."""
+def normalize_chip_structure_availability(
+    result: "AnalysisResult",
+    chip_data: Any,
+    *,
+    is_index_etf: bool = False,
+) -> None:
+    """Normalize chip evidence while distinguishing missing from not-applicable."""
     if not result:
         return
     language = getattr(result, "report_language", "zh")
+    if is_index_etf:
+        _mark_chip_structure_unavailable(result, language, not_applicable=True)
+        return
     if _has_meaningful_chip_data(chip_data):
         fill_chip_structure_if_needed(result, chip_data)
         return
-    _mark_chip_structure_unavailable(result, language)
+    _mark_chip_structure_unavailable(result, language, not_applicable=False)
+
+
+def normalize_index_etf_checklist(
+    result: "AnalysisResult",
+    *,
+    is_index_etf: bool = False,
+) -> None:
+    """Replace stock-only ETF checklist items without relying on item positions."""
+    if not result or not is_index_etf or not isinstance(result.dashboard, dict):
+        return
+    battle_plan = result.dashboard.get("battle_plan")
+    if not isinstance(battle_plan, dict):
+        return
+    checklist = battle_plan.get("action_checklist")
+    if not isinstance(checklist, list):
+        return
+
+    language = normalize_report_language(getattr(result, "report_language", "zh"))
+    normalized_items: List[str] = []
+    for item in checklist:
+        text = str(item or "").strip()
+        lowered = text.lower()
+        is_chip_item = "筹码" in text or "chip" in lowered
+        is_stock_valuation_item = bool(
+            "市盈率" in text
+            or "市净率" in text
+            or re.search(r"(?<![a-z])p/?[eb](?![a-z])", lowered)
+        )
+        if is_chip_item:
+            normalized_items.append(
+                _localized_text(
+                    language,
+                    zh="➖ ETF不适用个股筹码分布；本项改以成交额、换手率及流动性进行判断",
+                    en=(
+                        "➖ Stock-specific chip distribution is not applicable to ETFs; "
+                        "assess turnover and liquidity instead"
+                    ),
+                    ko=(
+                        "➖ ETF에는 개별 종목 칩 분포가 적용되지 않으며 "
+                        "거래대금·회전율·유동성으로 평가합니다"
+                    ),
+                )
+            )
+            continue
+        if is_stock_valuation_item:
+            normalized_items.append(
+                _localized_text(
+                    language,
+                    zh="➖ 个股PE/PB不适用于ETF；若无跟踪指数估值分位，本项不作负面判断",
+                    en=(
+                        "➖ Stock-level P/E and P/B are not applicable to ETFs; "
+                        "absence of index valuation data is not negative evidence"
+                    ),
+                    ko=(
+                        "➖ 개별 종목 PER/PBR은 ETF에 적용되지 않으며 "
+                        "지수 밸류에이션 부재를 부정적 근거로 보지 않습니다"
+                    ),
+                )
+            )
+            continue
+        normalized_items.append(text)
+    battle_plan["action_checklist"] = normalized_items
 
 
 def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> None:
@@ -1036,32 +1134,17 @@ def stabilize_decision_with_structure(
             default=getattr(result, "decision_type", "hold") or "hold",
         )
         decision_type = decision_type if decision_type in {"buy", "hold", "sell"} else "hold"
-        advice_decision_type = infer_decision_type_from_advice(
-            getattr(result, "operation_advice", ""),
-            default="",
-        )
-
         flow_bias, flow_reason = _capital_flow_bias_with_status(fundamental_context)
         if flow_bias == "unavailable":
             if isinstance(fundamental_context, dict) and "capital_flow" in fundamental_context:
-                if decision_type == "buy" or advice_decision_type == "buy":
-                    _downgrade_buy_without_capital_flow(
-                        result,
-                        language,
-                        current_price=current_price,
-                        support=support,
-                        resistance=resistance,
-                        flow_status=flow_reason,
-                    )
-                else:
-                    _set_decision_stability_unavailable(
-                        result,
-                        language,
-                        current_price=current_price,
-                        support=support,
-                        resistance=resistance,
-                        flow_status=flow_reason,
-                    )
+                _set_decision_stability_unavailable(
+                    result,
+                    language,
+                    current_price=current_price,
+                    support=support,
+                    resistance=resistance,
+                    flow_status=flow_reason,
+                )
             return
 
         if current_price is None:
@@ -3598,7 +3681,13 @@ class GeminiAnalyzer:
                 result.market_snapshot = self._build_market_snapshot(context)
                 result.model_used = model_used
                 result.report_language = report_language
-                normalize_chip_structure_availability(result, context.get("chip"))
+                is_index_etf = bool(context.get("is_index_etf", False))
+                normalize_chip_structure_availability(
+                    result,
+                    context.get("chip"),
+                    is_index_etf=is_index_etf,
+                )
+                normalize_index_etf_checklist(result, is_index_etf=is_index_etf)
 
                 # 内容完整性校验（可选）
                 if not config.report_integrity_enabled:
@@ -4100,6 +4189,10 @@ class GeminiAnalyzer:
 > - 严禁将基金公司的诉讼、声誉、高管变动纳入风险警报
 > - 业绩预期基于**指数成分股整体表现**，而非基金公司财报
 > - `risk_alerts` 中不得出现基金管理人相关的公司经营风险
+> - **个股筹码分布不适用于指数/ETF**。筹码为空时必须标记为“不适用/N/A”，不得描述为数据缺失风险，也不得因此降低评分或置信度
+> - **个股 PE/PB 不适用于 ETF**。优先分析跟踪指数整体估值或估值分位；未提供指数估值时不得将其视为负面证据
+> - ETF 的行动检查项不得把“筹码健康”作为必要条件，应以成交额、换手率、流动性、折溢价或跟踪表现等适用指标替代
+> - ETF 缺少个股 PE/PB、个股筹码或个股主力资金流时，不得仅因指标不适用而自动降低买入判断
 
 """
         prompt += f"""

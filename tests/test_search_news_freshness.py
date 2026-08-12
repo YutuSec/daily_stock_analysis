@@ -83,6 +83,81 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         kwargs = mock_search.call_args[1]
         self.assertEqual(kwargs["days"], 3)
 
+    def test_comprehensive_intel_falls_back_within_same_dimension(self) -> None:
+        fresh = datetime.now().date().isoformat()
+        service = SearchService(
+            searxng_public_instances_enabled=False,
+            news_max_age_days=3,
+            news_strategy_profile="short",
+        )
+        failed_search = MagicMock(
+            return_value=SearchResponse(
+                query="test",
+                results=[],
+                provider="FailProvider",
+                success=False,
+                error_message="429 Too Many Requests",
+            )
+        )
+        successful_search = MagicMock(
+            return_value=SearchResponse(
+                query="test",
+                results=[
+                    _result(
+                        "贵州茅台 600519 发布回购公告",
+                        fresh,
+                        snippet="贵州茅台披露最新股份回购公告。",
+                    )
+                ],
+                provider="SuccessProvider",
+                success=True,
+            )
+        )
+        service._providers = [
+            SimpleNamespace(name="FailProvider", is_available=True, search=failed_search),
+            SimpleNamespace(name="SuccessProvider", is_available=True, search=successful_search),
+        ]
+
+        with patch("src.search_service.time.sleep"):
+            intel = service.search_comprehensive_intel(
+                "600519",
+                "贵州茅台",
+                max_searches=1,
+            )
+
+        failed_search.assert_called_once()
+        successful_search.assert_called_once()
+        self.assertTrue(intel["latest_news"].success)
+        self.assertEqual(
+            [item.title for item in intel["latest_news"].results],
+            ["贵州茅台 600519 发布回购公告"],
+        )
+
+    def test_search_request_delay_env_is_validated_and_clamped(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "SEARCH_REQUEST_DELAY_MIN_SECONDS": "2.5",
+                "SEARCH_REQUEST_DELAY_MAX_SECONDS": "invalid",
+            },
+        ):
+            service = SearchService(searxng_public_instances_enabled=False)
+
+        self.assertEqual(service.search_request_delay_min, 2.5)
+        self.assertEqual(service.search_request_delay_max, 3.0)
+
+        with patch.dict(
+            "os.environ",
+            {
+                "SEARCH_REQUEST_DELAY_MIN_SECONDS": "4.0",
+                "SEARCH_REQUEST_DELAY_MAX_SECONDS": "1.0",
+            },
+        ):
+            clamped = SearchService(searxng_public_instances_enabled=False)
+
+        self.assertEqual(clamped.search_request_delay_min, 4.0)
+        self.assertEqual(clamped.search_request_delay_max, 4.0)
+
     def test_invalid_profile_falls_back_to_short(self) -> None:
         """Invalid profile should fallback to short (3 days)."""
         service, mock_search = self._create_service_with_mock_provider(

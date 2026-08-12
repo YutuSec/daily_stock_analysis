@@ -21,6 +21,7 @@ from src.analyzer import (
     AnalysisResult,
     fill_chip_structure_if_needed,
     normalize_chip_structure_availability,
+    normalize_index_etf_checklist,
     _is_value_placeholder,
     _derive_chip_health,
     _build_chip_structure_from_data,
@@ -286,7 +287,39 @@ class TestFillChipStructureIfNeeded(unittest.TestCase):
 
         dp = result.dashboard["data_perspective"]
         self.assertEqual(dp["chip_structure"], {})
+        self.assertEqual(dp["chip_applicability"], "missing")
         self.assertEqual(dp["chip_unavailable_reason"], "筹码分布未启用或数据源暂不可用，未纳入筹码判断。")
+
+    def test_normalize_marks_etf_chip_evidence_not_applicable(self) -> None:
+        result = self._make_result(dashboard={})
+
+        normalize_chip_structure_availability(result, None, is_index_etf=True)
+
+        dp = result.dashboard["data_perspective"]
+        self.assertEqual(dp["chip_structure"], {})
+        self.assertEqual(dp["chip_applicability"], "not_applicable")
+        self.assertIn("不适用", dp["chip_unavailable_reason"])
+        self.assertNotIn("缺失", dp["chip_unavailable_reason"])
+
+    def test_normalize_index_etf_checklist_replaces_only_stock_specific_items(self) -> None:
+        result = self._make_result(
+            dashboard={
+                "battle_plan": {
+                    "action_checklist": [
+                        "⚠️ 检查项5：筹码健康",
+                        "⚠️ 检查项6：市盈率/市净率数据缺失",
+                        "✅ 检查项7：跟踪误差可控",
+                    ]
+                }
+            }
+        )
+
+        normalize_index_etf_checklist(result, is_index_etf=True)
+
+        checklist = result.dashboard["battle_plan"]["action_checklist"]
+        self.assertIn("ETF不适用个股筹码分布", checklist[0])
+        self.assertIn("个股PE/PB不适用于ETF", checklist[1])
+        self.assertEqual(checklist[2], "✅ 检查项7：跟踪误差可控")
 
     def test_normalize_treats_zero_chip_metrics_as_unavailable(self) -> None:
         result = self._make_result(

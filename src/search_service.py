@@ -33,6 +33,7 @@ from tenacity import (
     retry_if_exception_type,
     before_sleep_log,
 )
+from src.config import parse_env_float
 
 from data_provider.us_index_mapping import is_us_index_code
 from src.config import (
@@ -2131,6 +2132,7 @@ class SearchService:
     FUTURE_TOLERANCE_DAYS = 1
     ANALYTICAL_INTEL_LOOKBACK_DAYS = 180
     ANALYTICAL_INTEL_DIMENSIONS = {"market_analysis", "earnings"}
+    COMPREHENSIVE_INTEL_PROVIDER_ATTEMPTS = 3
     _CHINESE_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
     _US_STOCK_RE = re.compile(r"^[A-Za-z]{1,5}(\.[A-Za-z])?$")
     _DIRECT_NEWS_CATEGORY = "direct_company_news"
@@ -2286,28 +2288,40 @@ class SearchService:
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
         self._providers: List[BaseSearchProvider] = []
-        self.search_request_delay_min = float(
-        os.getenv("SEARCH_REQUEST_DELAY_MIN_SECONDS", "1.5")
-    )
-    self.search_request_delay_max = float(
-        os.getenv("SEARCH_REQUEST_DELAY_MAX_SECONDS", "3.0")
-    )
-    self.news_max_age_days = max(1, news_max_age_days)
-    raw_profile = (news_strategy_profile or "short").strip().lower()
-    self.news_strategy_profile = normalize_news_strategy_profile(news_strategy_profile)
-    if raw_profile != self.news_strategy_profile:
-        logger.warning(
-            "NEWS_STRATEGY_PROFILE '%s' 无效，已回退为 'short'",
-            news_strategy_profile,
+        self.search_request_delay_min = parse_env_float(
+            os.getenv("SEARCH_REQUEST_DELAY_MIN_SECONDS"),
+            1.5,
+            field_name="SEARCH_REQUEST_DELAY_MIN_SECONDS",
+            minimum=0.0,
         )
-    self.news_window_days = resolve_news_window_days(
-        news_max_age_days=self.news_max_age_days,
-        news_strategy_profile=self.news_strategy_profile,
-    )
-    self.news_profile_days = NEWS_STRATEGY_WINDOWS.get(
-        self.news_strategy_profile,
-        NEWS_STRATEGY_WINDOWS["short"],
-    )
+        self.search_request_delay_max = parse_env_float(
+            os.getenv("SEARCH_REQUEST_DELAY_MAX_SECONDS"),
+            3.0,
+            field_name="SEARCH_REQUEST_DELAY_MAX_SECONDS",
+            minimum=0.0,
+        )
+        if self.search_request_delay_max < self.search_request_delay_min:
+            logger.warning(
+                "SEARCH_REQUEST_DELAY_MAX_SECONDS 小于最小值，已钳制为 %.2f",
+                self.search_request_delay_min,
+            )
+            self.search_request_delay_max = self.search_request_delay_min
+        self.news_max_age_days = max(1, news_max_age_days)
+        raw_profile = (news_strategy_profile or "short").strip().lower()
+        self.news_strategy_profile = normalize_news_strategy_profile(news_strategy_profile)
+        if raw_profile != self.news_strategy_profile:
+            logger.warning(
+                "NEWS_STRATEGY_PROFILE '%s' 无效，已回退为 'short'",
+                news_strategy_profile,
+            )
+        self.news_window_days = resolve_news_window_days(
+            news_max_age_days=self.news_max_age_days,
+            news_strategy_profile=self.news_strategy_profile,
+        )
+        self.news_profile_days = NEWS_STRATEGY_WINDOWS.get(
+            self.news_strategy_profile,
+            NEWS_STRATEGY_WINDOWS["short"],
+        )
 
         # 初始化搜索引擎（按优先级排序）
         # 1. Bocha 优先（中文搜索优化，AI摘要）
@@ -4086,13 +4100,17 @@ class SearchService:
             if search_count >= max_searches:
                 break
             
-            # 选择搜索引擎（轮流使用）
+            # 每个维度保留轮转起点；首选无有效结果时在同一维度内降级。
             available_providers = [p for p in self._providers if p.is_available]
             if not available_providers:
                 break
-            
-            provider = available_providers[provider_index % len(available_providers)]
+
+            start_index = provider_index % len(available_providers)
             provider_index += 1
+            ordered_providers = (
+                available_providers[start_index:]
+                + available_providers[:start_index]
+            )[:self.COMPREHENSIVE_INTEL_PROVIDER_ATTEMPTS]
             
             request_days = (
                 self.ANALYTICAL_INTEL_LOOKBACK_DAYS
@@ -4100,75 +4118,112 @@ class SearchService:
                 else search_days
             )
 
-            logger.info(
-                "[情报搜索] %s: 使用 %s，请求窗口: 近%s天",
-                dim['desc'],
-                provider.name,
-                request_days,
-            )
+            selected_response: Optional[SearchResponse] = None
+            last_filtered_response: Optional[SearchResponse] = None
+            last_error: Optional[str] = None
 
-            if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=request_days,
-                    topic=dim['tavily_topic'],
-                )
-            else:
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=request_days,
-                )
-            if dim['strict_freshness']:
-                filtered_response = self._filter_news_response(
-                    response,
-                    search_days=search_days,
-                    max_results=provider_max_results,
-                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
-                )
-            elif dim['name'] in self.ANALYTICAL_INTEL_DIMENSIONS:
-                filtered_response = self._filter_news_response(
-                    response,
-                    search_days=self.ANALYTICAL_INTEL_LOOKBACK_DAYS,
-                    max_results=provider_max_results,
-                    keep_unknown=True,
-                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
-                )
-            else:
-                filtered_response = self._normalize_and_limit_response(
-                    response,
-                    max_results=provider_max_results,
-                )
-            filtered_response = self._rank_news_response(
-                filtered_response,
-                stock_code=stock_code,
-                stock_name=stock_name,
-                prefer_chinese=self._should_prefer_chinese_news(stock_code, stock_name),
-                max_results=provider_max_results,
-                log_scope=f"{stock_code}:{provider.name}:{dim['name']}:rank",
-            )
-            filtered_response = self._filter_ranked_news_for_context(
-                filtered_response,
-                log_scope=f"{stock_code}:{provider.name}:{dim['name']}:admission",
-            )
-            filtered_response = self._limit_search_response(
-                filtered_response,
-                max_results=target_per_dimension,
-            )
-            results[dim['name']] = filtered_response
-            search_count += 1
-            
-            if response.success:
+            for attempt_index, provider in enumerate(ordered_providers, start=1):
                 logger.info(
-                    "[情报搜索] %s: 原始=%s条, 过滤后=%s条",
+                    "[情报搜索] %s: 尝试 %s (%s/%s)，请求窗口: 近%s天",
                     dim['desc'],
-                    len(response.results),
-                    len(filtered_response.results),
+                    provider.name,
+                    attempt_index,
+                    len(ordered_providers),
+                    request_days,
                 )
-            else:
-                logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
-            
+                try:
+                    if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
+                        response = provider.search(
+                            dim['query'],
+                            max_results=provider_max_results,
+                            days=request_days,
+                            topic=dim['tavily_topic'],
+                        )
+                    else:
+                        response = provider.search(
+                            dim['query'],
+                            max_results=provider_max_results,
+                            days=request_days,
+                        )
+                except Exception as exc:
+                    last_error = str(exc)
+                    logger.warning(
+                        "[情报搜索] %s: %s 异常: %s，切换下一数据源",
+                        dim['desc'],
+                        provider.name,
+                        exc,
+                    )
+                    continue
+
+                if dim['strict_freshness']:
+                    filtered_response = self._filter_news_response(
+                        response,
+                        search_days=search_days,
+                        max_results=provider_max_results,
+                        log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
+                    )
+                elif dim['name'] in self.ANALYTICAL_INTEL_DIMENSIONS:
+                    filtered_response = self._filter_news_response(
+                        response,
+                        search_days=self.ANALYTICAL_INTEL_LOOKBACK_DAYS,
+                        max_results=provider_max_results,
+                        keep_unknown=True,
+                        log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
+                    )
+                else:
+                    filtered_response = self._normalize_and_limit_response(
+                        response,
+                        max_results=provider_max_results,
+                    )
+                filtered_response = self._rank_news_response(
+                    filtered_response,
+                    stock_code=stock_code,
+                    stock_name=stock_name,
+                    prefer_chinese=self._should_prefer_chinese_news(stock_code, stock_name),
+                    max_results=provider_max_results,
+                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}:rank",
+                )
+                filtered_response = self._filter_ranked_news_for_context(
+                    filtered_response,
+                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}:admission",
+                )
+                filtered_response = self._limit_search_response(
+                    filtered_response,
+                    max_results=target_per_dimension,
+                )
+                last_filtered_response = filtered_response
+
+                if filtered_response.success and filtered_response.results:
+                    selected_response = filtered_response
+                    logger.info(
+                        "[情报搜索] %s: %s 成功，原始=%s条，过滤后=%s条",
+                        dim['desc'],
+                        provider.name,
+                        len(response.results or []),
+                        len(filtered_response.results or []),
+                    )
+                    break
+
+                last_error = response.error_message or "搜索成功但过滤后无有效结果"
+                logger.warning(
+                    "[情报搜索] %s: %s 未获得有效结果: %s，切换下一数据源",
+                    dim['desc'],
+                    provider.name,
+                    last_error,
+                )
+
+            if selected_response is None:
+                selected_response = last_filtered_response or SearchResponse(
+                    query=dim['query'],
+                    results=[],
+                    provider="None",
+                    success=False,
+                    error_message=last_error or "当前维度所有搜索数据源均失败",
+                )
+
+            results[dim['name']] = selected_response
+            search_count += 1
+
             # 短暂延迟避免请求过快
             # 随机延迟，避免搜索服务请求过快
             delay = random.uniform(

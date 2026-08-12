@@ -2143,6 +2143,13 @@ class DataFetcherManager:
             logger.debug(f"[筹码分布] 功能已禁用，跳过 {stock_code}")
             return None
 
+        if _is_etf_code(stock_code):
+            logger.info(
+                "[筹码分布] %s 为 ETF，个股筹码分布指标不适用，跳过数据源请求",
+                stock_code,
+            )
+            return None
+
         circuit_breaker = get_chip_circuit_breaker()
 
         candidate_fetchers = []
@@ -3676,6 +3683,10 @@ class DataFetcherManager:
             top: List[Dict] = []
             bottom: List[Dict] = []
             for fetcher in self._get_fetchers_snapshot():
+                fetcher_method = getattr(type(fetcher), "get_concept_rankings", None)
+                if fetcher_method is BaseFetcher.get_concept_rankings:
+                    logger.debug("[概念排行] %s 未实现概念排行能力，跳过", fetcher.name)
+                    continue
                 try:
                     data = fetcher.get_concept_rankings(normalized_n)
                     if data and (data[0] or data[1]):

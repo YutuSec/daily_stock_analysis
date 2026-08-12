@@ -33,6 +33,7 @@ from src.analyzer import (
     AnalysisResult,
     fill_price_position_if_needed,
     normalize_chip_structure_availability,
+    normalize_index_etf_checklist,
     populate_decision_action_fields,
     stabilize_decision_with_structure,
 )
@@ -761,7 +762,13 @@ class StockAnalysisPipeline:
 
             # Step 7.6: chip_structure fallback (Issue #589) and unavailable collapse
             if result:
-                normalize_chip_structure_availability(result, chip_data)
+                is_index_etf = bool(enhanced_context.get("is_index_etf", False))
+                normalize_chip_structure_availability(
+                    result,
+                    chip_data,
+                    is_index_etf=is_index_etf,
+                )
+                normalize_index_etf_checklist(result, is_index_etf=is_index_etf)
 
             # Step 7.7: price_position fallback
             if result:
@@ -1306,12 +1313,14 @@ class StockAnalysisPipeline:
             executor = build_agent_executor(self.config, requested_skills)
 
             # Build initial context to avoid redundant tool calls
+            is_index_etf = SearchService.is_index_or_etf(code, stock_name)
             initial_context = {
                 "stock_code": code,
                 "stock_name": stock_name,
                 "report_type": report_type.value,
                 "report_language": report_language,
                 "fundamental_context": fundamental_context,
+                "is_index_etf": is_index_etf if isinstance(is_index_etf, bool) else False,
             }
             if isinstance(portfolio_context, dict):
                 initial_context["portfolio_context"] = dict(portfolio_context)
@@ -1456,8 +1465,14 @@ class StockAnalysisPipeline:
                         missing,
                     )
             # chip_structure fallback (Issue #589), before save_analysis_history
-            if result and chip_data is not None:
-                normalize_chip_structure_availability(result, chip_data)
+            is_index_etf = bool(initial_context.get("is_index_etf", False))
+            if result and (chip_data is not None or is_index_etf):
+                normalize_chip_structure_availability(
+                    result,
+                    chip_data,
+                    is_index_etf=is_index_etf,
+                )
+                normalize_index_etf_checklist(result, is_index_etf=is_index_etf)
 
             # price_position fallback (same as non-agent path Step 7.7)
             if result:

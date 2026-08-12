@@ -7,8 +7,10 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
 
+import pandas as pd
+
 from api.v1.schemas.history import ReportDetails
-from data_provider.base import DataFetcherManager
+from data_provider.base import BaseFetcher, DataFetcherManager
 from src.core.pipeline import StockAnalysisPipeline
 from src.services.market_hotspot_service import MarketHotspotService
 from src.services.market_structure_service import MarketStructureService
@@ -47,6 +49,25 @@ class _HangingConceptRankingFetcher:
             [{"name": f"top-{n}", "change_pct": 1.0}],
             [{"name": f"bottom-{n}", "change_pct": -1.0}],
         )
+
+
+class _NoConceptRankingFetcher(BaseFetcher):
+    name = "NoConceptRankingFetcher"
+    priority = 0
+
+    def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        return pd.DataFrame()
+
+    def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        return df
+
+
+class _ConceptRankingFetcher:
+    name = "ConceptRankingFetcher"
+    priority = 1
+
+    def get_concept_rankings(self, n: int = 5):
+        return ([{"name": "机器人概念"}], [{"name": "转基因"}])
 
 
 class PipelineRelatedBoardsTestCase(unittest.TestCase):
@@ -218,6 +239,16 @@ class PipelineRelatedBoardsTestCase(unittest.TestCase):
 
         self.assertEqual(fetcher.calls, 1)
         self.assertEqual(fresh_result[0][0]["name"], "top-5")
+
+    def test_concept_rankings_skips_fetchers_with_only_base_noop(self) -> None:
+        manager = DataFetcherManager(
+            fetchers=[_NoConceptRankingFetcher(), _ConceptRankingFetcher()]
+        )
+
+        top, bottom = manager.get_concept_rankings(5)
+
+        self.assertEqual(top, [{"name": "机器人概念"}])
+        self.assertEqual(bottom, [{"name": "转基因"}])
 
     def test_extract_board_details_exposes_concept_rankings(self) -> None:
         snapshot = {
