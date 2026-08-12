@@ -13,6 +13,8 @@ A股自选股智能分析系统 - 搜索服务模块
 
 import logging
 import re
+import os
+import random
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -2284,6 +2286,13 @@ class SearchService:
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
         self._providers: List[BaseSearchProvider] = []
+        self.search_request_delay_min = float(
+        os.getenv("SEARCH_REQUEST_DELAY_MIN_SECONDS", "1.5")
+    )
+    self.search_request_delay_max = float(
+        os.getenv("SEARCH_REQUEST_DELAY_MAX_SECONDS", "3.0")
+    )
+    self.news_max_age_days = max(1, news_max_age_days)
         self.news_max_age_days = max(1, news_max_age_days)
         raw_profile = (news_strategy_profile or "short").strip().lower()
         self.news_strategy_profile = normalize_news_strategy_profile(news_strategy_profile)
@@ -4162,7 +4171,13 @@ class SearchService:
                 logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
             
             # 短暂延迟避免请求过快
-            time.sleep(0.5)
+            # 随机延迟，避免搜索服务请求过快
+            delay = random.uniform(
+                self.search_request_delay_min,
+                self.search_request_delay_max,
+            )
+            logger.debug("[情报搜索] 请求间隔 %.2fs", delay)
+            time.sleep(delay)
         
         return results
     
