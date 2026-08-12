@@ -2293,22 +2293,21 @@ class SearchService:
         os.getenv("SEARCH_REQUEST_DELAY_MAX_SECONDS", "3.0")
     )
     self.news_max_age_days = max(1, news_max_age_days)
-        self.news_max_age_days = max(1, news_max_age_days)
-        raw_profile = (news_strategy_profile or "short").strip().lower()
-        self.news_strategy_profile = normalize_news_strategy_profile(news_strategy_profile)
-        if raw_profile != self.news_strategy_profile:
-            logger.warning(
-                "NEWS_STRATEGY_PROFILE '%s' 无效，已回退为 'short'",
-                news_strategy_profile,
-            )
-        self.news_window_days = resolve_news_window_days(
-            news_max_age_days=self.news_max_age_days,
-            news_strategy_profile=self.news_strategy_profile,
+    raw_profile = (news_strategy_profile or "short").strip().lower()
+    self.news_strategy_profile = normalize_news_strategy_profile(news_strategy_profile)
+    if raw_profile != self.news_strategy_profile:
+        logger.warning(
+            "NEWS_STRATEGY_PROFILE '%s' 无效，已回退为 'short'",
+            news_strategy_profile,
         )
-        self.news_profile_days = NEWS_STRATEGY_WINDOWS.get(
-            self.news_strategy_profile,
-            NEWS_STRATEGY_WINDOWS["short"],
-        )
+    self.news_window_days = resolve_news_window_days(
+        news_max_age_days=self.news_max_age_days,
+        news_strategy_profile=self.news_strategy_profile,
+    )
+    self.news_profile_days = NEWS_STRATEGY_WINDOWS.get(
+        self.news_strategy_profile,
+        NEWS_STRATEGY_WINDOWS["short"],
+    )
 
         # 初始化搜索引擎（按优先级排序）
         # 1. Bocha 优先（中文搜索优化，AI摘要）
