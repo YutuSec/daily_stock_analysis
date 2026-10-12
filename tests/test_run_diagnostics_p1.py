@@ -156,7 +156,7 @@ class RunDiagnosticsP1TestCase(unittest.TestCase):
             trigger_source="api",
         )
         try:
-            df, source = manager.get_daily_data("600519")
+            df, source = manager.get_daily_data("600519", end_date="2026-05-22")
             snapshot = current_diagnostic_snapshot()
         finally:
             reset_run_diagnostic_context(token)

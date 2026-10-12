@@ -103,7 +103,13 @@ def classify_litellm_generation_param_error(
                 reason="temperature_unsupported",
             )
 
-    for param in ("top_p", "presence_penalty", "frequency_penalty", "seed"):
+    for param in (
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "seed",
+        "response_format",
+    ):
         if param in text and any(marker in text for marker in _UNSUPPORTED_PARAM_MARKERS):
             return GenerationParamRecovery(
                 omit_params=(param,),

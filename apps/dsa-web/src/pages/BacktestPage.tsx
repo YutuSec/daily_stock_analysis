@@ -2,6 +2,7 @@ import type React from 'react';
 import { useState, useEffect, useCallback } from 'react';
 import { Check, Minus, X } from 'lucide-react';
 import { backtestApi } from '../api/backtest';
+import { analysisApi } from '../api/analysis';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
 import { ApiErrorAlert, Card, Badge, EmptyState, Pagination, StatusDot, Tooltip } from '../components/common';
@@ -10,6 +11,7 @@ import { formatUiText, type UiLanguage } from '../i18n/uiText';
 import {
   BACKTEST_DIRECTION_EXPECTED_LABELS,
   BACKTEST_MOVEMENT_LABELS,
+  BACKTEST_MODEL_TEXT,
   BACKTEST_OUTCOME_LABELS,
   BACKTEST_PHASE_FILTER_OPTIONS,
   BACKTEST_PHASE_LABELS,
@@ -190,6 +192,12 @@ const PerformanceCard: React.FC<{ metrics: PerformanceMetrics; title: string; la
         <span className="label-uppercase">{title}</span>
       </div>
       <MetricRow label={text.directionAccuracy} value={pct(metrics.directionAccuracyPct)} accent />
+      {metrics.holdingApplicableCount != null && metrics.holdingApplicableCount > 0 ? (
+        <>
+          <MetricRow label={language === 'zh' ? '持仓决策准确率' : 'Holding decision accuracy'} value={pct(metrics.holdingDecisionAccuracyPct)} accent />
+          <MetricRow label={language === 'zh' ? '持仓决策模拟收益' : 'Holding decision return'} value={pct(metrics.avgHoldingDecisionReturnPct)} />
+        </>
+      ) : null}
       <MetricRow label={text.winRate} value={pct(metrics.winRatePct)} accent />
       <MetricRow label={text.avgSimulatedReturn} value={pct(metrics.avgSimulatedReturnPct)} />
       <MetricRow label={text.avgStockReturn} value={pct(metrics.avgStockReturnPct)} />
@@ -246,6 +254,7 @@ const RunSummary: React.FC<{ data: BacktestRunResponse; language: UiLanguage }> 
 const BacktestPage: React.FC = () => {
   const { language, t } = useUiLanguage();
   const text = BACKTEST_TEXT[language];
+  const modelText = BACKTEST_MODEL_TEXT[language];
   const phaseFilterOptions = BACKTEST_PHASE_FILTER_OPTIONS[language];
   const actionLabels = buildDecisionActionLabelMap(t);
 
@@ -259,6 +268,8 @@ const BacktestPage: React.FC = () => {
   const [analysisDateFrom, setAnalysisDateFrom] = useState('');
   const [analysisDateTo, setAnalysisDateTo] = useState('');
   const [phaseFilter, setPhaseFilter] = useState<BacktestPhaseFilter>('all');
+  const [modelFilter, setModelFilter] = useState('all');
+  const [analysisModels, setAnalysisModels] = useState<string[]>([]);
   const [evalDays, setEvalDays] = useState('');
   const [forceRerun, setForceRerun] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
@@ -277,6 +288,7 @@ const BacktestPage: React.FC = () => {
   const [overallPerf, setOverallPerf] = useState<PerformanceMetrics | null>(null);
   const [stockPerf, setStockPerf] = useState<PerformanceMetrics | null>(null);
   const [isLoadingPerf, setIsLoadingPerf] = useState(false);
+  const [comparisonPerf, setComparisonPerf] = useState<PerformanceMetrics[]>([]);
   const effectiveWindowDays = parseEvalWindowDays(evalDays) ?? overallPerf?.evalWindowDays;
   const isNextDayValidation = effectiveWindowDays === 1;
   const showNextDayActualColumns = isNextDayValidation;
@@ -289,6 +301,7 @@ const BacktestPage: React.FC = () => {
     startDate?: string,
     endDate?: string,
     phase?: BacktestPhaseFilter,
+    model?: string,
   ) => {
     setIsLoadingResults(true);
     try {
@@ -298,6 +311,7 @@ const BacktestPage: React.FC = () => {
         analysisDateFrom: startDate || undefined,
         analysisDateTo: endDate || undefined,
         analysisPhase: phase && phase !== 'all' ? phase : undefined,
+        ...(model && model !== 'all' ? { modelUsed: model } : {}),
         page,
         limit: pageSize,
       });
@@ -320,6 +334,7 @@ const BacktestPage: React.FC = () => {
     startDate?: string,
     endDate?: string,
     phase?: BacktestPhaseFilter,
+    model?: string,
   ) => {
     setIsLoadingPerf(true);
     try {
@@ -328,6 +343,7 @@ const BacktestPage: React.FC = () => {
         analysisDateFrom: startDate || undefined,
         analysisDateTo: endDate || undefined,
         analysisPhase: phase && phase !== 'all' ? phase : undefined,
+        ...(model && model !== 'all' ? { modelUsed: model } : {}),
       });
       setOverallPerf(overall);
 
@@ -337,6 +353,7 @@ const BacktestPage: React.FC = () => {
           analysisDateFrom: startDate || undefined,
           analysisDateTo: endDate || undefined,
           analysisPhase: phase && phase !== 'all' ? phase : undefined,
+          ...(model && model !== 'all' ? { modelUsed: model } : {}),
         });
         setStockPerf(stock);
       } else {
@@ -351,9 +368,52 @@ const BacktestPage: React.FC = () => {
     }
   }, []);
 
+  const fetchModelComparison = useCallback(async (
+    models: string[],
+    code?: string,
+    windowDays?: number,
+    startDate?: string,
+    endDate?: string,
+    phase?: BacktestPhaseFilter,
+  ) => {
+    if (models.length === 0) {
+      setComparisonPerf([]);
+      return;
+    }
+    try {
+      const settled = await Promise.allSettled(models.map((model) => (
+        code
+          ? backtestApi.getStockPerformance(code, {
+              evalWindowDays: windowDays,
+              analysisDateFrom: startDate || undefined,
+              analysisDateTo: endDate || undefined,
+              analysisPhase: phase && phase !== 'all' ? phase : undefined,
+              modelUsed: model,
+            })
+          : backtestApi.getOverallPerformance({
+              evalWindowDays: windowDays,
+              analysisDateFrom: startDate || undefined,
+              analysisDateTo: endDate || undefined,
+              analysisPhase: phase && phase !== 'all' ? phase : undefined,
+              modelUsed: model,
+            })
+      )));
+      const metrics = settled.flatMap((result) => (
+        result.status === 'fulfilled' && result.value ? [result.value] : []
+      ));
+      setComparisonPerf(metrics);
+    } catch (err) {
+      console.error('Failed to fetch model comparison:', err);
+      setComparisonPerf([]);
+    }
+  }, []);
+
   // Initial load — fetch performance first, then filter results by its window
   useEffect(() => {
     const init = async () => {
+      const modelResponse = await analysisApi.getModels().catch(() => null);
+      const models = modelResponse?.models.map((item) => item.model) ?? [];
+      setAnalysisModels(models);
       // Get latest performance (unfiltered returns most recent summary)
       const overall = await backtestApi.getOverallPerformance();
       setOverallPerf(overall);
@@ -362,7 +422,8 @@ const BacktestPage: React.FC = () => {
       if (windowDays && !evalDays) {
         setEvalDays(String(windowDays));
       }
-      fetchResults(1, undefined, windowDays, undefined, undefined, 'all');
+      fetchResults(1, undefined, windowDays, undefined, undefined, 'all', 'all');
+      void fetchModelComparison(models, undefined, windowDays, undefined, undefined, 'all');
     };
     init();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -384,6 +445,7 @@ const BacktestPage: React.FC = () => {
         evalWindowDays: requestedEvalWindowDays,
         analysisDateFrom: dateFrom,
         analysisDateTo: dateTo,
+        ...(modelFilter !== 'all' ? { modelUsed: modelFilter } : {}),
       });
       setRunResult(response);
       const effectiveEvalWindowDays =
@@ -395,8 +457,9 @@ const BacktestPage: React.FC = () => {
         setEvalDays(String(effectiveEvalWindowDays));
       }
       // Refresh data with same eval_window_days
-      fetchResults(1, code, effectiveEvalWindowDays, dateFrom, dateTo, phaseFilter);
-      fetchPerformance(code, effectiveEvalWindowDays, dateFrom, dateTo, phaseFilter);
+      fetchResults(1, code, effectiveEvalWindowDays, dateFrom, dateTo, phaseFilter, modelFilter);
+      fetchPerformance(code, effectiveEvalWindowDays, dateFrom, dateTo, phaseFilter, modelFilter);
+      void fetchModelComparison(analysisModels, code, effectiveEvalWindowDays, dateFrom, dateTo, phaseFilter);
     } catch (err) {
       setRunError(getParsedApiError(err));
     } finally {
@@ -409,8 +472,18 @@ const BacktestPage: React.FC = () => {
     const code = normalizeBacktestCode(codeFilter);
     const windowDays = parseEvalWindowDays(evalDays);
     setCurrentPage(1);
-    fetchResults(1, code, windowDays, analysisDateFrom, analysisDateTo, phaseFilter);
-    fetchPerformance(code, windowDays, analysisDateFrom, analysisDateTo, phaseFilter);
+    fetchResults(1, code, windowDays, analysisDateFrom, analysisDateTo, phaseFilter, modelFilter);
+    fetchPerformance(code, windowDays, analysisDateFrom, analysisDateTo, phaseFilter, modelFilter);
+    void fetchModelComparison(analysisModels, code, windowDays, analysisDateFrom, analysisDateTo, phaseFilter);
+  };
+
+  const handleModelFilterChange = (nextModel: string) => {
+    setModelFilter(nextModel);
+    setCurrentPage(1);
+    const code = normalizeBacktestCode(codeFilter);
+    const windowDays = parseEvalWindowDays(evalDays);
+    fetchResults(1, code, windowDays, analysisDateFrom, analysisDateTo, phaseFilter, nextModel);
+    fetchPerformance(code, windowDays, analysisDateFrom, analysisDateTo, phaseFilter, nextModel);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -423,15 +496,16 @@ const BacktestPage: React.FC = () => {
     const code = normalizeBacktestCode(codeFilter);
     setEvalDays('1');
     setCurrentPage(1);
-    fetchResults(1, code, 1, analysisDateFrom, analysisDateTo, phaseFilter);
-    fetchPerformance(code, 1, analysisDateFrom, analysisDateTo, phaseFilter);
+    fetchResults(1, code, 1, analysisDateFrom, analysisDateTo, phaseFilter, modelFilter);
+    fetchPerformance(code, 1, analysisDateFrom, analysisDateTo, phaseFilter, modelFilter);
+    void fetchModelComparison(analysisModels, code, 1, analysisDateFrom, analysisDateTo, phaseFilter);
   };
 
   // Pagination
   const totalPages = Math.ceil(totalResults / pageSize);
   const handlePageChange = (page: number) => {
     const windowDays = parseEvalWindowDays(evalDays);
-    fetchResults(page, normalizeBacktestCode(codeFilter), windowDays, analysisDateFrom, analysisDateTo, phaseFilter);
+    fetchResults(page, normalizeBacktestCode(codeFilter), windowDays, analysisDateFrom, analysisDateTo, phaseFilter, modelFilter);
   };
 
   return (
@@ -484,6 +558,23 @@ const BacktestPage: React.FC = () => {
               ))}
             </select>
           </div>
+          {analysisModels.length > 0 ? (
+            <div className="flex items-center gap-2 whitespace-nowrap">
+              <span className="text-xs text-muted-text">{modelText.model}</span>
+              <select
+                aria-label={modelText.model}
+                value={modelFilter}
+                onChange={(event) => handleModelFilterChange(event.target.value)}
+                disabled={isRunning}
+                className={`${BACKTEST_COMPACT_INPUT_CLASS} w-40`}
+              >
+                <option value="all">{modelText.allModels}</option>
+                {analysisModels.map((model) => (
+                  <option key={model} value={model}>{model}</option>
+                ))}
+              </select>
+            </div>
+          ) : null}
           <div className="flex items-center gap-2 whitespace-nowrap">
             <span className="text-xs text-muted-text">{text.startDate}</span>
             <input
@@ -560,6 +651,30 @@ const BacktestPage: React.FC = () => {
         </p>
       </header>
 
+      {analysisModels.length > 0 ? (
+        <section className="grid max-h-[18rem] flex-shrink-0 gap-3 overflow-y-auto border-b border-white/5 px-3 py-3 md:grid-cols-2 xl:grid-cols-3 sm:px-4">
+          {analysisModels.map((model) => {
+            const metrics = comparisonPerf.find((item) => item.modelUsed === model);
+            return metrics ? (
+              <Card key={model} variant="gradient" padding="md">
+                <span className="label-uppercase">{modelText.modelComparison}: {model}</span>
+                <div className="mt-3 grid grid-cols-2 gap-3 text-xs xl:grid-cols-4">
+                  <span className="text-muted-text">{modelText.accuracy} <strong className="block text-sm text-foreground">{pct(metrics.directionAccuracyPct)}</strong></span>
+                  <span className="text-muted-text">{language === 'zh' ? '持仓决策' : 'Holding decision'} <strong className="block text-sm text-foreground">{pct(metrics.holdingDecisionAccuracyPct)}</strong></span>
+                  <span className="text-muted-text">{modelText.winRate} <strong className="block text-sm text-foreground">{pct(metrics.winRatePct)}</strong></span>
+                  <span className="text-muted-text">{modelText.simulatedReturn} <strong className="block text-sm text-foreground">{pct(metrics.avgSimulatedReturnPct)}</strong></span>
+                </div>
+              </Card>
+            ) : (
+              <Card key={model} variant="gradient" padding="md">
+                <span className="label-uppercase">{modelText.modelComparison}: {model}</span>
+                <p className="mt-3 text-xs text-muted-text">{modelText.noModelMetrics}</p>
+              </Card>
+            );
+          })}
+        </section>
+      ) : null}
+
       {/* Main content */}
       <main className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-3 lg:flex-row">
         {/* Left sidebar - Performance */}
@@ -613,6 +728,7 @@ const BacktestPage: React.FC = () => {
                     {codeFilter.trim() ? formatUiText(text.filteredStock, { code: codeFilter.trim() }) : text.allStocks}
                     {evalDays ? ` · ${formatUiText(text.dayWindow, { days: evalDays })}` : ''}
                     {phaseFilter !== 'all' ? ` · ${phaseFilterOptions.find((item) => item.value === phaseFilter)?.label ?? phaseFilter}` : ''}
+                    {modelFilter !== 'all' ? ` · ${modelFilter}` : ''}
                     {analysisDateFrom ? ` · ${formatUiText(text.fromDate, { date: analysisDateFrom })}` : ''}
                     {analysisDateTo ? ` · ${formatUiText(text.toDate, { date: analysisDateTo })}` : ''}
                   </span>
@@ -626,6 +742,7 @@ const BacktestPage: React.FC = () => {
                       <th className="backtest-table-head-cell">{text.stock}</th>
                       <th className="backtest-table-head-cell">{text.analysisDate}</th>
                       <th className="backtest-table-head-cell">{text.phase}</th>
+                      <th className="backtest-table-head-cell">{modelText.model}</th>
                       <th className="backtest-table-head-cell">{text.aiPrediction}</th>
                       <th className="backtest-table-head-cell">
                         {showNextDayActualColumns ? text.actualPerformance : text.windowReturn}
@@ -634,6 +751,7 @@ const BacktestPage: React.FC = () => {
                         {showNextDayActualColumns ? text.accuracy : text.directionMatch}
                       </th>
                       <th className="backtest-table-head-cell">{text.result}</th>
+                      <th className="backtest-table-head-cell">{language === 'zh' ? '持仓决策' : 'Holding decision'}</th>
                       <th className="backtest-table-head-cell">{text.status}</th>
                     </tr>
                   </thead>
@@ -656,6 +774,7 @@ const BacktestPage: React.FC = () => {
                           </td>
                           <td className="backtest-table-cell text-secondary-text">{row.analysisDate || '--'}</td>
                           <td className="backtest-table-cell text-secondary-text">{phaseLabel(row, language)}</td>
+                          <td className="backtest-table-cell text-secondary-text">{row.modelUsed || '--'}</td>
                           <td className="backtest-table-cell max-w-[220px] text-foreground">
                             {predictionParts.length ? (
                               <Tooltip
@@ -697,6 +816,18 @@ const BacktestPage: React.FC = () => {
                             </span>
                           </td>
                           <td className="backtest-table-cell">{outcomeBadge(row.outcome, language)}</td>
+                          <td className="backtest-table-cell">
+                            {row.holdingActionApplicable ? (
+                              <div className="flex flex-col gap-1">
+                                <span>{getDecisionActionLabel(row.holdingAction, null, null, null, actionLabels) || '--'}</span>
+                                <span className="text-xs text-secondary-text">
+                                  {row.holdingActionEvaluable
+                                    ? `${row.holdingDecisionCorrect ? (language === 'zh' ? '正确' : 'Correct') : (language === 'zh' ? '错误' : 'Incorrect')} · ${pct(row.holdingDecisionReturnPct)}`
+                                    : (language === 'zh' ? '等待评估' : 'Pending evaluation')}
+                                </span>
+                              </div>
+                            ) : '--'}
+                          </td>
                           <td className="backtest-table-cell">{statusBadge(row.evalStatus, language)}</td>
                         </tr>
                       );

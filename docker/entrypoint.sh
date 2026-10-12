@@ -7,6 +7,7 @@ APP_UID="1000"
 APP_GID="1000"
 WRITABLE_DIRS="/app/data /app/logs /app/reports /home/dsa/.longbridge"
 DATABASE_FILE="${DATABASE_PATH:-/app/data/stock_analysis.db}"
+POSTGRES_PGPASS_FILE="${POSTGRES_PGPASS_FILE:-}"
 
 warn() {
     printf '%s\n' "$*" >&2
@@ -14,9 +15,9 @@ warn() {
 
 can_write_dir_as_app_user() {
     gosu "$APP_USER:$APP_GROUP" sh -c '
-        tmp="$1/.dsa-write-check.$$"
-        : > "$tmp" && rm -f "$tmp"
-    ' sh "$1"
+        tmp="$(mktemp "$1/.dsa-write-check.XXXXXX")"
+        rm -f "$tmp"
+    ' sh "$1" 2>/dev/null
 }
 
 can_write_file_as_app_user() {
@@ -83,6 +84,25 @@ if [ "$(id -u)" = "0" ]; then
             warn "WARN: $dir is still not writable by $APP_USER after permission repair; check host mount ownership or read-only, rootless, and NFS mount settings."
         fi
     done
+
+    if [ -n "$POSTGRES_PGPASS_FILE" ]; then
+        if [ ! -r "$POSTGRES_PGPASS_FILE" ]; then
+            warn "ERROR: PostgreSQL password file is not readable: $POSTGRES_PGPASS_FILE"
+            exit 1
+        fi
+        install -o "$APP_UID" -g "$APP_GID" -m 600 \
+            "$POSTGRES_PGPASS_FILE" /home/dsa/.pgpass
+        PGPASSFILE=/home/dsa/.pgpass
+        export PGPASSFILE
+        if [ -z "${DATABASE_URL:-}" ]; then
+            if [ -z "${POSTGRES_DEFAULT_URL:-}" ]; then
+                warn "ERROR: PostgreSQL secret is configured but POSTGRES_DEFAULT_URL is empty."
+                exit 1
+            fi
+            DATABASE_URL="$POSTGRES_DEFAULT_URL"
+            export DATABASE_URL
+        fi
+    fi
 
     HOME="/home/dsa"
     export HOME

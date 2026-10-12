@@ -8,6 +8,8 @@ import unittest
 from datetime import datetime, timezone
 from types import ModuleType
 from unittest.mock import MagicMock, patch
+import time
+import requests
 
 # Mock newspaper before search_service import (optional dependency)
 if "newspaper" not in sys.modules:
@@ -16,7 +18,14 @@ if "newspaper" not in sys.modules:
     mock_np.Config = MagicMock()
     sys.modules["newspaper"] = mock_np
 
-from src.search_service import SearchService, TavilySearchProvider
+from src.search_service import (
+    BaseSearchProvider,
+    MiniMaxSearchProvider,
+    SearchResponse,
+    SearchResult,
+    SearchService,
+    TavilySearchProvider,
+)
 
 
 class _FakeTavilyClient:
@@ -29,6 +38,8 @@ class _FakeTavilyClient:
 
     def search(self, **kwargs):
         type(self).search_calls.append(kwargs)
+        if isinstance(type(self).response_payload, Exception):
+            raise type(self).response_payload
         return type(self).response_payload
 
     @classmethod
@@ -77,9 +88,46 @@ class TestTavilySearchProvider(unittest.TestCase):
         self.assertEqual(_FakeTavilyClient.search_calls[0]["days"], 3)
         self.assertEqual(_FakeTavilyClient.search_calls[0]["max_results"], 5)
         self.assertEqual(_FakeTavilyClient.search_calls[0]["search_depth"], "advanced")
+        self.assertTrue(_FakeTavilyClient.search_calls[0]["include_usage"])
         self.assertEqual(len(resp.results), 1)
         self.assertEqual(resp.results[0].published_date, published_text)
         self.assertEqual(resp.results[0].url, "https://example.com/alibaba-earnings")
+
+    def test_provider_reports_usage_credits_when_sdk_returns_usage(self) -> None:
+        provider = TavilySearchProvider(["dummy_key"])
+
+        with self._patch_tavily(
+            {
+                "usage": {"credits": 1},
+                "results": [
+                    {
+                        "title": "Alibaba earnings beat",
+                        "url": "https://example.com/alibaba-earnings",
+                        "content": "Fresh coverage",
+                    },
+                ],
+            }
+        ):
+            resp = provider.search("BABA latest news", max_results=5, days=3, topic="news")
+
+        self.assertTrue(resp.success)
+        self.assertEqual(resp.usage_credits, 1.0)
+
+    def test_failed_search_context_is_not_reported_as_no_results(self) -> None:
+        resp = SearchResponse(
+            query="BABA latest news",
+            results=[],
+            provider="Tavily",
+            success=False,
+            error_message="API 配额已用尽",
+            error_type="quota_exceeded",
+        )
+
+        context = resp.to_context()
+
+        self.assertIn("暂不可用", context)
+        self.assertIn("不能据此判断无相关新闻", context)
+        self.assertNotIn("未找到相关结果", context)
 
     def test_provider_supports_publishedDate_variant(self) -> None:
         provider = TavilySearchProvider(["dummy_key"])
@@ -269,6 +317,146 @@ class TestTavilySearchProvider(unittest.TestCase):
         self.assertEqual(_FakeTavilyClient.search_calls[0]["topic"], "news")
         self.assertNotIn("topic", _FakeTavilyClient.search_calls[1])
         self.assertEqual(_FakeTavilyClient.search_calls[2]["topic"], "news")
+
+    def test_tavily_quota_error_is_classified_redacted_and_blocks_key(self) -> None:
+        from tavily.errors import UsageLimitExceededError
+
+        secret = "tvly-secret-key-123"
+        provider = TavilySearchProvider([secret])
+
+        with self._patch_tavily(
+            UsageLimitExceededError(f"quota exhausted for {secret}")
+        ):
+            resp = provider.search("BABA latest news", max_results=3, days=3, topic="news")
+
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error_type, "quota_exceeded")
+        self.assertNotIn(secret, resp.error_message or "")
+        self.assertIn("[REDACTED_", resp.error_message or "")
+        self.assertIsNone(provider._get_next_key())
+
+    def test_tavily_network_error_is_not_misreported_as_quota_or_auth(self) -> None:
+        provider = TavilySearchProvider(["tvly-secret-key-123"])
+
+        with self._patch_tavily(
+            requests.exceptions.ConnectionError(
+                "HTTPSConnectionPool(host='api.tavily.com'): Failed to resolve 'api.tavily.com'"
+            )
+        ):
+            resp = provider.search("BABA latest news", max_results=3, days=3, topic="news")
+
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error_type, "network_error")
+        self.assertNotIn("API 配额已用尽", resp.error_message or "")
+        self.assertNotIn("API 认证或权限失败", resp.error_message or "")
+        self.assertIsNotNone(provider._get_next_key())
+
+    def test_expired_mixed_cooldown_key_reenters_rotation(self) -> None:
+        provider = TavilySearchProvider(["quota_key", "rate_key"])
+        now = time.monotonic()
+
+        provider._key_errors["quota_key"] = 3
+        provider._key_errors["rate_key"] = 3
+        provider._key_blocked_until["quota_key"] = now + 3600
+        provider._key_blocked_until["rate_key"] = now - 1
+
+        self.assertEqual(provider._get_next_key(), "rate_key")
+        self.assertEqual(provider._key_errors["rate_key"], 0)
+        self.assertIn("quota_key", provider._key_blocked_until)
+
+    def test_all_configured_keys_unavailable_is_not_reported_as_not_configured(self) -> None:
+        provider = TavilySearchProvider(["quota_key", "rate_key"])
+        now = time.monotonic()
+        for key in ("quota_key", "rate_key"):
+            provider._key_errors[key] = 3
+            provider._key_blocked_until[key] = now + 60
+
+        resp = provider.search("BABA latest news", max_results=3, days=3, topic="news")
+
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error_type, "no_available_key")
+        self.assertIn("冷却", resp.error_message or "")
+        self.assertNotIn("未配置", resp.error_message or "")
+
+    def test_mixed_cooldown_and_terminal_errors_are_reported_no_available_key(self) -> None:
+        provider = TavilySearchProvider(["quota_key", "transient_key"])
+        provider._key_errors["quota_key"] = 3
+        provider._key_errors["transient_key"] = 3
+        provider._key_blocked_until["quota_key"] = time.monotonic() + 3600
+
+        resp = provider.search("BABA latest news", max_results=3, days=3, topic="news")
+
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error_type, "no_available_key")
+        self.assertIn("当前无可用 API Key", resp.error_message or "")
+        self.assertNotIn("未配置", resp.error_message or "")
+
+    def test_generic_invalid_query_is_not_treated_as_auth_failure(self) -> None:
+        provider = TavilySearchProvider(["tvly-secret-key-123"])
+
+        self.assertEqual(provider._classify_error_message("invalid query parameter"), "provider_error")
+        self.assertEqual(provider._classify_error_message("invalid api key"), "auth_failed")
+        self.assertEqual(provider._classify_error_message("ReadTimeout: request timed out"), "timeout")
+
+    def test_minimax_error_recorder_accepts_shared_error_metadata(self) -> None:
+        provider = MiniMaxSearchProvider(["minimax_key"])
+
+        provider._record_error("minimax_key", error_type="rate_limited", retry_after_seconds=1)
+
+        self.assertIsNone(provider._get_next_key())
+
+    def test_tavily_forbidden_credit_errors_are_classified_as_quota(self) -> None:
+        from tavily.errors import ForbiddenError
+
+        provider = TavilySearchProvider(["tvly-secret-key-123"])
+
+        self.assertEqual(
+            provider._classify_tavily_error(ForbiddenError("432: API credits exhausted")),
+            "quota_exceeded",
+        )
+        self.assertEqual(
+            provider._classify_tavily_error(ForbiddenError("403: plan permission denied")),
+            "permission_denied",
+        )
+
+    def test_search_stock_news_falls_back_after_tavily_rate_limit(self) -> None:
+        from tavily.errors import UsageLimitExceededError
+
+        class _FallbackProvider(BaseSearchProvider):
+            def __init__(self):
+                super().__init__(["fallback_key"], "FallbackSearch")
+
+            def _do_search(self, query, api_key, max_results, days=7):
+                return SearchResponse(
+                    query=query,
+                    provider=self.name,
+                    success=True,
+                    results=[
+                        SearchResult(
+                            title="贵州茅台 发布 最新 经营公告",
+                            snippet="贵州茅台 股票 最新 经营公告。",
+                            url="https://example.com/600519-news",
+                            source="example.com",
+                            published_date=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        )
+                    ],
+                )
+
+        with self._patch_tavily(
+            UsageLimitExceededError("Your request has been blocked due to excessive requests.")
+        ):
+            service = SearchService(
+                tavily_keys=["tvly-secret-key-123"],
+                searxng_public_instances_enabled=False,
+                news_max_age_days=3,
+                news_strategy_profile="short",
+            )
+            service._providers.append(_FallbackProvider())
+            resp = service.search_stock_news("600519", "贵州茅台", max_results=1)
+
+        self.assertTrue(resp.success)
+        self.assertEqual(resp.provider, "FallbackSearch")
+        self.assertEqual(len(resp.results), 1)
 
 
 if __name__ == "__main__":

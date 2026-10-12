@@ -60,6 +60,10 @@ def _unsupported_fund_flow_caps() -> dict:
     return {"capital_flow": {"status": "NOT_SUPPORTED", "data": {"stock_flow": {"main_net_inflow": 0}}}}
 
 
+def _failed_fund_flow() -> dict:
+    return {"capital_flow": {"status": "failed", "error": "provider timeout", "data": {}}}
+
+
 def test_capital_flow_bias_is_unavailable_when_stock_flow_data_is_missing() -> None:
     assert _capital_flow_bias(_unsupported_fund_flow()) == "unavailable"
     assert _capital_flow_bias({"capital_flow": {"status": "ok", "data": {}}}) == "unavailable"
@@ -100,12 +104,13 @@ def test_downgrades_buy_near_resistance_without_fund_confirmation() -> None:
         _fund_flow(main=-1_000_000, five_day=-2_000_000),
     )
 
-    assert result.decision_type == "hold"
-    assert result.sentiment_score <= 59
-    assert result.operation_advice == "震荡观望"
-    assert result.dashboard["decision_stability"]["applied"] is True
+    assert result.decision_type == "buy"
+    assert result.sentiment_score == 65
+    assert result.operation_advice == "买入"
+    assert result.dashboard["decision_stability"]["applied"] is False
+    assert result.dashboard["decision_stability"]["reason_code"] == "explicit_adjusted_score_required"
     assert "不宜仅因短线反弹追买" in result.risk_warning
-    assert result.dashboard["core_conclusion"]["signal_type"] == "🟡持有观望"
+    assert "signal_type" not in result.dashboard["core_conclusion"]
 
 
 def test_downgrades_buy_mid_range_with_neutral_fund_flow() -> None:
@@ -122,9 +127,9 @@ def test_downgrades_buy_mid_range_with_neutral_fund_flow() -> None:
         _fund_flow(main=0, five_day=0, ten_day=0),
     )
 
-    assert result.decision_type == "hold"
-    assert result.sentiment_score <= 59
-    assert result.operation_advice == "震荡观望"
+    assert result.decision_type == "buy"
+    assert result.sentiment_score == 66
+    assert result.operation_advice == "买入"
     assert "资金流不明确" in result.risk_warning
 
 
@@ -157,12 +162,48 @@ def test_unavailable_capital_flow_does_not_become_negative_evidence() -> None:
     assert buy_result.decision_type == "buy"
     assert buy_result.operation_advice == "买入"
     assert buy_result.sentiment_score == 66
+    assert buy_result.confidence_level == "中"
     assert buy_result.dashboard["decision_stability"]["applied"] is False
     assert buy_result.dashboard["decision_stability"]["capital_flow_bias"] == "unavailable"
+    assert buy_result.dashboard["decision_stability"]["capital_flow_unavailable_kind"] == "not_supported"
+    assert "capital_flow_not_supported" in buy_result.limitations
+    assert "capital_flow_unavailable" not in buy_result.limitations
     assert sell_result.decision_type == "sell"
     assert sell_result.operation_advice == "卖出"
+    assert sell_result.confidence_level == "中"
     assert sell_result.dashboard["decision_stability"]["applied"] is False
     assert "未使用资金流校准" in sell_result.dashboard["decision_stability"]["reason"]
+
+
+def test_unavailable_optional_flow_preserves_existing_structured_guardrail() -> None:
+    result = _result(
+        decision_type="hold",
+        operation_advice="观望",
+        score=55,
+        current_price=32.0,
+    )
+    result.raw_score = 72
+    result.guardrail = {
+        "applied": True,
+        "reason_code": "near_resistance",
+        "reason": "临近压力位且量价背离",
+        "raw_score": 72,
+        "adjusted_score": 55,
+        "score_delta": -17,
+    }
+
+    stabilize_decision_with_structure(
+        result,
+        SimpleNamespace(support_levels=[30.0], resistance_levels=[34.0]),
+        _unsupported_fund_flow(),
+    )
+
+    assert result.sentiment_score == 55
+    assert result.guardrail["applied"] is True
+    assert result.guardrail["reason_code"] == "near_resistance"
+    assert result.confidence_level == "中"
+    assert "capital_flow_not_supported" in result.limitations
+    assert "capital_flow_unavailable" not in result.limitations
 
 
 def test_preserves_buy_when_capital_flow_values_are_na() -> None:
@@ -193,8 +234,11 @@ def test_preserves_buy_when_capital_flow_values_are_na() -> None:
     assert result.decision_type == "buy"
     assert result.operation_advice == "买入"
     assert result.sentiment_score == 66
+    assert result.confidence_level == "中"
     assert result.dashboard["decision_stability"]["applied"] is False
     assert "资金流数据缺失" in result.dashboard["decision_stability"]["capital_flow_status"]
+    assert result.dashboard["decision_stability"]["capital_flow_unavailable_kind"] == "missing"
+    assert "capital_flow_unavailable" in result.limitations
 
 
 def test_preserves_existing_decision_when_buy_advice_has_unavailable_capital_flow() -> None:
@@ -214,6 +258,7 @@ def test_preserves_existing_decision_when_buy_advice_has_unavailable_capital_flo
     assert result.decision_type == "hold"
     assert result.operation_advice == "建议买入"
     assert result.sentiment_score == 68
+    assert result.confidence_level == "中"
     assert result.dashboard["decision_stability"]["applied"] is False
     assert "未使用资金流校准" in result.dashboard["decision_stability"]["reason"]
 
@@ -235,8 +280,66 @@ def test_preserves_buy_when_capital_flow_status_is_unavailable_case_insensitive(
     assert buy_result.decision_type == "buy"
     assert buy_result.operation_advice == "买入"
     assert buy_result.sentiment_score == 66
+    assert buy_result.confidence_level == "中"
     assert buy_result.dashboard["decision_stability"]["applied"] is False
-    assert "暂不支持" in str(buy_result.dashboard["decision_stability"]["capital_flow_status"])
+    assert "不适用" in str(buy_result.dashboard["decision_stability"]["capital_flow_status"])
+
+
+def test_failed_capital_flow_records_quality_limit_once_without_changing_action_or_score() -> None:
+    result = _result(
+        decision_type="buy",
+        operation_advice="买入",
+        score=66,
+        current_price=32.0,
+    )
+
+    stabilize_decision_with_structure(
+        result,
+        SimpleNamespace(support_levels=[30.0], resistance_levels=[34.0]),
+        _failed_fund_flow(),
+    )
+
+    assert result.decision_type == "buy"
+    assert result.operation_advice == "买入"
+    assert result.sentiment_score == 66
+    assert result.confidence_level == "低"
+    assert result.limitations.count("capital_flow_failed") == 1
+    assert result.dashboard["decision_stability"]["capital_flow_unavailable_kind"] == "failed"
+    assert "资金流获取失败" in result.dashboard["decision_stability"]["capital_flow_status"]
+
+    stabilize_decision_with_structure(
+        result,
+        SimpleNamespace(support_levels=[30.0], resistance_levels=[34.0]),
+        _failed_fund_flow(),
+    )
+
+    assert result.decision_type == "buy"
+    assert result.operation_advice == "买入"
+    assert result.sentiment_score == 66
+    assert result.confidence_level == "低"
+    assert result.limitations.count("capital_flow_failed") == 1
+
+
+def test_failed_capital_flow_does_not_raise_existing_low_confidence() -> None:
+    result = _result(
+        decision_type="buy",
+        operation_advice="买入",
+        score=66,
+        current_price=32.0,
+    )
+    result.confidence_level = "低"
+
+    stabilize_decision_with_structure(
+        result,
+        SimpleNamespace(support_levels=[30.0], resistance_levels=[34.0]),
+        _failed_fund_flow(),
+    )
+
+    assert result.decision_type == "buy"
+    assert result.operation_advice == "买入"
+    assert result.sentiment_score == 66
+    assert result.confidence_level == "低"
+    assert result.limitations == ["capital_flow_failed"]
 
 
 def test_skips_downgrade_when_only_generic_risk_warning_and_sell_near_support() -> None:
@@ -255,8 +358,9 @@ def test_skips_downgrade_when_only_generic_risk_warning_and_sell_near_support() 
         _fund_flow(main=500_000, five_day=300_000),
     )
 
-    assert result.decision_type == "hold"
-    assert result.operation_advice == "洗盘观察"
+    assert result.decision_type == "sell"
+    assert result.operation_advice == "卖出"
+    assert result.dashboard["decision_stability"]["applied"] is False
     assert "价格贴近支撑且未见资金持续流出" in result.risk_warning
 
 
@@ -275,9 +379,9 @@ def test_stability_can_infer_decision_from_natural_chinese_phrases_in_analyzer_p
         _fund_flow(main=500_000, five_day=300_000),
     )
 
-    assert result.decision_type == "hold"
-    assert result.operation_advice == "洗盘观察"
-    assert result.dashboard["decision_stability"]["applied"] is True
+    assert result.decision_type == "建议卖出"
+    assert result.operation_advice == "建议卖出"
+    assert result.dashboard["decision_stability"]["applied"] is False
 
 
 def test_downgrades_sell_near_support_without_sustained_outflow() -> None:
@@ -295,9 +399,10 @@ def test_downgrades_sell_near_support_without_sustained_outflow() -> None:
         _fund_flow(main=800_000, five_day=1_200_000),
     )
 
-    assert result.decision_type == "hold"
-    assert result.sentiment_score >= 45
-    assert result.operation_advice == "洗盘观察"
+    assert result.decision_type == "sell"
+    assert result.sentiment_score == 30
+    assert result.operation_advice == "卖出"
+    assert result.dashboard["decision_stability"]["applied"] is False
     assert "不宜仅因单日下跌直接卖出" in result.risk_warning
 
 

@@ -225,8 +225,11 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
         self.assertEqual(enhanced["today"]["date"], today.isoformat())
         self.assertEqual(enhanced["today"]["data_source"], "realtime:tencent")
         self.assertEqual(enhanced["today"]["realtime_source"], "tencent")
-        self.assertIn("price_change_ratio", enhanced)
-        self.assertIn("volume_change_ratio", enhanced)
+        # This legacy fixture has no comparison date: it must not claim a
+        # previous-session comparison without evidence of the session.
+        self.assertNotIn("price_change_ratio", enhanced)
+        self.assertNotIn("volume_change_ratio", enhanced)
+        self.assertEqual(enhanced['daily_comparison_status'], 'unavailable')
 
     @patch("src.core.pipeline.get_market_now")
     @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
@@ -324,7 +327,7 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
             None,
             trend,
             "贵州茅台",
-            market_phase_context={"is_partial_bar": True},
+            market_phase_context={"phase": "intraday", "is_partial_bar": True},
         )
 
         self.assertEqual(enhanced["realtime"]["source"], "tencent")

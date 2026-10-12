@@ -167,6 +167,8 @@ NEWS_STRATEGY_WINDOWS: Dict[str, int] = {
     "medium": 7,
     "long": 30,
 }
+PAPER_TRADING_STYLES = {"short_swing", "position", "trend"}
+MARKET_OPPORTUNITY_MODES = {"off", "observe", "paper"}
 
 
 @dataclass(frozen=True)
@@ -315,6 +317,147 @@ def resolve_news_window_days(news_max_age_days: int, news_strategy_profile: Opti
     profile = normalize_news_strategy_profile(news_strategy_profile)
     profile_days = NEWS_STRATEGY_WINDOWS.get(profile, NEWS_STRATEGY_WINDOWS["short"])
     return max(1, min(max(1, int(news_max_age_days)), profile_days))
+
+
+def normalize_paper_trading_style(value: Optional[str]) -> str:
+    """Normalize paper-trading style values."""
+    candidate = (value or "position").strip().lower().replace("-", "_")
+    return candidate if candidate in PAPER_TRADING_STYLES else "position"
+
+
+def normalize_market_opportunity_mode(value: Optional[str]) -> str:
+    """Normalize market-opportunity mode values."""
+    candidate = (value or "off").strip().lower()
+    return candidate if candidate in MARKET_OPPORTUNITY_MODES else "off"
+
+
+def normalize_market_opportunity_style(value: Optional[str]) -> str:
+    """Normalize the opportunity-pool trading style.
+
+    Empty/unset or an unrecognized value returns ``""`` meaning "inherit the
+    paper-trading style", so the pool keeps its historical behavior unless a
+    dedicated style is explicitly configured.
+    """
+    candidate = (value or "").strip().lower().replace("-", "_")
+    return candidate if candidate in PAPER_TRADING_STYLES else ""
+
+
+def normalize_market_opportunity_run_time(value: Optional[str]) -> str:
+    """Normalize the deferred opportunity-pool run time (Asia/Shanghai ``HH:MM``).
+
+    Empty keeps the pool inline after the scheduled analysis batch.  An invalid
+    value is logged and treated as empty, so a typo never silently stops the pool.
+    """
+    candidate = (value or "").strip()
+    if not candidate or re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", candidate):
+        return candidate
+    logger.warning(
+        "MARKET_OPPORTUNITY_RUN_TIME=%r is not HH:MM; the pool keeps running inline after the scheduled analysis",
+        candidate,
+    )
+    return ""
+
+
+def parse_paper_trading_style_overrides(raw: Optional[str]) -> Dict[str, str]:
+    """Parse configured per-symbol paper style overrides from JSON."""
+    if not raw or not str(raw).strip():
+        return {}
+    try:
+        value = json.loads(str(raw))
+    except Exception:
+        logger.warning("PAPER_TRADING_STYLE_OVERRIDES must be a JSON object; ignored")
+        return {}
+    if not isinstance(value, dict):
+        logger.warning("PAPER_TRADING_STYLE_OVERRIDES must be a JSON object; ignored")
+        return {}
+    overrides: Dict[str, str] = {}
+    for key, style in value.items():
+        key_text = str(key or "").strip().lower()
+        if ":" not in key_text or not key_text.split(":", 1)[1]:
+            logger.warning("PAPER_TRADING_STYLE_OVERRIDES requires market:symbol identities; ignored unscoped key")
+            continue
+        normalized_style = normalize_paper_trading_style(str(style or ""))
+        overrides[key_text] = normalized_style
+    return overrides
+
+
+PAPER_TRADING_ASSET_TYPES = {
+    "individual_stock": "individual_stock",
+    "stock": "individual_stock",
+    "individualstock": "individual_stock",
+    "theme_etf": "theme_etf",
+    "themeetf": "theme_etf",
+    "theme_fund": "theme_etf",
+    "sector_etf": "theme_etf",
+    "broad_etf": "broad_etf",
+    "broadetf": "broad_etf",
+    "broad_index_etf": "broad_etf",
+    "index_etf": "broad_etf",
+    "unknown": "unknown",
+}
+
+DEFAULT_PAPER_TRADING_ASSET_EXPOSURE_CAPS = {
+    "individual_stock": 20.0,
+    "theme_etf": 30.0,
+    "broad_etf": 40.0,
+    "unknown": 20.0,
+}
+
+
+def normalize_paper_trading_asset_type(value: Optional[str]) -> str:
+    """Normalize paper-trading asset exposure classes."""
+    candidate = (value or "unknown").strip().lower().replace("-", "_").replace(" ", "_")
+    return PAPER_TRADING_ASSET_TYPES.get(candidate, "unknown")
+
+
+def parse_paper_trading_asset_exposure_caps(raw: Optional[str]) -> Dict[str, float]:
+    """Parse asset-class exposure caps from JSON, keeping safe defaults."""
+    caps = dict(DEFAULT_PAPER_TRADING_ASSET_EXPOSURE_CAPS)
+    if not raw or not str(raw).strip():
+        return caps
+    try:
+        value = json.loads(str(raw))
+    except Exception:
+        logger.warning("PAPER_TRADING_ASSET_EXPOSURE_CAPS must be a JSON object; using defaults")
+        return caps
+    if not isinstance(value, dict):
+        logger.warning("PAPER_TRADING_ASSET_EXPOSURE_CAPS must be a JSON object; using defaults")
+        return caps
+    for key, cap in value.items():
+        asset_type = normalize_paper_trading_asset_type(str(key or ""))
+        try:
+            cap_value = float(cap)
+        except (TypeError, ValueError):
+            logger.warning("Invalid PAPER_TRADING_ASSET_EXPOSURE_CAPS[%s]=%r; ignored", key, cap)
+            continue
+        if cap_value < 0:
+            logger.warning("Negative PAPER_TRADING_ASSET_EXPOSURE_CAPS[%s]=%r; clamped to 0", key, cap)
+            cap_value = 0.0
+        caps[asset_type] = cap_value
+    return caps
+
+
+def parse_paper_trading_asset_class_overrides(raw: Optional[str]) -> Dict[str, str]:
+    """Parse explicit per-identity asset-class overrides from JSON."""
+    if not raw or not str(raw).strip():
+        return {}
+    try:
+        value = json.loads(str(raw))
+    except Exception:
+        logger.warning("PAPER_TRADING_ASSET_CLASS_OVERRIDES must be a JSON object; ignored")
+        return {}
+    if not isinstance(value, dict):
+        logger.warning("PAPER_TRADING_ASSET_CLASS_OVERRIDES must be a JSON object; ignored")
+        return {}
+    overrides: Dict[str, str] = {}
+    for key, asset_type in value.items():
+        key_text = str(key or "").strip().lower()
+        market, separator, code = key_text.partition(":")
+        if separator != ":" or market not in {"cn", "hk", "us"} or not code:
+            logger.warning("PAPER_TRADING_ASSET_CLASS_OVERRIDES requires an exact market:code key; ignored %r", key)
+            continue
+        overrides[key_text] = normalize_paper_trading_asset_type(str(asset_type or ""))
+    return overrides
 
 
 def normalize_agent_context_compression_profile(value: Optional[str]) -> str:
@@ -994,6 +1137,7 @@ class Config:
     prefetch_realtime_quotes: bool = True
 
     # === 数据库配置 ===
+    database_url: Optional[str] = None
     database_path: str = "./data/stock_analysis.db"
     sqlite_wal_enabled: bool = True
     sqlite_busy_timeout_ms: int = 5000
@@ -1009,7 +1153,72 @@ class Config:
     backtest_min_age_days: int = 14
     backtest_engine_version: str = "v1"
     backtest_neutral_band_pct: float = 2.0
-    
+    paper_trading_enabled: bool = False
+    paper_trading_style: str = "position"
+    paper_trading_style_overrides: Dict[str, str] = field(default_factory=dict)
+    paper_trading_strategy_thesis_enabled: bool = True
+    paper_trading_strategy_entry_confirmation_sessions: int = 2
+    paper_trading_strategy_flip_confirmation_sessions: int = 2
+    paper_trading_plan_compensation_enabled: bool = True
+    paper_trading_plan_compensation_lookback_days: int = 30
+    paper_trading_market_context_risk_control_enabled: bool = True
+    paper_trading_market_context_lookback_days: int = 3
+    paper_trading_intraday_enabled: bool = False
+    paper_trading_intraday_interval_minutes: int = 5
+    paper_trading_intraday_min_factor_domains: int = 2
+    paper_trading_intraday_min_composite_score: float = 0.6
+    paper_trading_intraday_min_risk_reward: float = 1.2
+    paper_trading_intraday_max_quote_stale_seconds: int = 360
+    paper_trading_initial_capital: float = 100000.0
+    paper_trading_risk_per_trade_pct: float = 1.0
+    paper_trading_max_position_pct: float = 20.0
+    paper_trading_max_symbol_exposure_pct: float = 50.0
+    paper_trading_asset_exposure_caps: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_PAPER_TRADING_ASSET_EXPOSURE_CAPS))
+    paper_trading_asset_class_overrides: Dict[str, str] = field(default_factory=dict)
+    paper_trading_max_total_exposure_pct: float = 80.0
+    paper_trading_max_open_positions: int = 5
+    paper_trading_default_reduce_fraction: float = 0.5
+    paper_trading_slippage_pct: float = 0.03
+    paper_trading_commission_rate: float = 0.0003
+    paper_trading_min_commission: float = 5.0
+    paper_trading_sell_tax_rate: float = 0.0005
+    paper_trading_feishu_notify: bool = False
+    paper_trading_t0_symbols: List[str] = field(default_factory=list)
+    paper_trading_auction_price_deviation_pct: float = 2.0
+    paper_trading_auction_min_matched_volume_ratio: float = 0.20
+    paper_trading_account_daily_loss_limit_pct: float = 3.0
+    paper_trading_account_drawdown_limit_pct: float = 10.0
+    paper_trading_account_drawdown_recovery_pct: float = 8.0
+    paper_trading_account_losing_streak_limit: int = 3
+    paper_trading_account_daily_trade_limit: int = 10
+    paper_trading_account_daily_open_add_limit: int = 5
+    paper_trading_account_sector_cap_pct: float = 60.0
+    paper_trading_account_correlation_cap_pct: float = 60.0
+    paper_trading_account_unknown_cap_pct: float = 50.0
+    paper_trading_correlation_threshold: float = 0.85
+    paper_trading_correlation_lookback_sessions: int = 60
+    paper_trading_correlation_min_overlap_sessions: int = 30
+    market_opportunity_mode: str = "off"
+    market_opportunity_board_source: str = "csrc_tencent"
+    market_opportunity_discovery_max_themes: int = 15
+    market_opportunity_max_themes: int = 3
+    market_opportunity_max_candidates_per_theme: int = 3
+    market_opportunity_max_total_candidates: int = 8
+    market_opportunity_max_observation_candidates: int = 30
+    market_opportunity_max_llm_calls_per_run: int = 16
+    market_opportunity_min_20d_avg_amount_cny: float = 100000000.0
+    market_opportunity_blacklist: List[str] = field(default_factory=list)
+    market_opportunity_observe_gate_days: int = 3
+    market_opportunity_research_daily_llm_budget: int = 16
+    # 机会池专用交易风格；空串表示沿用 PAPER_TRADING_STYLE。驱动机会池筛选与其触发的个股分析，
+    # 机会池来源的模拟计划冻结该风格；不改变主账户基础风格、自选股计划和现有持仓。
+    market_opportunity_style: str = ""
+    # 机会池晚间运行时间（北京时间 HH:MM）；空串表示仍随定时分析批次内联运行。
+    market_opportunity_run_time: str = ""
+    # 机会池 A/B/C 实验注册表 JSON 路径（受信任、服务端配置）。留空则 Web/API
+    # 只显示 primary 范围。注册表仅存各组 DB 连接的环境变量名，不含地址/凭据。
+    opportunity_experiment_registry_path: str = ""
+
     # === 日志配置 ===
     log_dir: str = "./logs"  # 日志文件目录
     log_level: str = "INFO"  # 日志级别
@@ -1024,6 +1233,7 @@ class Config:
     schedule_enabled: bool = False            # 是否启用定时任务
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     schedule_times: List[str] = field(default_factory=lambda: ["18:00"])
+    schedule_multi_model_enabled: bool = False  # 定时任务是否按已配置模型逐一独立分析
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
     run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
     market_review_enabled: bool = True        # 是否启用大盘复盘
@@ -1140,7 +1350,24 @@ class Config:
             "SCHEDULE_ENABLED",
             "SCHEDULE_TIME",
             "SCHEDULE_TIMES",
+            "SCHEDULE_MULTI_MODEL_ENABLED",
             "SCHEDULE_RUN_IMMEDIATELY",
+            "PAPER_TRADING_ENABLED",
+            "PAPER_TRADING_STRATEGY_THESIS_ENABLED",
+            "PAPER_TRADING_STRATEGY_ENTRY_CONFIRMATION_SESSIONS",
+            "PAPER_TRADING_STRATEGY_FLIP_CONFIRMATION_SESSIONS",
+            "PAPER_TRADING_INTRADAY_ENABLED",
+            "PAPER_TRADING_INTRADAY_INTERVAL_MINUTES",
+            "PAPER_TRADING_INTRADAY_MIN_FACTOR_DOMAINS",
+            "PAPER_TRADING_INTRADAY_MIN_COMPOSITE_SCORE",
+            "PAPER_TRADING_INTRADAY_MIN_RISK_REWARD",
+            "PAPER_TRADING_INTRADAY_MAX_QUOTE_STALE_SECONDS",
+            "PAPER_TRADING_MAX_SYMBOL_EXPOSURE_PCT",
+            "PAPER_TRADING_DEFAULT_REDUCE_FRACTION",
+            "PAPER_TRADING_SLIPPAGE_PCT",
+            "PAPER_TRADING_COMMISSION_RATE",
+            "PAPER_TRADING_MIN_COMMISSION",
+            "PAPER_TRADING_SELL_TAX_RATE",
         }
     )
     _BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED = False
@@ -1926,6 +2153,7 @@ class Config:
             ),
             md2img_engine=cls._parse_md2img_engine(os.getenv('MD2IMG_ENGINE', 'wkhtmltoimage')),
             prefetch_realtime_quotes=os.getenv('PREFETCH_REALTIME_QUOTES', 'true').lower() == 'true',
+            database_url=(os.getenv('DATABASE_URL') or '').strip() or None,
             database_path=os.getenv('DATABASE_PATH', './data/stock_analysis.db'),
             sqlite_wal_enabled=os.getenv('SQLITE_WAL_ENABLED', 'true').lower() == 'true',
             sqlite_busy_timeout_ms=parse_env_int(
@@ -1957,6 +2185,428 @@ class Config:
                 field_name='BACKTEST_NEUTRAL_BAND_PCT',
                 minimum=0.0,
             ),
+            paper_trading_enabled=cls._resolve_env_value(
+                'PAPER_TRADING_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            paper_trading_style=normalize_paper_trading_style(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_STYLE',
+                    default='position',
+                    prefer_env_file=True,
+                )
+            ),
+            paper_trading_style_overrides=parse_paper_trading_style_overrides(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_STYLE_OVERRIDES',
+                    default='{}',
+                    prefer_env_file=True,
+                )
+            ),
+            paper_trading_strategy_thesis_enabled=parse_env_bool(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_STRATEGY_THESIS_ENABLED',
+                    default='true',
+                    prefer_env_file=True,
+                ),
+                True,
+            ),
+            paper_trading_strategy_entry_confirmation_sessions=parse_env_int(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_STRATEGY_ENTRY_CONFIRMATION_SESSIONS',
+                    default='2',
+                    prefer_env_file=True,
+                ),
+                2,
+                field_name='PAPER_TRADING_STRATEGY_ENTRY_CONFIRMATION_SESSIONS',
+                minimum=1,
+            ),
+            paper_trading_strategy_flip_confirmation_sessions=parse_env_int(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_STRATEGY_FLIP_CONFIRMATION_SESSIONS',
+                    default='2',
+                    prefer_env_file=True,
+                ),
+                2,
+                field_name='PAPER_TRADING_STRATEGY_FLIP_CONFIRMATION_SESSIONS',
+                minimum=1,
+            ),
+            paper_trading_plan_compensation_enabled=parse_env_bool(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_PLAN_COMPENSATION_ENABLED',
+                    default='true',
+                    prefer_env_file=True,
+                ),
+                True,
+            ),
+            paper_trading_plan_compensation_lookback_days=parse_env_int(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_PLAN_COMPENSATION_LOOKBACK_DAYS',
+                    default='30',
+                    prefer_env_file=True,
+                ),
+                30,
+                field_name='PAPER_TRADING_PLAN_COMPENSATION_LOOKBACK_DAYS',
+                minimum=1,
+            ),
+            paper_trading_market_context_risk_control_enabled=parse_env_bool(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_MARKET_CONTEXT_RISK_CONTROL_ENABLED',
+                    default='true',
+                    prefer_env_file=True,
+                ),
+                True,
+            ),
+            paper_trading_market_context_lookback_days=parse_env_int(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_MARKET_CONTEXT_LOOKBACK_DAYS',
+                    default='3',
+                    prefer_env_file=True,
+                ),
+                3,
+                field_name='PAPER_TRADING_MARKET_CONTEXT_LOOKBACK_DAYS',
+                minimum=1,
+            ),
+            paper_trading_intraday_enabled=cls._resolve_env_value(
+                'PAPER_TRADING_INTRADAY_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            paper_trading_intraday_interval_minutes=parse_env_int(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_INTRADAY_INTERVAL_MINUTES',
+                    default='5',
+                    prefer_env_file=True,
+                ),
+                5,
+                field_name='PAPER_TRADING_INTRADAY_INTERVAL_MINUTES',
+                minimum=1,
+            ),
+            paper_trading_intraday_min_factor_domains=parse_env_int(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_INTRADAY_MIN_FACTOR_DOMAINS',
+                    default='2',
+                    prefer_env_file=True,
+                ),
+                2,
+                field_name='PAPER_TRADING_INTRADAY_MIN_FACTOR_DOMAINS',
+                minimum=1,
+            ),
+            paper_trading_intraday_min_composite_score=parse_env_float(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_INTRADAY_MIN_COMPOSITE_SCORE',
+                    default='0.6',
+                    prefer_env_file=True,
+                ),
+                0.6,
+                field_name='PAPER_TRADING_INTRADAY_MIN_COMPOSITE_SCORE',
+                minimum=0.0,
+            ),
+            paper_trading_intraday_min_risk_reward=parse_env_float(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_INTRADAY_MIN_RISK_REWARD',
+                    default='1.2',
+                    prefer_env_file=True,
+                ),
+                1.2,
+                field_name='PAPER_TRADING_INTRADAY_MIN_RISK_REWARD',
+                minimum=0.0,
+            ),
+            paper_trading_intraday_max_quote_stale_seconds=parse_env_int(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_INTRADAY_MAX_QUOTE_STALE_SECONDS',
+                    default='360',
+                    prefer_env_file=True,
+                ),
+                360,
+                field_name='PAPER_TRADING_INTRADAY_MAX_QUOTE_STALE_SECONDS',
+                minimum=30,
+            ),
+            paper_trading_initial_capital=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_INITIAL_CAPITAL', default='100000', prefer_env_file=True),
+                100000.0,
+                field_name='PAPER_TRADING_INITIAL_CAPITAL',
+                minimum=1.0,
+            ),
+            paper_trading_risk_per_trade_pct=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_RISK_PER_TRADE_PCT', default='1.0', prefer_env_file=True),
+                1.0,
+                field_name='PAPER_TRADING_RISK_PER_TRADE_PCT',
+                minimum=0.0,
+            ),
+            paper_trading_max_position_pct=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_MAX_POSITION_PCT', default='20.0', prefer_env_file=True),
+                20.0,
+                field_name='PAPER_TRADING_MAX_POSITION_PCT',
+                minimum=0.0,
+            ),
+            paper_trading_max_symbol_exposure_pct=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_MAX_SYMBOL_EXPOSURE_PCT', default='50.0', prefer_env_file=True),
+                50.0,
+                field_name='PAPER_TRADING_MAX_SYMBOL_EXPOSURE_PCT',
+                minimum=0.0,
+            ),
+            paper_trading_asset_exposure_caps=parse_paper_trading_asset_exposure_caps(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_ASSET_EXPOSURE_CAPS',
+                    default=json.dumps(DEFAULT_PAPER_TRADING_ASSET_EXPOSURE_CAPS),
+                    prefer_env_file=True,
+                )
+            ),
+            paper_trading_asset_class_overrides=parse_paper_trading_asset_class_overrides(
+                cls._resolve_env_value(
+                    'PAPER_TRADING_ASSET_CLASS_OVERRIDES',
+                    default='{}',
+                    prefer_env_file=True,
+                )
+            ),
+            paper_trading_max_total_exposure_pct=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_MAX_TOTAL_EXPOSURE_PCT', default='80.0', prefer_env_file=True),
+                80.0,
+                field_name='PAPER_TRADING_MAX_TOTAL_EXPOSURE_PCT',
+                minimum=0.0,
+            ),
+            paper_trading_max_open_positions=parse_env_int(
+                cls._resolve_env_value('PAPER_TRADING_MAX_OPEN_POSITIONS', default='5', prefer_env_file=True),
+                5,
+                field_name='PAPER_TRADING_MAX_OPEN_POSITIONS',
+                minimum=1,
+            ),
+            paper_trading_default_reduce_fraction=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_DEFAULT_REDUCE_FRACTION', default='0.5', prefer_env_file=True),
+                0.5,
+                field_name='PAPER_TRADING_DEFAULT_REDUCE_FRACTION',
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            paper_trading_slippage_pct=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_SLIPPAGE_PCT', default='0.03', prefer_env_file=True),
+                0.03,
+                field_name='PAPER_TRADING_SLIPPAGE_PCT',
+                minimum=0.0,
+            ),
+            paper_trading_commission_rate=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_COMMISSION_RATE', default='0.0003', prefer_env_file=True),
+                0.0003,
+                field_name='PAPER_TRADING_COMMISSION_RATE',
+                minimum=0.0,
+            ),
+            paper_trading_min_commission=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_MIN_COMMISSION', default='5.0', prefer_env_file=True),
+                5.0,
+                field_name='PAPER_TRADING_MIN_COMMISSION',
+                minimum=0.0,
+            ),
+            paper_trading_sell_tax_rate=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_SELL_TAX_RATE', default='0.0005', prefer_env_file=True),
+                0.0005,
+                field_name='PAPER_TRADING_SELL_TAX_RATE',
+                minimum=0.0,
+            ),
+            paper_trading_feishu_notify=cls._resolve_env_value(
+                'PAPER_TRADING_FEISHU_NOTIFY',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            paper_trading_t0_symbols=[
+                item.strip()
+                for item in cls._resolve_env_value(
+                    'PAPER_TRADING_T0_SYMBOLS',
+                    default='',
+                    prefer_env_file=True,
+                ).split(',')
+                if item.strip()
+            ],
+            paper_trading_auction_price_deviation_pct=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_AUCTION_PRICE_DEVIATION_PCT', default='2.0', prefer_env_file=True),
+                2.0,
+                field_name='PAPER_TRADING_AUCTION_PRICE_DEVIATION_PCT',
+                minimum=0.0,
+            ),
+            paper_trading_auction_min_matched_volume_ratio=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_AUCTION_MIN_MATCHED_VOLUME_RATIO', default='0.20', prefer_env_file=True),
+                0.20,
+                field_name='PAPER_TRADING_AUCTION_MIN_MATCHED_VOLUME_RATIO',
+                minimum=0.0,
+            ),
+            paper_trading_account_daily_loss_limit_pct=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_ACCOUNT_DAILY_LOSS_LIMIT_PCT', default='3.0', prefer_env_file=True),
+                3.0,
+                field_name='PAPER_TRADING_ACCOUNT_DAILY_LOSS_LIMIT_PCT',
+                minimum=0.0,
+            ),
+            paper_trading_account_drawdown_limit_pct=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_ACCOUNT_DRAWDOWN_LIMIT_PCT', default='10.0', prefer_env_file=True),
+                10.0,
+                field_name='PAPER_TRADING_ACCOUNT_DRAWDOWN_LIMIT_PCT',
+                minimum=0.0,
+            ),
+            paper_trading_account_drawdown_recovery_pct=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_ACCOUNT_DRAWDOWN_RECOVERY_PCT', default='8.0', prefer_env_file=True),
+                8.0,
+                field_name='PAPER_TRADING_ACCOUNT_DRAWDOWN_RECOVERY_PCT',
+                minimum=0.0,
+            ),
+            paper_trading_account_losing_streak_limit=parse_env_int(
+                cls._resolve_env_value('PAPER_TRADING_ACCOUNT_LOSING_STREAK_LIMIT', default='3', prefer_env_file=True),
+                3,
+                field_name='PAPER_TRADING_ACCOUNT_LOSING_STREAK_LIMIT',
+                minimum=1,
+            ),
+            paper_trading_account_daily_trade_limit=parse_env_int(
+                cls._resolve_env_value('PAPER_TRADING_ACCOUNT_DAILY_TRADE_LIMIT', default='10', prefer_env_file=True),
+                10,
+                field_name='PAPER_TRADING_ACCOUNT_DAILY_TRADE_LIMIT',
+                minimum=1,
+            ),
+            paper_trading_account_daily_open_add_limit=parse_env_int(
+                cls._resolve_env_value('PAPER_TRADING_ACCOUNT_DAILY_OPEN_ADD_LIMIT', default='5', prefer_env_file=True),
+                5,
+                field_name='PAPER_TRADING_ACCOUNT_DAILY_OPEN_ADD_LIMIT',
+                minimum=1,
+            ),
+            paper_trading_account_sector_cap_pct=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_ACCOUNT_SECTOR_CAP_PCT', default='60.0', prefer_env_file=True),
+                60.0,
+                field_name='PAPER_TRADING_ACCOUNT_SECTOR_CAP_PCT',
+                minimum=0.0,
+            ),
+            paper_trading_account_correlation_cap_pct=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_ACCOUNT_CORRELATION_CAP_PCT', default='60.0', prefer_env_file=True),
+                60.0,
+                field_name='PAPER_TRADING_ACCOUNT_CORRELATION_CAP_PCT',
+                minimum=0.0,
+            ),
+            paper_trading_account_unknown_cap_pct=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_ACCOUNT_UNKNOWN_CAP_PCT', default='50.0', prefer_env_file=True),
+                50.0,
+                field_name='PAPER_TRADING_ACCOUNT_UNKNOWN_CAP_PCT',
+                minimum=0.0,
+            ),
+            paper_trading_correlation_threshold=parse_env_float(
+                cls._resolve_env_value('PAPER_TRADING_CORRELATION_THRESHOLD', default='0.85', prefer_env_file=True),
+                0.85,
+                field_name='PAPER_TRADING_CORRELATION_THRESHOLD',
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            paper_trading_correlation_lookback_sessions=parse_env_int(
+                cls._resolve_env_value('PAPER_TRADING_CORRELATION_LOOKBACK_SESSIONS', default='60', prefer_env_file=True),
+                60,
+                field_name='PAPER_TRADING_CORRELATION_LOOKBACK_SESSIONS',
+                minimum=1,
+            ),
+            paper_trading_correlation_min_overlap_sessions=parse_env_int(
+                cls._resolve_env_value('PAPER_TRADING_CORRELATION_MIN_OVERLAP_SESSIONS', default='30', prefer_env_file=True),
+                30,
+                field_name='PAPER_TRADING_CORRELATION_MIN_OVERLAP_SESSIONS',
+                minimum=1,
+            ),
+            market_opportunity_mode=normalize_market_opportunity_mode(
+                cls._resolve_env_value(
+                    'MARKET_OPPORTUNITY_MODE',
+                    default='off',
+                    prefer_env_file=True,
+                )
+            ),
+            market_opportunity_board_source=cls._resolve_env_value(
+                "MARKET_OPPORTUNITY_BOARD_SOURCE", default="csrc_tencent", prefer_env_file=True,
+            ).strip(),
+            market_opportunity_discovery_max_themes=parse_env_int(
+                cls._resolve_env_value('MARKET_OPPORTUNITY_DISCOVERY_MAX_THEMES', default='15', prefer_env_file=True),
+                15,
+                field_name='MARKET_OPPORTUNITY_DISCOVERY_MAX_THEMES',
+                minimum=1,
+                maximum=30,
+            ),
+            market_opportunity_max_themes=parse_env_int(
+                cls._resolve_env_value('MARKET_OPPORTUNITY_MAX_THEMES', default='3', prefer_env_file=True),
+                3,
+                field_name='MARKET_OPPORTUNITY_MAX_THEMES',
+                minimum=1,
+                maximum=20,
+            ),
+            market_opportunity_max_candidates_per_theme=parse_env_int(
+                cls._resolve_env_value('MARKET_OPPORTUNITY_MAX_CANDIDATES_PER_THEME', default='3', prefer_env_file=True),
+                3,
+                field_name='MARKET_OPPORTUNITY_MAX_CANDIDATES_PER_THEME',
+                minimum=1,
+                maximum=20,
+            ),
+            market_opportunity_max_total_candidates=parse_env_int(
+                cls._resolve_env_value('MARKET_OPPORTUNITY_MAX_TOTAL_CANDIDATES', default='8', prefer_env_file=True),
+                8,
+                field_name='MARKET_OPPORTUNITY_MAX_TOTAL_CANDIDATES',
+                minimum=1,
+                maximum=100,
+            ),
+            market_opportunity_max_observation_candidates=parse_env_int(
+                cls._resolve_env_value('MARKET_OPPORTUNITY_MAX_OBSERVATION_CANDIDATES', default='30', prefer_env_file=True),
+                30,
+                field_name='MARKET_OPPORTUNITY_MAX_OBSERVATION_CANDIDATES',
+                minimum=1,
+                maximum=100,
+            ),
+            market_opportunity_max_llm_calls_per_run=parse_env_int(
+                cls._resolve_env_value('MARKET_OPPORTUNITY_MAX_LLM_CALLS_PER_RUN', default='16', prefer_env_file=True),
+                16,
+                field_name='MARKET_OPPORTUNITY_MAX_LLM_CALLS_PER_RUN',
+                minimum=0,
+                maximum=200,
+            ),
+            market_opportunity_min_20d_avg_amount_cny=parse_env_float(
+                cls._resolve_env_value('MARKET_OPPORTUNITY_MIN_20D_AVG_AMOUNT_CNY', default='100000000', prefer_env_file=True),
+                100000000.0,
+                field_name='MARKET_OPPORTUNITY_MIN_20D_AVG_AMOUNT_CNY',
+                minimum=0.0,
+            ),
+            market_opportunity_blacklist=[
+                item.strip().lower()
+                for item in cls._resolve_env_value(
+                    'MARKET_OPPORTUNITY_BLACKLIST',
+                    default='',
+                    prefer_env_file=True,
+                ).split(',')
+                if item.strip()
+            ],
+            market_opportunity_observe_gate_days=parse_env_int(
+                cls._resolve_env_value('MARKET_OPPORTUNITY_OBSERVE_GATE_DAYS', default='3', prefer_env_file=True),
+                3,
+                field_name='MARKET_OPPORTUNITY_OBSERVE_GATE_DAYS',
+                minimum=0,
+                maximum=30,
+            ),
+            market_opportunity_research_daily_llm_budget=parse_env_int(
+                cls._resolve_env_value(
+                    'MARKET_OPPORTUNITY_RESEARCH_DAILY_LLM_BUDGET',
+                    default='16',
+                    prefer_env_file=True,
+                ),
+                16,
+                field_name='MARKET_OPPORTUNITY_RESEARCH_DAILY_LLM_BUDGET',
+                minimum=0,
+                maximum=200,
+            ),
+            market_opportunity_style=normalize_market_opportunity_style(
+                cls._resolve_env_value(
+                    'MARKET_OPPORTUNITY_STYLE',
+                    default='',
+                    prefer_env_file=True,
+                )
+            ),
+            market_opportunity_run_time=normalize_market_opportunity_run_time(
+                cls._resolve_env_value(
+                    'MARKET_OPPORTUNITY_RUN_TIME',
+                    default='',
+                    prefer_env_file=True,
+                )
+            ),
+            opportunity_experiment_registry_path=cls._resolve_env_value(
+                'OPPORTUNITY_EXPERIMENT_REGISTRY_PATH',
+                default='',
+                prefer_env_file=True,
+            ).strip(),
             log_dir=os.getenv('LOG_DIR', './logs'),
             log_level=os.getenv('LOG_LEVEL', 'INFO'),
             max_workers=parse_env_int(os.getenv('MAX_WORKERS'), 3, field_name='MAX_WORKERS', minimum=1),
@@ -1974,6 +2624,11 @@ class Config:
                 schedule_times_value,
                 fallback_time=(schedule_time_value or '18:00').strip() or '18:00',
             ),
+            schedule_multi_model_enabled=cls._resolve_env_value(
+                'SCHEDULE_MULTI_MODEL_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
             schedule_run_immediately=schedule_run_immediately,
             run_immediately=legacy_run_immediately,
             market_review_enabled=os.getenv('MARKET_REVIEW_ENABLED', 'true').lower() == 'true',
@@ -3358,9 +4013,22 @@ class Config:
     def get_db_url(self) -> str:
         """
         获取 SQLAlchemy 数据库连接 URL
-        
-        自动创建数据库目录（如果不存在）
+
+        DATABASE_URL 显式配置时优先使用 PostgreSQL/SQLite URL；否则继续
+        使用 DATABASE_PATH 构造本地 SQLite URL，以保持现有安装兼容。
         """
+        database_url = (self.database_url or "").strip()
+        if database_url:
+            parsed = urlparse(database_url)
+            backend = parsed.scheme.lower().split("+", 1)[0]
+            if backend not in {"postgresql", "sqlite"}:
+                raise ValueError(
+                    "DATABASE_URL 仅支持 postgresql 或 sqlite SQLAlchemy URL"
+                )
+            if backend == "postgresql" and not parsed.hostname:
+                raise ValueError("PostgreSQL DATABASE_URL 必须包含主机名")
+            return database_url
+
         db_path = Path(self.database_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         return f"sqlite:///{db_path.absolute()}"

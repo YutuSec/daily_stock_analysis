@@ -10,6 +10,7 @@ import type {
   MarketReviewRequest,
   TaskStatus,
   TaskListResponse,
+  AnalysisModelsResponse,
 } from '../types/analysis';
 import type { RunFlowSnapshot } from '../types/runFlow';
 
@@ -34,6 +35,8 @@ export const analysisApi = {
       selection_source: data.selectionSource,
       skills: data.skills,
       report_language: data.reportLanguage,
+      model: data.model,
+      models: data.models,
       ...(data.notify !== undefined && { notify: data.notify }),
     };
 
@@ -70,6 +73,8 @@ export const analysisApi = {
       selection_source: data.selectionSource,
       skills: data.skills,
       report_language: data.reportLanguage,
+      model: data.model,
+      models: data.models,
       ...(data.notify !== undefined && { notify: data.notify }),
     };
 
@@ -94,6 +99,11 @@ export const analysisApi = {
     }
 
     return toCamelCase<AnalyzeAsyncResponse>(response.data);
+  },
+
+  getModels: async (): Promise<AnalysisModelsResponse> => {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/analysis/models');
+    return toCamelCase<AnalysisModelsResponse>(response.data);
   },
 
   /**

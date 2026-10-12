@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -218,6 +219,18 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(top[0]["name"], "地产")
         self.assertEqual(bottom[0]["name"], "煤炭")
 
+    def test_empty_ranking_pair_does_not_hide_fallback(self) -> None:
+        primary = _DummyFetcher("EmptyProvider", priority=0, rankings=([], []))
+        fallback = _DummyFetcher("ValidProvider", priority=1, rankings=(
+            [{"name": "行业A", "change_pct": 1.0}], [{"name": "行业B", "change_pct": -1.0}],
+        ))
+        manager = DataFetcherManager(fetchers=[primary, fallback])
+        top, bottom, chain, _ = manager._get_sector_rankings_with_meta(1)
+        self.assertEqual(top[0]["name"], "行业A")
+        self.assertEqual(bottom[0]["name"], "行业B")
+        self.assertEqual(chain[0]["result"], "empty")
+        self.assertEqual(chain[1]["result"], "ok")
+
     def test_fundamental_context_aggregates_blocks(self) -> None:
         manager = DataFetcherManager(fetchers=[])
         cfg = SimpleNamespace(
@@ -252,6 +265,45 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertIn("growth", ctx)
         self.assertIn("capital_flow", ctx)
         self.assertIn("dragon_tiger", ctx)
+
+    def test_fundamental_context_does_not_mark_stale_forecast_as_ok(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=0,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        stale_forecast = pd.DataFrame(
+            {
+                "股票代码": ["600519"],
+                "报告期": ["2020-03-31"],
+                "预告": ["2020Q1 stale forecast"],
+            }
+        )
+
+        def _fake_call(_self, candidates, **_deadline_options):
+            func_name, _kwargs = candidates[0]
+            if func_name in {"stock_yjyg_em", "stock_yjbb_em", "stock_yjkb_em"}:
+                return stale_forecast, func_name, []
+            return None, None, []
+
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote", return_value=None), \
+                patch(
+                    "data_provider.fundamental_adapter.AkshareFundamentalAdapter._call_df_candidates",
+                    side_effect=_fake_call,
+                    autospec=True,
+                ), \
+                patch.object(manager, "get_capital_flow_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_dragon_tiger_context", return_value={"status": "not_supported", "source_chain": []}), \
+                patch.object(manager, "get_board_context", return_value={"status": "not_supported", "source_chain": []}):
+            ctx = manager.get_fundamental_context("600519", budget_seconds=1.5)
+
+        self.assertNotEqual(ctx["earnings"]["status"], "ok")
+        self.assertNotIn("forecast_summary", ctx["earnings"].get("data") or {})
+        self.assertIn("not_supported", ctx["coverage"].get("earnings"))
 
     def test_fundamental_context_derives_ttm_dividend_yield_from_quote_price(self) -> None:
         manager = DataFetcherManager(fetchers=[])

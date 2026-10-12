@@ -33,14 +33,17 @@ CANONICAL_DECISION_SCALE: tuple[DecisionScaleBand, ...] = (
 
 CANONICAL_DECISION_SCALE_PROMPT_ZH = """## Canonical 评分与动作口径
 
-- `sentiment_score`、`operation_advice`、三态 `decision_type` 与八态 `action` 必须按同一口径表达。
+- `raw_score` 是模型原始评分；`adjusted_score` 是最终评分；兼容字段 `sentiment_score` 必须等于 `adjusted_score`。
+- 最终 `operation_advice`、`action_label`、三态 `decision_type` 必须全部由最终 `action` 派生，不得分别生成互相矛盾的值。
 - 80-100：强烈买入，`action=buy`，`decision_type=buy`。
 - 60-79：买入，`action=buy`，`decision_type=buy`。
 - 40-59：观望，`action=watch`，`decision_type=hold`。
 - 20-39：减仓，`action=reduce`，`decision_type=sell`。
 - 0-19：卖出，`action=sell`，`decision_type=sell`。
 - `decision_type` 只保留 `buy|hold|sell` 兼容统计；更细建议必须写入 `action`。
-- 若 score >= 60 但最终 `action` 是 `hold/watch`，或 score < 40 但最终 `action` 是 `hold/watch`，必须在 `guardrail_reason` 或 `dashboard.decision_stability.reason` 中说明降级原因。"""
+- 可选数据缺失只能写入 `limitations` 并降低 `confidence_level`，禁止因此修改评分或动作。
+- 只有 `guardrail.applied=true` 且同时提供明确 `reason_code`、`reason`、`raw_score`、`adjusted_score`、`score_delta` 时，才允许调整评分；`score_delta` 必须等于 adjusted_score-raw_score，最终 action 必须与 adjusted_score 区间一致。
+- 同时输出 `position_actions.empty` 与 `position_actions.holding`，每项包含 `action` 和 `advice`；`holding` 可在证据充分时额外输出正数 `stop_loss` 与 `target_price`，无法可靠给出时必须省略，不得用顶层入场止损/止盈补齐；通用顶层 `action` 仍表达方向判断。"""
 
 
 def normalize_score(value: Any) -> Optional[int]:

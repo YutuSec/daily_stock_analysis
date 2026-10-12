@@ -321,6 +321,8 @@ For the notification baseline, diagnostics, and deployment notes, see [Notificat
 
 > Behavior note: Search and social sentiment are optional enhancement services. If either service fails to initialize, the system logs a warning and degrades gracefully by skipping that stage without blocking the core analysis flow.
 
+> Tavily retains `advanced` search depth; temporary quota shortages do not silently reduce retrieval quality. Responses distinguish quota, rate-limit, authentication/permission, network and timeout failures. Recognized failures cool down only the affected key: quota defaults to one hour, rate limiting to 60 seconds (Retry-After may be parsed from the exception), and authentication/permission to 24 hours. Keys become eligible again after cooldown without a restart. Existing provider fallback order remains in effect; if every source fails, unavailable news is not evidence of absent risks. Returned usage information and sanitized errors may be recorded, never plaintext keys.
+
 ### Data Source Configuration
 
 | Variable | Description | Default | Required |
@@ -364,6 +366,11 @@ For the notification baseline, diagnostics, and deployment notes, see [Notificat
 >   - `AnalysisReport.details.sector_rankings` = sector leaderboard in structured report details for board-linkage display.
 >   - `AnalysisReport.details.concept_rankings` = concept/theme leaderboard in structured report details for Web related-board signal matching and notification table type labels.
 > - **Sector leaderboard** uses a fixed fallback order: consistent with global priority.
+> - A-share valuation, the financial-report bundle, capital flow, dragon-tiger and board blocks run independently under a shared stage deadline. Existing provider-worker limits still apply. Individual fetches use `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS`; the multi-endpoint financial bundle may use the remaining stage budget.
+> - Completed financial sub-blocks are captured in independent snapshots. A later institution/shareholder timeout does not discard an already fetched report, and late results cannot mutate the returned snapshot. Failed blocks retain their errors: a failed request is not evidence of zero capital flow or absence from the dragon-tiger list.
+> - Institution/shareholder requests use explicit reporting periods and endpoint-specific symbols: `YYYYQ` for institution quarters, and a market-prefixed symbol plus `YYYYMMDD` for top-ten shareholders. Default stocks/old periods, institution recommendations and shareholder headcounts are not substitutes for holdings.
+> - Net capital amounts are separate from net-flow percentages and ranks. Stock flow includes `stock_flow_meta` date, source and validity; missing or stale observations do not enter the current flow bias. Dragon-tiger lookup uses dated details by default: institution-only statistics cannot establish complete-list absence, and a monthly summary cannot replace the exact 20-day window. Failed or indeterminate results remain unknown.
+> - Industry rise/fall rankings fall back from failed, timed-out or invalid Eastmoney results to Sina HTTPS with bounded waits and pacing. Opportunity-pool Eastmoney constituent requests prefer `BK` board codes; the existing Sina concept fallback only applies to matching concepts. Industry percentage changes must never masquerade as industry net capital inflows.
 > - **Timeout control** is a `best-effort` soft timeout: the stage will quickly degrade and continue execution based on the budget, but does not guarantee a hard interrupt of underlying third-party network calls.
 > - `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS=8.0` indicates the target budget for the newly added fundamental stage, not a strict hard SLA; Windows, Docker, or rate-limited free data sources can raise it to `12-15s`.
 > - For a hard SLA, please upgrade to isolated child process execution in future versions to forcefully terminate timeout tasks.
@@ -381,6 +388,7 @@ For the notification baseline, diagnostics, and deployment notes, see [Notificat
 | `SCHEDULE_ENABLED` | Enable scheduled tasks | `false` |
 | `SCHEDULE_TIME` | Scheduled execution time | `18:00` |
 | `SCHEDULE_TIMES` | Multiple scheduled execution times, comma-separated; falls back to `SCHEDULE_TIME` when empty | empty |
+| `SCHEDULE_MULTI_MODEL_ENABLED` | Run every currently configured LLM independently for each scheduled batch, with cross-model fallback disabled and model-specific report filenames | `false` |
 | `SCHEDULE_RUN_IMMEDIATELY` | Run once immediately when scheduler mode starts; when unset it keeps following the legacy `RUN_IMMEDIATELY` runtime override | `true` |
 | `RUN_IMMEDIATELY` | Run once immediately for non-scheduler startup; also acts as the legacy fallback when `SCHEDULE_RUN_IMMEDIATELY` is unset | `true` |
 | `LOG_DIR` | Log directory | `./logs` |
@@ -660,9 +668,15 @@ crontab -e
 >
 > The Web/API runtime scheduler run-now endpoint only accepts a request when no analysis is already running; if an analysis is in progress, it returns a busy response instead of reporting a queued run.
 
+> Single-model and multi-model scheduled batches independently attempt opportunity recovery and the end-of-day paper monitor even when analysis fails. One failed stage does not skip the other or delete saved reports; failures are aggregated after all stages have been attempted. Intraday/opening-confirmation service exceptions also reach scheduler failure state instead of advancing success timestamps. Closed sessions, no eligible objects, and no triggered fills are not errors.
+
 ### Market Phase Baseline (Issue #1386 P0)
 
-P0 only adds an internal market-phase inference baseline. It does not change the existing daily post-market report, trading-day skip behavior, effective trading date resolution, API, Web, Bot, Agent, or GitHub Actions defaults. The phase inference is preparation for the P1+ context contract. If `exchange-calendars` is unavailable or the calendar lookup fails, the phase returns `unknown`; the existing trading-day filter and effective-date helpers keep their current fail-open behavior.
+Scheduled trading-day filtering recognizes numeric CN symbols and SH/SZ/SS/BJ prefixes, dotted prefixes and suffixes (for example `SZ159915`, `SH.513980`, `002714.SZ`). This only identifies the market: watchlist identifiers are preserved and instruments from different exchanges are not merged. Closed-session stocks are skipped without new stock reports or notifications. Explicit `--force-run` and disabled trading-day checks retain their existing behavior.
+
+Market-phase inference uses an internal regular-session baseline. Missing `exchange-calendars` or calendar lookup errors produce `unknown`. Trading-day filtering now requires trusted evidence: calendar errors fail the scheduled batch with `calendar_unavailable`, and unidentified stock markets are not automatically permitted. Only markets relevant to this batch/review are checked. Historical effective-date fallback is for data retrieval, not permission to analyze or trade. Explicit `--force-run` or disabled trading-day checks remain available for manual research.
+
+Partial stock-analysis failure preserves successful reports but fails the scheduled batch. CLI/Web scheduled callbacks and background callbacks do not advance success timestamps after a failure return or exception. Shared leases record failure and running locks are released; subsequent scheduled tasks remain usable. This does not imply automatic retry or notification resend.
 
 The phase labels describe regular-session state:
 
@@ -1101,6 +1115,7 @@ System defaults to AkShare (free), also supports other data sources:
 ### Baostock
 - Free, no configuration needed
 - Used as backup data source
+- `BAOSTOCK_SOCKET_TIMEOUT` (default 30 seconds) bounds login and query sockets; on timeout the next source is tried
 
 ### YFinance
 - Free, no configuration needed
@@ -1203,9 +1218,21 @@ This post-processing update only adjusts advisory wording and stability logic an
 Compatibility check result: decision operability and runtime post-processing paths are changed, while model/provider/API configuration and persistence semantics remain unchanged; the compatibility boundary is now in analysis/pipeline/agent intent inference and stabilization mapping.
 Verification trail: the runtime behavior is implemented in `src/analyzer.py`, `src/core/pipeline.py`, `src/core/backtest_engine.py`, `src/report_language.py`, and `src/agent` decision-path modules (with corresponding tests in `tests/test_backtest_engine.py`, `tests/test_analyzer_news_prompt.py`, `tests/test_decision_stability.py`, and `tests/test_agent_pipeline.py`); it does not add/remove runtime config fields or config-cleanup logic in `src/config.py` or persistence code paths.
 
-### Decision Action Taxonomy (#1390 P0)
+### Unified score and action contract
 
-Single-stock reports now keep the existing free-text `operation_advice` and add optional `action` / `action_label` fields for structured display in Web history, StockBar, same-stock history, and backtest result rows. `decision_type` remains the legacy `buy|hold|sell` statistics contract; an empty `action` does not rewrite the existing `decision_type` inference chain.
+Single-stock reports use one machine-readable decision contract. `raw_score` preserves the model score, `adjusted_score` is the final score, and compatibility field `sentiment_score` always equals `adjusted_score`. The general score action follows the final score band and remains market-stance evidence. When the report freezes a known holding state, one account-effective action is then resolved from the matching `position_actions` branch, and Home, history, DecisionSignal, and paper trading consume that same effective action instead of independently reinterpreting the recommendation.
+
+Missing optional data is recorded in `limitations` and may reduce `confidence_level`, but it cannot force a score to 59 or turn buy into watch. A score change is accepted only from a complete structured `guardrail` containing `applied=true`, a stable `reason_code`, an explicit `reason`, `raw_score`, `adjusted_score`, and an arithmetically consistent `score_delta`. The final action must still match the adjusted score band. Narrative-only reasons, legacy free text, and candidate rules with `applied=false` cannot change it.
+
+Reports may explicitly provide `position_actions.empty` and `position_actions.holding`. The low-sensitive frozen `holding_state` selects the account-effective action: `empty` consumes only the empty branch, `holding` consumes only the holding branch, and `unknown` never guesses ownership. An empty report cannot display or execute `hold/reduce/sell` inherited from a general or wrong-state branch; a missing valid empty branch fails closed to `watch/avoid`. The general score action remains market-stance and audit evidence, while history APIs, Home, and new DecisionSignals consume the holding-aware effective action. Current mutable holdings never rewrite a historical report or its SQLite row.
+
+LLM call failures, balance/auth provider errors, JSON parsing failures, and schema validation failures are stored as `analysis_attempts` only; they are not persisted to `analysis_history` as valid reports. The Home stock bar reconciles attempts by stock and model, surfaces the latest failed/degraded reason first, and still shows the latest successful report time for diagnostics.
+
+The standard single-stock report path now selects the structured-output route by provider. The analysis temperature still comes from `LLM_TEMPERATURE` / runtime configuration and is not proactively lowered for formatting stability. The official DeepSeek Responses route is limited to the currently documented V4 model family (for example `deepseek/deepseek-v4-pro` and `deepseek/deepseek-v4-flash`, with Base URL `https://api.deepseek.com`). It uses DeepSeek Responses API `json_schema` as the primary final structured-output path with thinking effort kept enabled; it no longer models report submission as the synthetic `submit_analysis_report` tool and does not disable thinking for formatting. Both the first report attempt and integrity-completion retry remain on this official Responses JSON Schema path, instead of falling back to the old Tool Call path or configured fallback models because `_structured_resubmission` is set. Because DeepSeek counts reasoning and visible text together under `max_output_tokens`, the official report route uses the current official 384K (393,216) token maximum from the first request instead of staged 16K/32K budgets; this is only a generation ceiling and actual usage is metered. It checks Responses `status` / `incomplete_details` before parsing and extracts only `message/output_text`, never `reasoning_text`. If Responses is unavailable, empty, or explicitly ends as `incomplete/max_output_tokens`, the same supported DeepSeek V4 model receives at most one Chat Completions JSON Output fallback attempt with the same 393,216-token ceiling rather than an enlarged second-stage budget. `content_filter`, a `completed` response that still fails JSON/report-core/trading-critical validation, or a truncated Chat fallback remains fail-closed: no cross-model fallback, no free-text parser recovery, and no DecisionSignal or paper-trading plan. Legacy Chat-compatible models such as `deepseek-chat`, non-official DeepSeek gateways, and Claude/Gemini/OpenAI-compatible routes keep their existing provider-specific structured behavior. Routes that still use Tool Schema continue to accept only one matching tool call; plain text, empty arguments, wrong tools, multiple calls, schema-version mismatches, and invalid JSON fail closed. The prompt still keeps the full reasoning chain: market phase, daily market context, market structure, technicals, volume/turnover, chip structure, fundamentals, news, holding state, risk/reward, action timing, score calibration, position branches, field semantics, and cross-field consistency. Local CLI, Agent, and other non-native-tool paths retain their existing contracts and are not misclassified as `analysis-report-tool-v1`.
+
+New `analysis-report-tool-v1` separates report visibility from trade execution. The Tool Schema and receiver fail a report only for JSON syntax, unique-tool, schema-version, score, structured `action`, `confidence_level`, and `position_actions.*.action` violations. Display/explanation/metadata fields such as `stock_name`, `trend_prediction`, legacy `operation_advice`, `decision_type`, `analysis_summary`, `key_points`, `risk_warning`, `buy_reason`, news, fundamentals, hot topics, the one-sentence conclusion, `risk_alerts`, `action_checklist`, `search_performed`, confidence rationale, and data limitations may be missing or shape-drifted without failing the whole report; the receiver keeps them empty, normalizes them into text/lists, or records limitations.
+
+Buy/add reports must still satisfy the executable buy contract before they can create monitorable plans: `entry_leg_schema_version=entry-legs-v1`, at least one bounded `close_between` entry leg, unique increasing leg order, valid allocations, explicit stop loss, explicit final target, `exit_leg_schema_version=exit-legs-v1`, increasing exit targets, exit allocation totaling approximately 1.0, and the price order `stop loss < entry range < final target`. They must also provide the execution-consumed phase fields `action_window`, `immediate_action`, `watch_conditions`, and `next_check_time`. The existing score/action unification still applies: if a high-score watch is normalized to buy, it must satisfy the same executable contract. If completion fails, the report can remain visible for reading, but no DecisionSignal or paper-trading plan is created. When evidence is insufficient, the model should output a score-consistent `watch/avoid` instead of fabricating prices. Rollback is to revert the report Tool Schema / integrity-check change set; no `.env` change is required.
 
 | `action` | Common source text | `decision_type` bridge |
 | --- | --- | --- |
@@ -1215,12 +1242,10 @@ Single-stock reports now keep the existing free-text `operation_advice` and add 
 | `watch` | `watch`, `观望`, `等待`, `wait` | `hold` |
 | `reduce` | `reduce`, `减仓`, `trim` | `sell` |
 | `sell` | `sell`, `卖出`, `清仓`, `strong_sell`, `强烈卖出` | `sell` |
-| `avoid` | `avoid`, `回避`, `规避`, `不建议买入`, `避免买入`, `do not buy` | `hold` |
-| `alert` | `alert`, `风险预警`, `警惕`, `触发告警`, `risk alert` | `hold` |
+| `avoid` | `avoid`, `回避`, `规避`, `不建议买入`, `避免买入`, `do not buy` | `sell` |
+| `alert` | `alert`, `风险预警`, `警惕`, `触发告警`, `risk alert` | `sell` |
 
-The `decision_type` bridge in the table only documents compatibility between the eight-state action taxonomy and the legacy three-state statistics contract. #1390 P0 does not automatically write `action` back into the existing `decision_type`. If upstream sends both an explicit `action` and a semantically different `decision_type`, legacy statistics, backtesting, and old report semantics still follow `decision_type` / the existing inference chain; `action/action_label` remains structured display metadata.
-
-Unknown or ambiguous advice is not coerced into `watch` or `hold`; it returns empty `action/action_label`. Web history cards, StockBar, same-stock history drawers, and backtest result rows use `operation_advice` as a display-only fallback when old records do not have `action/action_label`; that fallback affects only the UI label and is not a stable API action or future signal asset. When Web receives both `action` and `action_label`, it first renders the label from `action` in the current UI language; API `action_label` remains report-language display metadata for non-Web clients or compatibility display when `action` is absent. Market review and other non-stock reports do not emit trading `action` values and keep only the `operation_advice` text. `dashboard.phase_decision.immediate_action` belongs to the market-phase guardrail report block and is not used by the #1390 P0 eight-state action derivation. The final market phase still comes from `report.meta.market_phase_summary.phase`.
+Unknown or ambiguous legacy advice is not silently coerced into `watch` or `hold`. Web may retain display-only fallback for old rows, but new reports, three-state statistics, and downstream signal assets use the normalized final `action`. Market review and other non-stock reports do not emit trading actions; `dashboard.phase_decision.immediate_action` remains a separate market-phase field.
 
 #1390 P0 does not flatten future signal-asset fields into current report summaries, history lists, StockBar rows, or backtest responses. #1390 P1 now carries more granular plan fields such as `horizon`, `plan_quality`, and `status` through an independent `DecisionSignal` resource; it still does not change the existing report contract, backfill history, or add configuration.
 
@@ -1276,15 +1301,20 @@ Regular stock history report details no longer embed the extracted `source_type=
 
 ## Backtesting
 
+To generate separate local reports with multiple LLMs and compare their backtest performance by model, see [Local multi-LLM analysis and backtest comparison](llm-comparison-backtest_EN.md).
+
 The backtesting module automatically validates historical AI analysis records against actual price movements, evaluating the accuracy of analysis recommendations.
 
 ### How It Works
 
 1. Selects `AnalysisHistory` records past the cooldown period (default 14 days)
 2. Fetches daily bar data after the analysis date (forward bars)
-3. Infers expected direction from the operation advice and compares against actual movement
-4. Evaluates stop-loss/take-profit hit conditions and simulates execution returns
-5. Aggregates into overall and per-stock performance metrics
+3. Uses the report-time frozen general final action for direction evaluation
+4. Separately evaluates holding decisions when report-time holding state and action were explicitly frozen
+5. Evaluates stop-loss/take-profit hit conditions and simulates execution returns
+6. Aggregates by overall, stock, and model dimensions
+
+Per-result `action/action_label/operation_advice` fields display the account-effective action selected by the report-time frozen holding state, so an empty report is not presented as reduce/sell. Direction accuracy still uses the general final action from step 3, while holding metrics still use the holding branch from step 4; correcting display does not collapse the two metric families.
 
 ### Operation Advice Mapping
 
@@ -1306,21 +1336,36 @@ Set the following variables in `.env` (all optional, have defaults):
 | `BACKTEST_MIN_AGE_DAYS` | `14` | Only backtest records older than N days to avoid incomplete data |
 | `BACKTEST_ENGINE_VERSION` | `v1` | Engine version, used to distinguish results when logic is updated |
 | `BACKTEST_NEUTRAL_BAND_PCT` | `2.0` | Neutral band threshold (%), ±2% treated as range-bound |
+| `PAPER_TRADING_ENABLED` | `false` | Build report-derived plans and run paper-trading monitoring |
+| `PAPER_TRADING_INTRADAY_ENABLED` | `false` | Enable realtime quote polling in schedule mode |
+| `PAPER_TRADING_INTRADAY_INTERVAL_MINUTES` | `5` | Intraday paper-monitor polling interval in minutes |
+| `PAPER_TRADING_INTRADAY_MIN_FACTOR_DOMAINS` | `2` | Minimum available and passing market-factor domains required for automatic paper entry |
+| `PAPER_TRADING_INTRADAY_MIN_COMPOSITE_SCORE` | `0.6` | Market-factor weighted composite score threshold for automatic paper entry |
+| `PAPER_TRADING_INTRADAY_MIN_RISK_REWARD` | `1.2` | Minimum reward/risk ratio for automatic paper entry |
+| `PAPER_TRADING_INTRADAY_MAX_QUOTE_STALE_SECONDS` | `360` | Maximum accepted realtime quote staleness for intraday monitoring |
 
 ### Auto-run
 
 Backtesting triggers automatically after the daily analysis flow completes (non-blocking; failures do not affect notifications). It can also be triggered manually via API.
+
+Paper trading is an independent, opt-in metric and does not change the 14-day backtest. With scheduled multi-model analysis, all model reports finish before the post-close monitor runs once; scheduled/postmarket reports take authority in the next session, while a manual Web/API analysis completed during continuous trading may take authority immediately in that same session. A latest watch or non-executable report freezes older unfilled entry legs. Filled lots remain monitored, and a post-entry same-model `position_actions.holding.stop_loss/target_price` may safely and idempotently tighten or update effective risk. Automatic entries still require explicit report rules, valid stop/target, minimum reward/risk, at least two market-factor domains, and the market-factor weighted score threshold. Explicit `exit_legs` staged exits compute weighted target price and reward/risk across all exit fractions and execute each target once, while legacy `take_profit` remains single-target compatible. Plans rejected for `risk_reward_below_policy` create one same-model corrective reanalysis request and remain non-executable/blocked until a replacement report is stored; thresholds are not lowered and model prices are not silently edited. The market opportunity pool's `MARKET_OPPORTUNITY_MODE` is hot-switched through a shared database runtime setting; after a Web/API save, server and analyzer read the same value on the next task without container restarts, while `.env` only remains the bootstrap default when no database value exists. See [Hybrid paper-trading monitor](paper-trading_EN.md) and [Market opportunity pool](market-opportunity-pool_EN.md) for rules, T+1, no-look-ahead constraints, APIs, and rollback.
 
 ### Evaluation Metrics
 
 | Metric | Description |
 |--------|-------------|
 | `direction_accuracy_pct` | Direction prediction accuracy (expected direction matches actual) |
+| `direction_evaluable_count` | Number of rows included in direction accuracy |
+| `holding_decision_accuracy_pct` | Holding-decision accuracy for rows with an explicit frozen holding action and enough forward data |
+| `holding_applicable_count` / `holding_evaluable_count` | Rows with a frozen holding action / rows that also have enough forward data to score |
+| `avg_holding_decision_return_pct` | Execution return from analysis-day close; keeping exposure follows stock return, reducing/exiting stays at 0% cash return |
 | `win_rate_pct` | Win rate (wins / (wins + losses), excludes neutral) |
 | `avg_stock_return_pct` | Average stock return percentage |
 | `avg_simulated_return_pct` | Average simulated execution return (including SL/TP exits) |
 | `stop_loss_trigger_rate` | Stop-loss trigger rate (only counts records with SL configured) |
 | `take_profit_trigger_rate` | Take-profit trigger rate (only counts records with TP configured) |
+
+The two metric families are independent. General `buy/add` expects up, `hold` expects not-down, and `reduce/sell/avoid` expects down. For a frozen holding action, `buy/add` expects up, `hold` expects not-down, and `reduce/sell/avoid` expects down; `watch/alert` is unavailable because it does not define exposure. Both metrics start from the analysis-day close. Holding evaluation reads only the low-sensitivity report-time snapshot, never the current portfolio, and does not persist account, quantity, or cost details.
 
 ---
 
@@ -1342,7 +1387,7 @@ FastAPI provides RESTful API service for configuration management and triggering
 ### Features
 
 - **Configuration Management** - View/modify watchlist
-- **Home workspace tri-view** - Home now has History / Watchlist / Today tabs, with History as the default view; Watchlist supports batch submission for all stocks or only those not analyzed today
+- **Home workspace tri-view** - Home now has History / Watchlist / Today tabs, with History as the default view; History can analyze checked or all currently displayed stocks, while Watchlist supports batch submission for all stocks or only those not analyzed today. Market-review rows are never submitted as stock-analysis tasks.
 - **UI Language Switch** - Toggle UI language (`zh`/`en`) on login page, shell/navigation, settings page, and shared controls; this switch is independent of `REPORT_LANGUAGE`.
 - **Quick Analysis** - Trigger stock analysis via API; the Home page also provides a Market Review button that starts a background market recap in Docker/server mode
 - **Strategy selection** - The Home page supports explicitly selecting analysis strategy skills; when `skills` is omitted, analysis uses the server default strategy so legacy clients keep existing behavior
@@ -1540,7 +1585,7 @@ A: Check if Actions is enabled, and if cron expression is correct (note it's UTC
 - The button calls the existing `POST /api/v1/portfolio/fx/refresh` endpoint and reloads snapshot/risk data only.
 - If upstream FX fetch fails, the page may still remain stale after refresh and will explain the fallback result inline.
 - When `PORTFOLIO_FX_UPDATE_ENABLED=false`, the refresh API returns an explicit disabled status and the page shows that online FX refresh is disabled instead of implying that no refreshable pairs exist.
-- Portfolio snapshot `positions[]` includes price metadata such as `price_source`, `price_date`, `price_stale`, and `price_available`. Today's snapshot tries realtime quotes by default, then falls back to the latest historical close on or before `as_of` when the realtime quote is unavailable or non-positive. Passing `include_realtime=false` skips realtime quotes and uses the local historical-close fallback path directly; the Web portfolio page uses this mode to render holdings before slow external realtime quote sources can block the first screen. Historical `as_of` snapshots stay on historical-close semantics and no longer silently treat cost basis as the current price. Missing-price positions are marked with `price_available=false` and excluded from market value / unrealized PnL totals.
+- Portfolio snapshot `positions[]` includes price metadata such as `price_source`, `price_date`, `price_stale`, and `price_available`. Today's snapshot tries realtime quotes by default, then falls back to the latest historical close on or before `as_of` when the realtime quote is unavailable or non-positive. Passing `include_realtime=false` skips realtime quotes and uses closing prices directly; the Web portfolio page uses this mode. If no local close exists for the current `as_of` date, the backend fetches daily bars through the existing data-source fallback chain up to `as_of`, persists them locally, and retries valuation without calling the realtime-quote path. CN daily-price aliases are matched only when the exchange is explicit, so `SH512480` and `512480.SH` are equivalent while bare `512480` is not assigned to an exchange. Historical `as_of` snapshots do not trigger online backfill and no longer silently treat cost basis as the current price. Positions that remain unpriced are marked with `price_available=false` and excluded from market value / unrealized PnL totals.
 
 ## Agent Tool Data Cache And Persistence
 

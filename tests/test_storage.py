@@ -16,7 +16,19 @@ from sqlalchemy.sql import func
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.config import Config
-from src.storage import Base, CURRENT_SCHEMA_VERSION, DatabaseManager, DatabaseSchemaMigration, StockDaily
+from src.storage import (
+    REPORT_EXECUTION_INTENT_BASELINE_VERSION,
+    AnalysisHistory,
+    AnalysisReportExecutionIntent,
+    Base,
+    CURRENT_SCHEMA_VERSION,
+    DatabaseManager,
+    DatabaseSchemaMigration,
+    PaperAccountRiskEvent,
+    PaperAccountRiskSnapshot,
+    StockDaily,
+    evaluate_report_execution_intent,
+)
 
 class TestStorage(unittest.TestCase):
 
@@ -51,6 +63,14 @@ class TestStorage(unittest.TestCase):
                         index_columns.append(column_name)
                 unique_indexes[index_name] = index_columns
             return unique_indexes
+
+    @staticmethod
+    def _list_sqlite_foreign_keys(db_path: str, table_name: str) -> list[tuple[str, str, str]]:
+        with sqlite3.connect(db_path) as conn:
+            return [
+                (row[2], row[3], row[4])
+                for row in conn.execute(f"PRAGMA foreign_key_list({table_name})").fetchall()
+            ]
 
     def test_legacy_intelligence_items_url_unique_index_rebuilds_without_collision(self) -> None:
         temp_dir = tempfile.TemporaryDirectory()
@@ -172,12 +192,273 @@ class TestStorage(unittest.TestCase):
 
         with db.get_session() as session:
             count = session.execute(
-                select(func.count()).select_from(DatabaseSchemaMigration)
+                select(func.count())
+                .select_from(DatabaseSchemaMigration)
+                .where(DatabaseSchemaMigration.version == CURRENT_SCHEMA_VERSION)
             ).scalar_one()
 
         self.assertEqual(count, 1)
 
         DatabaseManager.reset_instance()
+
+    def test_paper_account_risk_tables_are_created_with_unique_keys_and_fk_idempotently(self):
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temp_dir.name, "paper_risk_schema.db")
+
+        try:
+            DatabaseManager(db_url=f"sqlite:///{db_path}")
+            DatabaseManager.reset_instance()
+            DatabaseManager(db_url=f"sqlite:///{db_path}")
+
+            with sqlite3.connect(db_path) as conn:
+                tables = {
+                    row[0] for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                self.assertIn(PaperAccountRiskSnapshot.__tablename__, tables)
+                self.assertIn(PaperAccountRiskEvent.__tablename__, tables)
+                snapshot_unique = self._list_sqlite_unique_indexes(
+                    db_path,
+                    PaperAccountRiskSnapshot.__tablename__,
+                )
+                event_unique = self._list_sqlite_unique_indexes(
+                    db_path,
+                    PaperAccountRiskEvent.__tablename__,
+                )
+                self.assertTrue(any(cols == ["snapshot_key"] for cols in snapshot_unique.values()))
+                self.assertTrue(any(cols == ["event_key"] for cols in event_unique.values()))
+                event_fks = self._list_sqlite_foreign_keys(db_path, PaperAccountRiskEvent.__tablename__)
+                self.assertIn(("paper_capital_accounts", "capital_account_id", "id"), event_fks)
+                self.assertIn(("paper_account_risk_snapshots", "snapshot_id", "id"), event_fks)
+                self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+        finally:
+            DatabaseManager.reset_instance()
+            Config.reset_instance()
+            temp_dir.cleanup()
+
+    def test_legacy_analysis_history_backfills_model_used(self):
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temp_dir.name, "legacy_analysis_history.db")
+
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "CREATE TABLE analysis_history ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, raw_result TEXT)"
+                )
+                conn.executemany(
+                    "INSERT INTO analysis_history (raw_result) VALUES (?)",
+                    [
+                        ('{"model_used":"provider/model-a"}',),
+                        ('{"model_used":""}',),
+                        ('not-json',),
+                    ],
+                )
+
+            DatabaseManager(db_url=f"sqlite:///{db_path}")
+
+            with sqlite3.connect(db_path) as conn:
+                columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(analysis_history)")
+                }
+                values = conn.execute(
+                    "SELECT model_used FROM analysis_history ORDER BY id"
+                ).fetchall()
+
+            self.assertIn("model_used", columns)
+            self.assertEqual(values, [("provider/model-a",), (None,), (None,)])
+            self.assertEqual(
+                self._list_sqlite_indexes(db_path, "analysis_history").get(
+                    "ix_analysis_history_model_used"
+                ),
+                ["model_used"],
+            )
+        finally:
+            DatabaseManager.reset_instance()
+            Config.reset_instance()
+            temp_dir.cleanup()
+
+    def test_legacy_backtest_tables_gain_dual_metric_columns_idempotently(self):
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temp_dir.name, "legacy_backtest_metrics.db")
+
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE analysis_history (id INTEGER PRIMARY KEY, raw_result TEXT)")
+                conn.execute("CREATE TABLE backtest_results (id INTEGER PRIMARY KEY)")
+                conn.execute(
+                    "CREATE TABLE backtest_summaries ("
+                    "id INTEGER PRIMARY KEY, total_evaluations INTEGER)"
+                )
+                conn.execute(
+                    "INSERT INTO backtest_summaries (id, total_evaluations) VALUES (1, 7)"
+                )
+
+            db = DatabaseManager(db_url=f"sqlite:///{db_path}")
+            db._ensure_backtest_metric_columns()
+
+            with sqlite3.connect(db_path) as conn:
+                result_columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(backtest_results)")
+                }
+                summary_columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(backtest_summaries)")
+                }
+                holding_unavailable_count = conn.execute(
+                    "SELECT holding_unavailable_count FROM backtest_summaries WHERE id = 1"
+                ).fetchone()[0]
+
+            self.assertIn("holding_action_evaluable", result_columns)
+            self.assertIn("holding_decision_correct", result_columns)
+            self.assertIn("holding_evaluable_count", summary_columns)
+            self.assertIn("holding_decision_accuracy_pct", summary_columns)
+            self.assertEqual(holding_unavailable_count, 7)
+        finally:
+            DatabaseManager.reset_instance()
+            Config.reset_instance()
+            temp_dir.cleanup()
+
+    def test_legacy_paper_sync_links_rebuild_removes_refreshable_position_fk(self):
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temp_dir.name, "legacy_paper_sync_fk.db")
+
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE portfolio_positions (id INTEGER PRIMARY KEY)")
+                conn.execute("INSERT INTO portfolio_positions (id) VALUES (99)")
+                conn.execute(
+                    """CREATE TABLE paper_sync_links (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    idempotency_key VARCHAR(160) NOT NULL,
+                    payload_hash VARCHAR(64) NOT NULL,
+                    direction VARCHAR(32) NOT NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'synced',
+                    source_model VARCHAR(255) NOT NULL,
+                    market VARCHAR(8) NOT NULL,
+                    stock_code VARCHAR(16) NOT NULL,
+                    portfolio_account_id INTEGER REFERENCES portfolio_accounts(id),
+                    portfolio_position_id INTEGER REFERENCES portfolio_positions(id),
+                    portfolio_trade_id INTEGER REFERENCES portfolio_trades(id),
+                    paper_plan_id INTEGER REFERENCES paper_execution_plans(id),
+                    paper_position_id INTEGER REFERENCES paper_positions(id),
+                    paper_event_id INTEGER REFERENCES paper_trade_events(id),
+                    quantity FLOAT NOT NULL,
+                    price FLOAT NOT NULL,
+                    fee FLOAT NOT NULL DEFAULT 0,
+                    trade_date DATE NOT NULL,
+                    origin VARCHAR(32) NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL
+                )"""
+                )
+                conn.execute(
+                    "CREATE UNIQUE INDEX ix_paper_sync_links_idempotency_key "
+                    "ON paper_sync_links(idempotency_key)"
+                )
+                conn.execute(
+                    "CREATE INDEX ix_paper_sync_identity_direction "
+                    "ON paper_sync_links(source_model, market, stock_code, direction)"
+                )
+                conn.execute(
+                    "CREATE INDEX ix_paper_sync_portfolio_position "
+                    "ON paper_sync_links(portfolio_position_id, direction)"
+                )
+                conn.execute(
+                    """INSERT INTO paper_sync_links (
+                    id,
+                    idempotency_key,
+                    payload_hash,
+                    direction,
+                    status,
+                    source_model,
+                    market,
+                    stock_code,
+                    portfolio_position_id,
+                    quantity,
+                    price,
+                    fee,
+                    trade_date,
+                    origin,
+                    details_json,
+                    created_at,
+                    updated_at
+                ) VALUES (
+                    1,
+                    'import-1',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                    'portfolio_to_paper',
+                    'synced',
+                    'model-a',
+                    'cn',
+                    '600519',
+                    99,
+                    100,
+                    101,
+                    0,
+                    '2026-08-24',
+                    'portfolio_import',
+                    '{"note":"keep"}',
+                    '2026-08-24 09:30:00',
+                    '2026-08-24 09:30:00'
+                )"""
+                )
+
+            self.assertIn(
+                ("portfolio_positions", "portfolio_position_id", "id"),
+                self._list_sqlite_foreign_keys(db_path, "paper_sync_links"),
+            )
+
+            DatabaseManager(db_url=f"sqlite:///{db_path}")
+            DatabaseManager.reset_instance()
+            DatabaseManager(db_url=f"sqlite:///{db_path}")
+
+            foreign_keys = self._list_sqlite_foreign_keys(db_path, "paper_sync_links")
+            indexes = self._list_sqlite_indexes(db_path, "paper_sync_links")
+            unique_indexes = self._list_sqlite_unique_indexes(db_path, "paper_sync_links")
+            with sqlite3.connect(db_path) as conn:
+                row = conn.execute(
+                    "SELECT id, idempotency_key, portfolio_position_id, details_json "
+                    "FROM paper_sync_links"
+                ).fetchone()
+                temp_tables = conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name LIKE 'paper_sync_links_recreate_tmp_%'"
+                ).fetchall()
+
+            self.assertNotIn(
+                ("portfolio_positions", "portfolio_position_id", "id"),
+                foreign_keys,
+            )
+            self.assertIn(("portfolio_accounts", "portfolio_account_id", "id"), foreign_keys)
+            self.assertIn(("paper_positions", "paper_position_id", "id"), foreign_keys)
+            self.assertEqual(row, (1, "import-1", 99, '{"note":"keep"}'))
+            self.assertTrue(
+                any(columns == ["idempotency_key"] for columns in unique_indexes.values())
+            )
+            self.assertEqual(
+                indexes.get("ix_paper_sync_identity_direction"),
+                ["source_model", "market", "stock_code", "direction"],
+            )
+            self.assertEqual(
+                indexes.get("ix_paper_sync_portfolio_position"),
+                ["portfolio_position_id", "direction"],
+            )
+            self.assertEqual(temp_tables, [])
+        finally:
+            DatabaseManager.reset_instance()
+            Config.reset_instance()
+            temp_dir.cleanup()
 
     def test_fresh_decision_signal_schema_has_profile_indexes(self):
         DatabaseManager.reset_instance()
@@ -336,8 +617,13 @@ class TestStorage(unittest.TestCase):
             self.assertIn("guard_skipped_count=0", log_text)
             self.assertIn("missing_metadata_count=1", log_text)
             self.assertIn("missing_profile_count=4", log_text)
-            self.assertIn("invalid_json_count=5", log_text)
-            self.assertIn("non_object_count=4", log_text)
+            # CPython's JSON decoder may either reject the pathological deep
+            # nesting with RecursionError or decode it as a non-object. Both
+            # paths are safely skipped by the migration.
+            self.assertTrue(
+                ("invalid_json_count=5" in log_text and "non_object_count=4" in log_text)
+                or ("invalid_json_count=4" in log_text and "non_object_count=5" in log_text)
+            )
             self.assertIn("invalid_profile_count=1", log_text)
             self.assertIn("skipped_existing_profile_count=0", log_text)
 
@@ -350,8 +636,16 @@ class TestStorage(unittest.TestCase):
             self.assertIn("guard_skipped_count=0", second_log_text)
             self.assertIn("missing_metadata_count=1", second_log_text)
             self.assertIn("missing_profile_count=4", second_log_text)
-            self.assertIn("invalid_json_count=5", second_log_text)
-            self.assertIn("non_object_count=4", second_log_text)
+            self.assertTrue(
+                (
+                    "invalid_json_count=5" in second_log_text
+                    and "non_object_count=4" in second_log_text
+                )
+                or (
+                    "invalid_json_count=4" in second_log_text
+                    and "non_object_count=5" in second_log_text
+                )
+            )
             self.assertIn("invalid_profile_count=1", second_log_text)
             self.assertIn("skipped_existing_profile_count=1", second_log_text)
         finally:
@@ -1092,6 +1386,164 @@ class TestStorage(unittest.TestCase):
         finally:
             temp_dir.cleanup()
             DatabaseManager.reset_instance()
+
+    @staticmethod
+    def _intent_result(code: str = "600519"):
+        from src.analyzer import AnalysisResult
+
+        return AnalysisResult(
+            code=code,
+            name="贵州茅台",
+            sentiment_score=70,
+            trend_prediction="看多",
+            operation_advice="买入",
+        )
+
+    def test_report_execution_intent_is_frozen_with_first_report_save(self) -> None:
+        DatabaseManager.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory()
+        try:
+            db = DatabaseManager(db_url=f"sqlite:///{os.path.join(temp_dir.name, 'intent.db')}")
+            report_id = db.save_analysis_history(
+                result=self._intent_result(),
+                query_id="intent-save",
+                report_type="detailed",
+                news_content=None,
+                execution_intent={
+                    "execution_intent": "research_only",
+                    "execution_scope": "experiment:exp1:a",
+                    "decision_as_of": "2026-09-25",
+                    "intent_source": "unit_test",
+                },
+            )
+            self.assertGreater(report_id, 0)
+            intent = db.get_report_execution_intent(report_id)
+            self.assertEqual(
+                (
+                    intent.execution_intent,
+                    intent.execution_scope,
+                    intent.decision_as_of,
+                    intent.execution_policy_version,
+                    intent.intent_source,
+                ),
+                ("research_only", "experiment:exp1:a", date(2026, 9, 25), "report-execution-intent-v1", "unit_test"),
+            )
+
+            with self.assertRaisesRegex(ValueError, "immutable"):
+                with db.session_scope() as session:
+                    session.get(AnalysisReportExecutionIntent, intent.id).execution_intent = "paper_candidate"
+            self.assertEqual(db.get_report_execution_intent(report_id).execution_intent, "research_only")
+
+            self.assertEqual(db.delete_analysis_history_records([report_id]), 1)
+            self.assertIsNone(db.get_report_execution_intent(report_id))
+            with db.get_session() as session:
+                self.assertEqual(session.query(AnalysisReportExecutionIntent).count(), 0)
+        finally:
+            DatabaseManager.reset_instance()
+            temp_dir.cleanup()
+
+    def test_invalid_report_execution_intent_fails_the_whole_first_save(self) -> None:
+        DatabaseManager.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory()
+        try:
+            db = DatabaseManager(db_url=f"sqlite:///{os.path.join(temp_dir.name, 'intent-invalid.db')}")
+            for invalid in (
+                "paper_candidate",
+                {"execution_intent": "live_trade", "intent_source": "unit_test"},
+                {"execution_intent": "paper_candidate", "execution_scope": "account:main", "intent_source": "unit_test"},
+                {"execution_intent": "paper_candidate", "execution_scope": "experiment:Exp1:a", "intent_source": "unit_test"},
+                {"execution_intent": "paper_candidate", "execution_scope": "experiment:exp1:d", "intent_source": "unit_test"},
+                {"execution_intent": "paper_candidate", "intent_source": ""},
+            ):
+                with self.subTest(invalid=invalid):
+                    self.assertEqual(
+                        db.save_analysis_history(
+                            result=self._intent_result(),
+                            query_id="intent-invalid",
+                            report_type="detailed",
+                            news_content=None,
+                            execution_intent=invalid,
+                        ),
+                        0,
+                    )
+            with db.get_session() as session:
+                self.assertEqual(session.query(AnalysisHistory).count(), 0)
+                self.assertEqual(session.query(AnalysisReportExecutionIntent).count(), 0)
+
+            undeclared_id = db.save_analysis_history(
+                result=self._intent_result(),
+                query_id="intent-undeclared",
+                report_type="detailed",
+                news_content=None,
+            )
+            self.assertGreater(undeclared_id, 0)
+            self.assertEqual(
+                evaluate_report_execution_intent(
+                    db.get_report_execution_intent(undeclared_id), execution_scope="primary"
+                )["reason"],
+                "execution_intent_missing",
+            )
+        finally:
+            DatabaseManager.reset_instance()
+            temp_dir.cleanup()
+
+    def test_report_execution_intent_legacy_baseline_runs_once_for_stock_reports(self) -> None:
+        DatabaseManager.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temp_dir.name, "legacy-intent.db")
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "CREATE TABLE analysis_history ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, code VARCHAR(10), "
+                    "report_type VARCHAR(16), raw_result TEXT)"
+                )
+                conn.executemany(
+                    "INSERT INTO analysis_history (id, code, report_type, raw_result) VALUES (?, ?, ?, ?)",
+                    [
+                        (1, "600519", "detailed", "{}"),
+                        (2, "MARKET", "market_review", "{}"),
+                        (3, "000001", "market_review", "{}"),
+                        (4, "AAPL", None, "{}"),
+                    ],
+                )
+
+            db = DatabaseManager(db_url=f"sqlite:///{db_path}")
+            with sqlite3.connect(db_path) as conn:
+                baseline = conn.execute(
+                    "SELECT analysis_history_id, execution_intent, execution_scope, intent_source "
+                    "FROM analysis_report_execution_intents ORDER BY analysis_history_id"
+                ).fetchall()
+                marker = conn.execute(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+                    (REPORT_EXECUTION_INTENT_BASELINE_VERSION,),
+                ).fetchone()[0]
+                # A report written after the upgrade without a declared purpose.
+                conn.execute(
+                    "INSERT INTO analysis_history (id, code, report_type, raw_result) "
+                    "VALUES (5, '000858', 'detailed', '{}')"
+                )
+            self.assertEqual(
+                baseline,
+                [
+                    (1, "paper_candidate", "primary", "legacy_baseline"),
+                    (4, "paper_candidate", "primary", "legacy_baseline"),
+                ],
+            )
+            self.assertEqual(marker, 1)
+            self.assertTrue(evaluate_report_execution_intent(db.get_report_execution_intent(1), execution_scope="primary")["authorized"])
+
+            DatabaseManager.reset_instance()
+            db = DatabaseManager(db_url=f"sqlite:///{db_path}")
+            self.assertIsNone(db.get_report_execution_intent(5))
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM analysis_report_execution_intents").fetchone()[0],
+                    2,
+                )
+        finally:
+            DatabaseManager.reset_instance()
+            temp_dir.cleanup()
 
 if __name__ == '__main__':
     unittest.main()

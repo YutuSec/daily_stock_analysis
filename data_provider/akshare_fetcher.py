@@ -24,15 +24,19 @@ AkshareFetcher - 主数据源 (Priority 1)
 """
 
 import logging
+import math
 import multiprocessing
 import os
 import random
 import time
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
+from .volume_units import lots_to_shares
 import requests
 from tenacity import (
     retry,
@@ -62,6 +66,8 @@ logger = logging.getLogger(__name__)
 SINA_REALTIME_ENDPOINT = "hq.sinajs.cn/list"
 TENCENT_REALTIME_ENDPOINT = "qt.gtimg.cn/q"
 _AKSHARE_HISTORY_CALL_TIMEOUT = 30.0
+_AKSHARE_SECTOR_RANKING_CALL_TIMEOUT = 2.0
+_SECTOR_RANKING_RATE_LIMIT_WAIT = 0.5
 _AKSHARE_TIMEOUT_PROCESS_JOIN_GRACE = 1.0
 _AKSHARE_TIMEOUT_PROCESS_START_METHOD = "spawn"
 
@@ -579,6 +585,7 @@ class AkshareFetcher(BaseFetcher):
             # 标准化新浪数据列名
             # 新浪返回：date, open, high, low, close, volume, amount, outstanding_share, turnover
             if df is not None and not df.empty:
+                df.attrs['volume_unit'] = 'shares'  # stock_zh_a_daily: shares
                 # 确保日期列存在
                 if 'date' in df.columns:
                     df = df.rename(columns={'date': '日期'})
@@ -625,6 +632,9 @@ class AkshareFetcher(BaseFetcher):
                 call_name="ak.stock_zh_a_hist_tx",
             )
 
+            # stock_zh_a_hist_tx reports lots, unlike Sina daily shares.
+            if df is not None:
+                df.attrs['volume_unit'] = 'lots'
             # 标准化腾讯数据列名
             # 腾讯返回：date, open, close, high, low, volume, amount
             if df is not None and not df.empty:
@@ -892,6 +902,15 @@ class AkshareFetcher(BaseFetcher):
             '涨跌幅': 'pct_chg',
         }
         
+        # EM mainland stock/ETF history uses lots. Sina/foreign history uses
+        # shares, retained explicitly on the source frame across renaming.
+        from .volume_units import lots_to_shares
+        unit = df.attrs.get('volume_unit') or (
+            'shares' if _is_hk_code(stock_code) or _is_us_code(stock_code) else 'lots'
+        )
+        if unit == 'lots' and '成交量' in df.columns:
+            df['成交量'] = df['成交量'].map(lots_to_shares)
+        df.attrs['volume_unit'] = 'shares'
         # 重命名列
         df = df.rename(columns=column_mapping)
         
@@ -1024,7 +1043,7 @@ class AkshareFetcher(BaseFetcher):
                 price=safe_float(row.get('最新价')),
                 change_pct=safe_float(row.get('涨跌幅')),
                 change_amount=safe_float(row.get('涨跌额')),
-                volume=safe_int(row.get('成交量')),
+                volume=lots_to_shares(row.get('成交量')),
                 amount=safe_float(row.get('成交额')),
                 volume_ratio=safe_float(row.get('量比')),
                 turnover_rate=safe_float(row.get('换手率')),
@@ -1209,12 +1228,12 @@ class AkshareFetcher(BaseFetcher):
         优点：单股票查询，负载小，包含换手率
         缺点：无量比/PE/PB等估值数据
         
-        接口格式：http://qt.gtimg.cn/q=sh600519,sz000001
+        接口格式：https://qt.gtimg.cn/q=sh600519,sz000001
         """
         circuit_breaker = get_realtime_circuit_breaker()
         source_key = "akshare_tencent"
         symbol = _to_sina_tx_symbol(stock_code)
-        url = f"http://{TENCENT_REALTIME_ENDPOINT}={symbol}"
+        url = f"https://{TENCENT_REALTIME_ENDPOINT}={symbol}"
         api_start = time.time()
         
         try:
@@ -1308,10 +1327,17 @@ class AkshareFetcher(BaseFetcher):
             # 44:流通市值(亿) 45:总市值(亿) 46:市净率 47:涨停价 48:跌停价 49:量比
             # 使用 realtime_types.py 中的统一转换函数
             amount = _parse_tencent_amount(fields)
+            try:
+                provider_timestamp = datetime.strptime(fields[30], "%Y%m%d%H%M%S").replace(
+                    tzinfo=ZoneInfo("Asia/Shanghai")
+                ).isoformat()
+            except (TypeError, ValueError):
+                provider_timestamp = None
             quote = UnifiedRealtimeQuote(
                 code=stock_code,
                 name=fields[1] if len(fields) > 1 else "",
                 source=RealtimeSource.TENCENT,
+                provider_timestamp=provider_timestamp,
                 price=safe_float(fields[3]),
                 change_pct=safe_float(fields[32]),
                 change_amount=safe_float(fields[31]) if len(fields) > 31 else None,
@@ -1430,7 +1456,7 @@ class AkshareFetcher(BaseFetcher):
                 price=safe_float(row.get('最新价')),
                 change_pct=safe_float(row.get('涨跌幅')),
                 change_amount=safe_float(row.get('涨跌额')),
-                volume=safe_int(row.get('成交量')),
+                volume=lots_to_shares(row.get('成交量')),
                 amount=safe_float(row.get('成交额')),
                 volume_ratio=safe_float(row.get('量比')),
                 turnover_rate=safe_float(row.get('换手率')),
@@ -1916,59 +1942,84 @@ class AkshareFetcher(BaseFetcher):
 
         数据源优先级：
         1. 东财接口 (ak.stock_board_industry_name_em)
-        2. 新浪接口 (ak.stock_sector_spot)
+        2. 当前 CSRC 分类 + 腾讯带日期报价（同一成员集合派生排行）
         """
         import akshare as ak
 
-        def _get_rank_top_n(df: pd.DataFrame, change_col: str, industry_name: str, n: int) -> Tuple[list, list]:
-            df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
-            df = df.dropna(subset=[change_col])
-
-            # 涨幅前n
-            top = df.nlargest(n, change_col)
-            top_sectors = [
-                {'name': row[industry_name], 'change_pct': row[change_col]}
-                for _, row in top.iterrows()
-            ]
-
-            bottom = df.nsmallest(n, change_col)
-            bottom_sectors = [
-                {'name': row[industry_name], 'change_pct': row[change_col]}
-                for _, row in bottom.iterrows()
-            ]
-            return top_sectors, bottom_sectors
-        
         # 优先东财接口
         try:
             self._set_random_user_agent()
-            self._enforce_rate_limit()
+            self._enforce_sector_ranking_rate_limit()
 
             logger.info("[API调用] ak.stock_board_industry_name_em() 获取板块排行...")
-            df = ak.stock_board_industry_name_em()
+            df = _akshare_call_with_timeout(
+                ak.stock_board_industry_name_em,
+                timeout=_AKSHARE_SECTOR_RANKING_CALL_TIMEOUT,
+                call_name="ak.stock_board_industry_name_em",
+            )
             if df is not None and not df.empty:
                 change_col = '涨跌幅'
                 name = '板块名称'
-                return _get_rank_top_n(df, change_col, name, n)
+                if change_col in df.columns and name in df.columns:
+                    top, bottom = self._get_rank_top_n(df, change_col, name, n)
+                    if top or bottom:
+                        return top, bottom
             
         except Exception as e:
-            logger.warning(f"[Akshare] 东财接口获取行业板块排行失败: {e}，尝试新浪接口")
+            logger.warning(f"[Akshare] 东财接口获取行业板块排行失败: {e}，尝试 CSRC/腾讯备用源")
 
-        # 东财失败后，尝试新浪接口
+        # The legacy Sina industry directory can contain stale classifications.
+        # Use a coherent derived-industry snapshot instead of mixing taxonomies.
         try:
-            self._set_random_user_agent()
-            self._enforce_rate_limit()
-
-            logger.info("[API调用] ak.stock_sector_spot() 获取行业板块排行(新浪)...")
-            df = ak.stock_sector_spot(indicator='行业')
-            if df is None or df.empty:
-                return None
-            change_col = '涨跌幅'
-            name = '板块'
-            return _get_rank_top_n(df, change_col, name, n)
-        
-        except Exception as e:
-            logger.error(f"[Akshare] 新浪接口获取板块排行也失败: {e}")
+            from data_provider.csrc_board_provider import CsrcBoardConstituentProvider
+            return CsrcBoardConstituentProvider().get_sector_rankings(n)
+        except Exception as exc:
+            logger.error("[Akshare] CSRC/腾讯行业备用源失败: %s", exc)
             return None
+
+    @staticmethod
+    def _get_rank_top_n(df: pd.DataFrame, change_col: str, industry_name: str, n: int, board_type: str = "industry") -> Tuple[list, list]:
+        df = df.copy()
+        df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
+        df = df.dropna(subset=[change_col, industry_name])
+        df[industry_name] = df[industry_name].map(lambda value: str(value).strip() if value is not None else "")
+        df = df[df[industry_name] != ""]
+        df = df[df[change_col].map(lambda value: math.isfinite(float(value)))]
+
+        def ranked_row(row: pd.Series) -> Dict:
+            item = {'name': str(row[industry_name]), 'change_pct': float(row[change_col])}
+            # Preserve the source identity through the market report. A Sina
+            # industry node is not an Eastmoney BK board, even if names overlap.
+            for column, source in (("label", f"sina_{board_type}"), ("板块代码", f"eastmoney_{board_type}")):
+                code = row.get(column)
+                if code is not None and pd.notna(code) and str(code).strip():
+                    item.update(code=str(code).strip(), source=source)
+                    break
+            return item
+
+        top = df.nlargest(n, change_col)
+        top_sectors = [
+            ranked_row(row)
+            for _, row in top.iterrows()
+        ]
+
+        bottom = df.nsmallest(n, change_col)
+        bottom_sectors = [
+            ranked_row(row)
+            for _, row in bottom.iterrows()
+        ]
+        return top_sectors, bottom_sectors
+
+    def _enforce_sector_ranking_rate_limit(self) -> None:
+        """Keep per-fetcher pacing for board rankings without consuming the full 8s stage."""
+
+        if self._last_request_time is not None:
+            elapsed = time.time() - self._last_request_time
+            additional_sleep = min(max(0.0, self.sleep_min - elapsed), _SECTOR_RANKING_RATE_LIMIT_WAIT)
+            if additional_sleep > 0:
+                logger.debug("板块排行补充休眠 %.2f 秒", additional_sleep)
+                time.sleep(additional_sleep)
+        self._last_request_time = time.time()
 
     def get_concept_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
         """获取概念/题材涨跌榜。"""
@@ -1988,24 +2039,96 @@ class AkshareFetcher(BaseFetcher):
             if change_col not in df.columns or name_col not in df.columns:
                 return None
 
-            df = df.copy()
-            df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
-            df = df.dropna(subset=[change_col])
-            top = df.nlargest(n, change_col)
-            bottom = df.nsmallest(n, change_col)
-            return (
-                [
-                    {'name': str(row[name_col]), 'change_pct': float(row[change_col])}
-                    for _, row in top.iterrows()
-                ],
-                [
-                    {'name': str(row[name_col]), 'change_pct': float(row[change_col])}
-                    for _, row in bottom.iterrows()
-                ],
-            )
+            return self._get_rank_top_n(df, change_col, name_col, n, board_type="concept")
         except Exception as e:
             logger.warning(f"[Akshare] 获取概念排行失败: {e}")
             return None
+
+    def get_board_constituents(
+        self,
+        board_name: str,
+        board_type: str = "concept",
+    ) -> Optional[List[Dict[str, Any]]]:
+        """获取东方财富行业/概念板块成分股，并规范化 A 股身份。"""
+        import akshare as ak
+
+        topic = str(board_name or "").strip()
+        normalized_type = str(board_type or "concept").strip().lower()
+        if not topic or normalized_type not in {"concept", "industry"}:
+            return None
+
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+
+        if normalized_type == "industry":
+            call = ak.stock_board_industry_cons_em
+            call_name = "ak.stock_board_industry_cons_em"
+        else:
+            call = ak.stock_board_concept_cons_em
+            call_name = "ak.stock_board_concept_cons_em"
+
+        logger.info("[API调用] %s(symbol=%s) 获取板块成分股...", call_name, topic)
+        try:
+            df = _akshare_call_with_timeout(
+                call,
+                topic,
+                timeout=_AKSHARE_HISTORY_CALL_TIMEOUT,
+                call_name=call_name,
+            )
+        except TypeError:
+            df = _akshare_call_with_timeout(
+                call,
+                symbol=topic,
+                timeout=_AKSHARE_HISTORY_CALL_TIMEOUT,
+                call_name=call_name,
+            )
+        if df is None or getattr(df, "empty", True):
+            return None
+
+        records: List[Dict[str, Any]] = []
+        for _, row in df.iterrows():
+            raw_code = self._first_present(row, ("代码", "股票代码", "code", "symbol"))
+            raw_name = self._first_present(row, ("名称", "股票名称", "name"))
+            code = normalize_stock_code(str(raw_code or "").strip())
+            if not code.isdigit() or len(code) != 6:
+                continue
+            exchange = "sh" if code.startswith(("6", "5")) else "sz" if code.startswith(("0", "2", "3")) else ""
+            if not exchange:
+                continue
+            records.append(
+                {
+                    "code": code,
+                    "name": str(raw_name or "").strip() or code,
+                    "exchange": exchange,
+                    "market": "cn",
+                    "board_name": topic,
+                    "board_type": normalized_type,
+                    "source": "akshare",
+                    "raw": {
+                        key: self._json_safe_value(value)
+                        for key, value in row.to_dict().items()
+                    },
+                }
+            )
+        return records or None
+
+    @staticmethod
+    def _first_present(row: Any, keys: Tuple[str, ...]) -> Any:
+        for key in keys:
+            if key in row and row[key] not in (None, ""):
+                return row[key]
+        return None
+
+    @staticmethod
+    def _json_safe_value(value: Any) -> Any:
+        if pd.isna(value):
+            return None
+        if hasattr(value, "item"):
+            try:
+                return value.item()
+            except Exception:
+                pass
+        return value
 
     def get_hot_stocks(self, n: int = 10) -> Optional[List[Dict[str, Any]]]:
         """获取人气股榜，按免配置热榜数据源降级。"""

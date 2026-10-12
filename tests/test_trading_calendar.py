@@ -14,6 +14,28 @@ import pandas as pd
 from src.core import trading_calendar
 
 
+class MarketIdentificationTest(unittest.TestCase):
+    def test_cn_exchange_annotations(self):
+        for exchange, base in (("SH", "513980"), ("SS", "512480"),
+                               ("SZ", "002714"), ("BJ", "920748")):
+            for code in (base, exchange + base, exchange + "." + base,
+                         base + "." + exchange):
+                with self.subTest(code=code):
+                    self.assertEqual(trading_calendar.get_market_for_stock(code), "cn")
+                    self.assertEqual(trading_calendar.get_market_for_stock(" " + code.lower() + " "), "cn")
+
+    def test_other_market_identity_and_invalid_cn_are_not_collapsed(self):
+        for code, market in (("AAPL", "us"), ("BRK.B", "us"),
+                             ("HK00700", "hk"), ("00700.HK", "hk"),
+                             ("7203.T", "jp"), ("005930.KS", "kr"),
+                             ("005930.KQ", "kr"), ("006208.TW", "tw"),
+                             ("6505.TWO", "tw"), ("SHABC123", None),
+                             ("1234567.SH", None), ("513980.UNKNOWN", None),
+                             ("", None), (None, None)):
+            with self.subTest(code=code):
+                self.assertEqual(trading_calendar.get_market_for_stock(code), market)
+
+
 class _FakeCalendar:
     def __init__(
         self,
@@ -831,12 +853,25 @@ class MarketPhaseContextTestCase(unittest.TestCase):
 class ComputeEffectiveRegionTestCase(unittest.TestCase):
     """Regression tests for compute_effective_region subset logic."""
 
-    def test_get_open_markets_today_fail_open_includes_new_markets(self):
+    def test_calendar_missing_blocks_automatic_checks(self):
         with patch.object(trading_calendar, "_XCALS_AVAILABLE", False):
-            self.assertEqual(
-                trading_calendar.get_open_markets_today(),
-                {"cn", "hk", "us", "jp", "kr", "tw"},
-            )
+            self.assertFalse(trading_calendar.is_market_open("cn", date(2026, 9, 14)))
+            with self.assertRaisesRegex(RuntimeError, "calendar_unavailable"):
+                trading_calendar.get_open_markets_today(markets={"cn"})
+
+    def test_calendar_query_error_is_not_an_open_market(self):
+        with patch.object(trading_calendar, "_XCALS_AVAILABLE", True), \
+             patch.object(trading_calendar.xcals, "get_calendar", side_effect=ValueError("out of range")):
+            self.assertFalse(trading_calendar.is_market_open("cn", date(2026, 9, 12)))
+            with self.assertRaisesRegex(RuntimeError, "calendar_unavailable"):
+                trading_calendar.get_open_markets_today(markets={"cn"})
+
+    def test_only_requested_markets_require_calendar_evidence(self):
+        with patch.object(trading_calendar, "is_market_open", return_value=True) as check:
+            self.assertEqual(trading_calendar.get_open_markets_today(markets={"cn"}), {"cn"})
+        self.assertEqual(check.call_count, 1)
+        self.assertEqual(check.call_args.args[0], "cn")
+        self.assertTrue(check.call_args.kwargs["strict"])
 
     def test_both_all_open_returns_comma_joined_supported_markets(self):
         result = trading_calendar.compute_effective_region("both", {"cn", "hk", "us", "jp", "kr"})

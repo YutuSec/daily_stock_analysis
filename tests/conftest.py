@@ -16,6 +16,7 @@ from warnings import warn
 import anyio.to_thread
 import fastapi.testclient
 import httpx
+import pytest
 import starlette.testclient
 from anyio._backends import _asyncio
 
@@ -249,3 +250,42 @@ class _ThreadlessTestClient:
 
 fastapi.testclient.TestClient = _ThreadlessTestClient
 starlette.testclient.TestClient = _ThreadlessTestClient
+
+
+def _shutdown_analysis_task_queue_singleton() -> None:
+    """Drain test-created analysis workers before another test swaps database state."""
+    try:
+        from src.services.task_queue import AnalysisTaskQueue
+    except Exception:
+        return
+
+    queue = getattr(AnalysisTaskQueue, "_instance", None)
+    if queue is None:
+        return
+
+    executor = getattr(queue, "_executor", None)
+    if executor is not None:
+        shutdown = getattr(executor, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                shutdown(wait=True)
+            except RuntimeError:
+                pass
+        queue._executor = None
+
+    for attr in ("_futures", "_tasks", "_analyzing_stocks", "_subscribers"):
+        value = getattr(queue, attr, None)
+        if hasattr(value, "clear"):
+            value.clear()
+
+    AnalysisTaskQueue._instance = None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_analysis_task_queue_workers():
+    """Keep background analysis tasks from leaking across database-isolated tests."""
+    _shutdown_analysis_task_queue_singleton()
+    yield
+    _shutdown_analysis_task_queue_singleton()

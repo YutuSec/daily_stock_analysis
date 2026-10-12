@@ -24,6 +24,7 @@ from src.config import get_config
 from src.report_language import normalize_report_language
 from src.search_service import SearchService
 from src.core.market_profile import get_profile, MarketProfile
+from src.core.trading_calendar import get_effective_trading_date
 from src.core.market_strategy import get_market_strategy_blueprint
 from src.llm.backend_registry import (
     resolve_generation_backend_id,
@@ -33,6 +34,7 @@ from src.llm.generation_backend import GenerationError
 from src.schemas.market_light import MARKET_LIGHT_REGIONS, MarketLightSnapshot
 from src.services.run_diagnostics import record_llm_run, record_llm_run_started
 from src.services.intelligence_service import IntelligenceService
+from src.services.board_observation_service import BoardObservationService
 from data_provider.base import DataFetcherManager
 
 logger = logging.getLogger(__name__)
@@ -103,6 +105,7 @@ class MarketOverview:
     bottom_sectors: List[Dict] = field(default_factory=list)  # 跌幅前5板块
     top_concepts: List[Dict] = field(default_factory=list)    # 涨幅前5概念
     bottom_concepts: List[Dict] = field(default_factory=list) # 跌幅前5概念
+    board_observation: Optional[Dict[str, Any]] = None        # 完整板块观察快照引用
 
 
 @dataclass
@@ -442,6 +445,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         if self.profile.has_sector_rankings:
             self._get_sector_rankings(overview)
             self._get_concept_rankings(overview)
+            self._collect_board_observation_snapshot(overview)
         
         # 4. 获取北向资金（可选）
         # self._get_north_flow(overview)
@@ -568,6 +572,48 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         except Exception as e:
             logger.warning("[大盘] %s action=get_concept_rankings status=failed error=%s", self._log_context(), e)
+
+    def _collect_board_observation_snapshot(self, overview: MarketOverview) -> None:
+        """Persist full same-source board observations for opportunity discovery."""
+        if self.region != "cn":
+            return
+        try:
+            trade_date = get_effective_trading_date("cn")
+            service = BoardObservationService(
+                config=self.config,
+                fetcher_manager=self.data_manager,
+            )
+            result = service.collect("cn", trade_date)
+            overview.board_observation = {
+                "status": result.get("status"),
+                "snapshot_id": result.get("snapshot_id"),
+                "trade_date": result.get("trade_date").isoformat() if result.get("trade_date") else None,
+                "source": result.get("source"),
+                "theme_count": len(result.get("themes") or []),
+                "reason": result.get("reason"),
+            }
+            if result.get("status") == "ok":
+                logger.info(
+                    "[大盘] %s action=collect_board_observation status=success snapshot_id=%s themes=%d",
+                    self._log_context(),
+                    result.get("snapshot_id"),
+                    len(result.get("themes") or []),
+                )
+            else:
+                logger.warning(
+                    "[大盘] %s action=collect_board_observation status=%s reason=%s",
+                    self._log_context(),
+                    result.get("status"),
+                    result.get("reason"),
+                )
+        except Exception as exc:
+            overview.board_observation = {
+                "status": "failed",
+                "snapshot_id": None,
+                "source": "csrc_tencent",
+                "reason": f"{type(exc).__name__}:{exc}",
+            }
+            logger.warning("[大盘] %s action=collect_board_observation status=failed error=%s", self._log_context(), exc)
     
     # def _get_north_flow(self, overview: MarketOverview):
     #     """获取北向资金流入"""
@@ -805,6 +851,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 "top": list(overview.top_concepts or []),
                 "bottom": list(overview.bottom_concepts or []),
             },
+            "board_observation": dict(overview.board_observation or {}),
             "news": [self._normalize_news_item(item) for item in (news or [])[:8]],
             "sections": sections,
             "markdown_report": report,
@@ -1149,6 +1196,14 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             append_ranking("#### 行业板块领跌 Top 5", "行业板块", overview.bottom_sectors)
             append_ranking("#### 概念板块领涨 Top 5", "概念板块", overview.top_concepts)
             append_ranking("#### 概念板块领跌 Top 5", "概念板块", overview.bottom_concepts)
+        if any(row.get("aggregation") == "equal_weight_member_return" for row in
+               list(overview.top_sectors or []) + list(overview.bottom_sectors or [])):
+            lines.extend(["", (
+                "Industry returns use current CSRC membership and same-session Tencent quotes, "
+                "equally weighted across members; these are derived statistics, not official index returns."
+                if language == "en" else
+                "行业涨跌采用当前证监会分类与同一交易日的腾讯报价，按成分股等权计算；这是派生统计，不是官方行业指数涨跌。"
+            )])
         return "\n".join(lines)
 
     def _build_news_block(self, news: List) -> str:
@@ -1229,7 +1284,10 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             if not name:
                 continue
             parts.append(f"{name}({cls._format_signed_pct(item.get('change_pct'))})")
-        return ", ".join(parts)
+        summary = ", ".join(parts)
+        if any(isinstance(row, dict) and row.get("aggregation") == "equal_weight_member_return" for row in (rows or [])[:limit]):
+            summary += " [CSRC membership; equal-weight member returns, not official index returns]"
+        return summary
 
     @staticmethod
     def _escape_markdown_link_label(value: str) -> str:

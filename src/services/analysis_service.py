@@ -24,7 +24,7 @@ from src.report_language import (
     normalize_report_language,
 )
 from src.market_phase_summary import extract_market_phase_summary
-from src.schemas.decision_action import build_action_fields
+from src.schemas.decision_action import display_action_fields, normalize_holding_state
 from src.services.run_diagnostics import (
     activate_run_diagnostic_context,
     build_run_diagnostic_summary,
@@ -60,7 +60,11 @@ class AnalysisService:
         analysis_phase: str = "auto",
         query_source: str = "api",
         portfolio_context: Optional[Dict[str, Any]] = None,
+        selection_context: Optional[Dict[str, Any]] = None,
         report_language: Optional[str] = None,
+        model: Optional[str] = None,
+        execution_intent: Optional[Dict[str, Any]] = None,
+        trading_style_override: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         执行股票分析
@@ -72,6 +76,8 @@ class AnalysisService:
             query_id: 查询 ID（可选）
             send_notification: 是否发送通知（API 触发默认发送）
             analysis_phase: 请求的分析阶段覆盖（auto/premarket/intraday/postmarket）
+            execution_intent: 仅供后端可信任务传入的报告执行用途，不从请求体读取
+            trading_style_override: 仅供后端可信任务传入的基础交易风格，不从请求体读取
             
         Returns:
             分析结果字典，包含:
@@ -102,9 +108,14 @@ class AnalysisService:
             # 获取配置
             config = get_config()
             normalized_report_language = normalize_report_language(report_language, default="")
-            if normalized_report_language:
+            if normalized_report_language or model:
                 config = copy.copy(config)
+            if normalized_report_language:
                 config.report_language = normalized_report_language
+            if model:
+                from src.services.analysis_model_service import build_model_scoped_config
+
+                config = build_model_scoped_config(config, model)
             
             # 创建分析流水线
             pipeline = StockAnalysisPipeline(
@@ -116,6 +127,9 @@ class AnalysisService:
                 analysis_skills=skills,
                 analysis_phase=analysis_phase,
                 portfolio_context=portfolio_context,
+                selection_context=selection_context,
+                execution_intent=execution_intent,
+                trading_style_override=trading_style_override,
             )
             
             # 确定报告类型 (API: simple/detailed/full/brief -> ReportType)
@@ -175,14 +189,17 @@ class AnalysisService:
         report_language = normalize_report_language(getattr(result, "report_language", "zh"))
         sentiment_label = get_sentiment_label(result.sentiment_score, report_language)
         stock_name = get_localized_stock_name(getattr(result, "name", None), result.code, report_language)
-        action_fields = build_action_fields(
+        holding_state = getattr(result, "holding_state", None)
+        action_fields = display_action_fields(
             operation_advice=getattr(result, "operation_advice", None),
             explicit_action=getattr(result, "action", None),
+            action_label=getattr(result, "action_label", None),
             report_type=report_type,
             report_language=report_language,
             sentiment_score=getattr(result, "sentiment_score", None),
             guardrail_reason=getattr(result, "guardrail_reason", None),
-            align_with_score=True,
+            holding_state=holding_state,
+            position_actions=getattr(result, "position_actions", None),
         )
         diagnostic_context = get_current_diagnostic_context()
         trace_id = diagnostic_context.trace_id if diagnostic_context is not None else query_id
@@ -221,7 +238,11 @@ class AnalysisService:
             },
             "summary": {
                 "analysis_summary": result.analysis_summary,
-                "operation_advice": localize_operation_advice(result.operation_advice, report_language),
+                "operation_advice": (
+                    action_fields["action_label"]
+                    if normalize_holding_state(holding_state) != "unknown"
+                    else localize_operation_advice(result.operation_advice, report_language)
+                ),
                 "action": action_fields["action"],
                 "action_label": action_fields["action_label"],
                 "trend_prediction": localize_trend_prediction(result.trend_prediction, report_language),

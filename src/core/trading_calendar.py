@@ -10,7 +10,7 @@
 3. 支持 per-stock 过滤：只分析当日开市市场的股票
 4. 提供 regular-session 市场阶段推断基线，不改变现有分析入口行为
 
-依赖：exchange-calendars（可选，交易日判断不可用时 fail-open，阶段推断不可用时 unknown）
+依赖：exchange-calendars（交易日证据不可用时不放行，阶段推断不可用时 unknown）
 """
 
 import logging
@@ -33,7 +33,7 @@ try:
     _XCALS_AVAILABLE = True
 except ImportError:
     logger.warning(
-        "exchange-calendars not installed; trading day check disabled. "
+        "exchange-calendars not installed; automatic trading-day checks will block. "
         "Run: pip install exchange-calendars"
     )
 
@@ -51,8 +51,8 @@ MARKET_TIMEZONE = {
 }
 
 # P0 market phase baseline (Issue #1386). This is an intentionally small
-# regular-session inference layer; it does not change existing fail-open
-# trading-day filtering or effective-date behavior.
+# regular-session inference layer; effective-date fallback is not evidence
+# that a market is open for an automatic task.
 # tw: TWSE/TPEx run a 13:25-13:30 closing call auction (5 min). JP/KR use
 # regular-session closing auction windows before the 15:30 close (JP 5 min,
 # KR 10 min). Without an entry here .get(market, 0) yields a zero-width
@@ -142,37 +142,44 @@ def get_market_for_stock(code: str) -> Optional[str]:
     suffix_market = get_suffix_market(code)
     if suffix_market:
         return suffix_market
-    # A-share: 6-digit numeric
-    if code.isdigit() and len(code) == 6:
+    # Reuse provider-supported CN exchange annotations for market inference only.
+    # Do not replace the caller's symbol or strip overseas exchange identity.
+    from data_provider.base import normalize_stock_code
+
+    cn_code = normalize_stock_code(code)
+    if cn_code.isdigit() and len(cn_code) == 6:
         return "cn"
     return None
 
 
-def is_market_open(market: str, check_date: date) -> bool:
+def is_market_open(market: str, check_date: date, *, strict: bool = False) -> bool:
     """
     Check if the given market is open on the given date.
 
-    Fail-open: returns True if exchange-calendars unavailable or date out of range.
+    Missing/invalid calendar evidence never means open. Strict callers raise
+    so automatic task status distinguishes unavailable evidence from a holiday.
 
     Args:
         market: 'cn' | 'hk' | 'us'
         check_date: Date to check
 
     Returns:
-        True if trading day (or fail-open), False otherwise
+        True only for a verified trading day, False otherwise (or raise in strict mode)
     """
-    if not _XCALS_AVAILABLE:
-        return True
-    ex = MARKET_EXCHANGE.get(market)
-    if not ex:
-        return True
     try:
+        if not _XCALS_AVAILABLE:
+            raise RuntimeError("exchange-calendars unavailable")
+        ex = MARKET_EXCHANGE.get(market)
+        if not ex:
+            raise ValueError(f"unsupported market: {market}")
         cal = xcals.get_calendar(ex)
         session = datetime(check_date.year, check_date.month, check_date.day)
         return cal.is_session(session)
     except Exception as e:
-        logger.warning("trading_calendar.is_market_open fail-open: %s", e)
-        return True
+        logger.error("交易日历不可用，禁止自动放行: market=%s date=%s error=%s", market, check_date, e)
+        if strict:
+            raise RuntimeError(f"calendar_unavailable: {market} {check_date}") from e
+        return False
 
 
 def get_market_now(
@@ -290,8 +297,8 @@ def infer_market_phase(
 
     This P0 helper is intentionally fail-closed: unknown markets, unavailable
     exchange calendars, and calendar errors return ``MarketPhase.UNKNOWN``.
-    That differs from ``is_market_open()`` and ``get_effective_trading_date()``,
-    which keep their existing fail-open behavior for backwards compatibility.
+    ``is_market_open()`` also requires verified evidence. The historical
+    ``get_effective_trading_date()`` fallback is not permission to run a task.
 
     ``premarket`` and ``postmarket`` mean before/after the regular trading
     session only; they do not imply that extended-hours quote data is available.
@@ -525,24 +532,18 @@ def build_market_phase_context(
     )
 
 
-def get_open_markets_today() -> Set[str]:
+def get_open_markets_today(markets: Optional[Set[str]] = None) -> Set[str]:
     """
     Get markets that are open today (by each market's local timezone).
 
     Returns:
         Set of market keys that are trading today
     """
-    if not _XCALS_AVAILABLE:
-        return set(MARKET_TIMEZONE)
     result: Set[str] = set()
-    for mkt, tz_name in MARKET_TIMEZONE.items():
-        try:
-            tz = ZoneInfo(tz_name)
-            today = datetime.now(tz).date()
-            if is_market_open(mkt, today):
-                result.add(mkt)
-        except Exception as e:
-            logger.warning("get_open_markets_today fail-open for %s: %s", mkt, e)
+    for mkt in sorted(markets if markets is not None else MARKET_TIMEZONE):
+        tz = ZoneInfo(MARKET_TIMEZONE[mkt])
+        today = datetime.now(tz).date()
+        if is_market_open(mkt, today, strict=True):
             result.add(mkt)
     return result
 

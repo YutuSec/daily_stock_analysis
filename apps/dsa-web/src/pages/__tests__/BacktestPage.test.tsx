@@ -9,11 +9,13 @@ const {
   mockGetOverallPerformance,
   mockGetStockPerformance,
   mockRun,
+  mockGetModels,
 } = vi.hoisted(() => ({
   mockGetResults: vi.fn(),
   mockGetOverallPerformance: vi.fn(),
   mockGetStockPerformance: vi.fn(),
   mockRun: vi.fn(),
+  mockGetModels: vi.fn(),
 }));
 
 vi.mock('../../api/backtest', () => ({
@@ -22,6 +24,12 @@ vi.mock('../../api/backtest', () => ({
     getOverallPerformance: mockGetOverallPerformance,
     getStockPerformance: mockGetStockPerformance,
     run: mockRun,
+  },
+}));
+
+vi.mock('../../api/analysis', () => ({
+  analysisApi: {
+    getModels: mockGetModels,
   },
 }));
 
@@ -73,7 +81,9 @@ const baseResultItem = {
 beforeEach(() => {
   vi.clearAllMocks();
   window.localStorage.clear();
-  mockGetOverallPerformance.mockResolvedValue(basePerformance);
+  mockGetOverallPerformance.mockImplementation(async (params?: { modelUsed?: string }) => (
+    params?.modelUsed ? { ...basePerformance, modelUsed: params.modelUsed } : basePerformance
+  ));
   mockGetStockPerformance.mockResolvedValue(null);
   mockGetResults.mockResolvedValue({
     total: 1,
@@ -87,6 +97,14 @@ beforeEach(() => {
     completed: 1,
     insufficient: 0,
     errors: 0,
+  });
+  mockGetModels.mockResolvedValue({
+    models: [
+      { model: 'deepseek', isDefault: true },
+      { model: 'claude', isDefault: false },
+    ],
+    defaultModel: 'deepseek',
+    comparisonAvailable: true,
   });
 });
 
@@ -128,6 +146,66 @@ describe('BacktestPage', () => {
     expect(screen.getAllByLabelText('是').length).toBeGreaterThan(0);
     expect(screen.getByText('方向准确率')).toBeInTheDocument();
     expect(screen.getByText('平均模拟收益')).toBeInTheDocument();
+  });
+
+  it('renders holding-decision metrics and the frozen holding action when available', async () => {
+    mockGetOverallPerformance.mockResolvedValueOnce({
+      ...basePerformance,
+      holdingApplicableCount: 1,
+      holdingEvaluableCount: 1,
+      holdingDecisionAccuracyPct: 100,
+      avgHoldingDecisionReturnPct: 3.8,
+    });
+    mockGetResults.mockResolvedValueOnce({
+      total: 1,
+      page: 1,
+      limit: 20,
+      items: [{
+        ...baseResultItem,
+        holdingState: 'holding',
+        holdingAction: 'hold',
+        holdingActionApplicable: true,
+        holdingActionEvaluable: true,
+        holdingDecisionCorrect: true,
+        holdingDecisionReturnPct: 3.8,
+      }],
+    });
+
+    render(<BacktestPage />);
+
+    expect(await screen.findByText('持仓决策准确率')).toBeInTheDocument();
+    expect(screen.getByText('持仓决策模拟收益')).toBeInTheDocument();
+    const resultRow = screen.getByText('600519').closest('tr');
+    expect(resultRow).not.toBeNull();
+    expect(within(resultRow as HTMLElement).getByText('持有')).toBeInTheDocument();
+    expect(within(resultRow as HTMLElement).getByText('正确 · 3.8%')).toBeInTheDocument();
+  });
+
+  it('filters by model and renders side-by-side model metrics', async () => {
+    mockGetModels.mockResolvedValue({
+      models: [
+        { model: 'deepseek', isDefault: true },
+        { model: 'claude', isDefault: false },
+        { model: 'gemini', isDefault: false },
+      ],
+      defaultModel: 'deepseek',
+      comparisonAvailable: true,
+    });
+    render(<BacktestPage />);
+
+    const modelSelect = await screen.findByLabelText('模型');
+    await screen.findByText('模型表现对比: deepseek');
+    expect(screen.getByText('模型表现对比: claude')).toBeInTheDocument();
+    expect(screen.getByText('模型表现对比: gemini')).toBeInTheDocument();
+
+    fireEvent.change(modelSelect, { target: { value: 'claude' } });
+
+    await waitFor(() => expect(mockGetResults).toHaveBeenLastCalledWith(
+      expect.objectContaining({ modelUsed: 'claude' }),
+    ));
+    expect(mockGetOverallPerformance).toHaveBeenCalledWith(
+      expect.objectContaining({ modelUsed: 'claude' }),
+    );
   });
 
   it('falls back to the taxonomy label when backtest actionLabel is missing', async () => {
@@ -366,7 +444,7 @@ describe('BacktestPage', () => {
         analysisDateTo: '2026-03-31',
         analysisPhase: undefined,
       });
-      expect(mockGetOverallPerformance).toHaveBeenLastCalledWith({
+      expect(mockGetOverallPerformance).toHaveBeenCalledWith({
         evalWindowDays: 10,
         analysisDateFrom: '2026-03-01',
         analysisDateTo: '2026-03-31',
@@ -393,7 +471,7 @@ describe('BacktestPage', () => {
         page: 1,
         limit: 20,
       });
-      expect(mockGetOverallPerformance).toHaveBeenLastCalledWith({
+      expect(mockGetOverallPerformance).toHaveBeenCalledWith({
         evalWindowDays: 1,
         analysisDateFrom: undefined,
         analysisDateTo: undefined,

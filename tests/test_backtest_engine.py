@@ -42,6 +42,65 @@ class BacktestEngineTestCase(unittest.TestCase):
         self.assertEqual(res["outcome"], "win")
         self.assertTrue(res["direction_correct"])  # up
 
+    def test_holding_decision_requires_frozen_explicit_action(self):
+        unavailable = BacktestEngine.evaluate_holding_decision(
+            holding_state="holding",
+            holding_action="watch",
+            stock_return_pct=5.0,
+            eval_status="completed",
+            neutral_band_pct=2.0,
+        )
+        self.assertFalse(unavailable["holding_action_applicable"])
+        self.assertFalse(unavailable["holding_action_evaluable"])
+        self.assertEqual(unavailable["holding_eval_status"], "unavailable")
+
+        evaluated = BacktestEngine.evaluate_holding_decision(
+            holding_state="holding",
+            holding_action="hold",
+            stock_return_pct=5.0,
+            eval_status="completed",
+            neutral_band_pct=2.0,
+        )
+        self.assertTrue(evaluated["holding_action_applicable"])
+        self.assertTrue(evaluated["holding_action_evaluable"])
+        self.assertTrue(evaluated["holding_decision_correct"])
+        self.assertEqual(evaluated["holding_direction_expected"], "not_down")
+        self.assertEqual(evaluated["holding_decision_return_pct"], 5.0)
+
+    def test_reduce_holding_action_is_correct_on_material_decline(self):
+        evaluated = BacktestEngine.evaluate_holding_decision(
+            holding_state="holding",
+            holding_action="reduce",
+            stock_return_pct=-4.0,
+            eval_status="completed",
+            neutral_band_pct=2.0,
+        )
+        self.assertTrue(evaluated["holding_decision_correct"])
+        self.assertEqual(evaluated["holding_direction_expected"], "down")
+        self.assertEqual(evaluated["holding_decision_return_pct"], 0.0)
+
+    def test_buy_holding_action_requires_material_upside(self):
+        neutral = BacktestEngine.evaluate_holding_decision(
+            holding_state="holding",
+            holding_action="buy",
+            stock_return_pct=1.0,
+            eval_status="completed",
+            neutral_band_pct=2.0,
+        )
+        self.assertEqual(neutral["holding_direction_expected"], "up")
+        self.assertIsNone(neutral["holding_decision_correct"])
+        self.assertEqual(neutral["holding_outcome"], "neutral")
+
+        correct = BacktestEngine.evaluate_holding_decision(
+            holding_state="holding",
+            holding_action="add",
+            stock_return_pct=3.0,
+            eval_status="completed",
+            neutral_band_pct=2.0,
+        )
+        self.assertEqual(correct["holding_direction_expected"], "up")
+        self.assertTrue(correct["holding_decision_correct"])
+
     def test_sell_win_when_down_cash(self):
         cfg = EvaluationConfig(eval_window_days=3, neutral_band_pct=2.0)
         bars = self._bars(date(2024, 1, 1), [98, 97, 96], highs=[99, 98, 97], lows=[97, 96, 95])

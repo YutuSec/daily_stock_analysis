@@ -14,6 +14,7 @@ from src.schemas.decision_action import DecisionAction
 
 class BacktestRunRequest(BaseModel):
     code: Optional[str] = Field(None, description="仅回测指定股票")
+    model_used: Optional[str] = Field(None, max_length=255, description="仅回测指定 LLM 模型的历史记录（精确匹配）")
     force: bool = Field(False, description="强制重新计算")
     eval_window_days: Optional[int] = Field(None, ge=1, le=120, description="评估窗口（交易日数）")
     min_age_days: Optional[int] = Field(None, ge=0, le=365, description="分析记录最小天龄（0=不限）")
@@ -40,6 +41,7 @@ class BacktestResultItem(BaseModel):
     analysis_history_id: int
     code: str
     stock_name: Optional[str] = None
+    model_used: Optional[str] = None
     analysis_date: Optional[str] = None
     eval_window_days: int
     engine_version: str
@@ -73,6 +75,15 @@ class BacktestResultItem(BaseModel):
     simulated_exit_price: Optional[float] = None
     simulated_exit_reason: Optional[str] = None
     simulated_return_pct: Optional[float] = None
+    holding_state: str = "unknown"
+    holding_action: Optional[DecisionAction] = None
+    holding_action_applicable: bool = False
+    holding_action_evaluable: bool = False
+    holding_eval_status: str = "unavailable"
+    holding_direction_expected: Optional[str] = None
+    holding_decision_correct: Optional[bool] = None
+    holding_outcome: Optional[str] = None
+    holding_decision_return_pct: Optional[float] = None
 
 
 class BacktestResultsResponse(BaseModel):
@@ -85,6 +96,7 @@ class BacktestResultsResponse(BaseModel):
 class PerformanceMetrics(BaseModel):
     scope: str
     code: Optional[str] = None
+    model_used: Optional[str] = None
     eval_window_days: int
     engine_version: str
     computed_at: Optional[str] = None
@@ -99,6 +111,15 @@ class PerformanceMetrics(BaseModel):
     neutral_count: int
 
     direction_accuracy_pct: Optional[float] = None
+    direction_evaluable_count: int = 0
+    holding_applicable_count: int = 0
+    holding_evaluable_count: int = 0
+    holding_unavailable_count: int = 0
+    holding_correct_count: int = 0
+    holding_incorrect_count: int = 0
+    holding_neutral_count: int = 0
+    holding_decision_accuracy_pct: Optional[float] = None
+    avg_holding_decision_return_pct: Optional[float] = None
     win_rate_pct: Optional[float] = None
     neutral_rate_pct: Optional[float] = None
     avg_stock_return_pct: Optional[float] = None

@@ -220,4 +220,32 @@ describe('StockBarItemComponent', () => {
     expect(within(actions).queryByText('预警 28')).not.toBeInTheDocument();
     expect(within(actions).getByText(/28/)).toBeInTheDocument();
   });
+
+  it('shows a newer failed attempt instead of the stale successful action badge', () => {
+    render(
+      <StockBarItemComponent
+        item={{
+          ...issue1600Item,
+          stockCode: '518880.SH',
+          stockName: '黄金ETF华安',
+          action: null,
+          actionLabel: null,
+          operationAdvice: '分析失败',
+          sentimentScore: 78,
+          analysisStatus: 'failed',
+          latestAttemptTime: '2026-08-28T07:20:00Z',
+          latestAttemptError: 'Insufficient Balance',
+          lastSuccessTime: '2026-08-27T07:21:00Z',
+        }}
+        isViewing={false}
+        onClick={vi.fn()}
+      />,
+    );
+
+    const actions = screen.getByTestId('history-card-actions');
+    expect(within(actions).getByText('分析失败')).toBeInTheDocument();
+    expect(within(actions).queryByText('买入 78')).not.toBeInTheDocument();
+    expect(screen.getByText(/最近失败：Insufficient Balance/)).toBeInTheDocument();
+    expect(screen.getByText(/最近成功/)).toBeInTheDocument();
+  });
 });

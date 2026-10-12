@@ -275,14 +275,57 @@ def _metadata_lines(payload: Dict[str, Any], *, lang: str) -> List[str]:
     metadata = payload.get("metadata")
     if not isinstance(metadata, Mapping):
         return []
+    lines: List[str] = []
     news_count = metadata.get("news_result_count")
-    if news_count is None:
-        return []
-    return [
-        f"- News result count: {news_count}"
-        if lang == "en"
-        else f"- 新闻结果数：{news_count}"
-    ]
+    if news_count is not None:
+        lines.append(
+            f"- News result count: {news_count}"
+            if lang == "en"
+            else f"- 新闻结果数：{news_count}"
+        )
+    style_context = metadata.get("paper_trading_style_context")
+    style_indicators = metadata.get("paper_trading_style_indicators")
+    if isinstance(style_context, Mapping):
+        settings = style_context.get("settings") if isinstance(style_context.get("settings"), Mapping) else {}
+        style = _safe_text(style_context.get("trading_style")) or "unknown"
+        window = settings.get("analysis_window_sessions")
+        ma_windows = settings.get("core_ma_windows")
+        volatility_windows = settings.get("volatility_windows")
+        max_holding = settings.get("max_holding_sessions")
+        cadence = settings.get("plan_refresh_cadence_sessions")
+        if lang == "en":
+            lines.append(
+                "- Paper style contract: "
+                f"style={style}; daily_window={window}; ma_windows={ma_windows}; "
+                f"volatility_windows={volatility_windows}; max_holding_sessions={max_holding}; "
+                f"plan_refresh_cadence_sessions={cadence}"
+            )
+            lines.append(
+                "- Style rule: separate the holding thesis from entry timing. "
+                "MA5/short-MA alignment is timing evidence; medium-term styles "
+                "must also use MA10/MA20/MA60, support/resistance, volatility, "
+                "participation and risk/reward instead of treating MA5>MA10>MA20 "
+                "as a universal buy gate."
+            )
+        else:
+            lines.append(
+                "- 纸面交易风格契约："
+                f"style={style}；日线窗口={window}；均线窗口={ma_windows}；"
+                f"波动窗口={volatility_windows}；最大持有={max_holding}；"
+                f"计划刷新间隔={cadence} 个交易日"
+            )
+            lines.append(
+                "- 风格规则：持仓 thesis 与入场择时分开；MA5/短均线排列主要是时机证据，"
+                "中线风格还必须结合 MA10/MA20/MA60、支撑压力、波动、成交参与度和风险收益，"
+                "不得把 MA5>MA10>MA20 当作所有风格的买入硬门槛。"
+            )
+    if isinstance(style_indicators, Mapping):
+        observed = style_indicators.get("bars_observed")
+        if lang == "en":
+            lines.append(f"- Paper style indicator snapshot: bars_observed={observed}")
+        else:
+            lines.append(f"- 纸面交易风格指标快照：bars_observed={observed}")
+    return lines
 
 
 def _data_limitation_lines(payload: Dict[str, Any], *, lang: str) -> List[str]:
@@ -335,6 +378,12 @@ def _data_limitation_lines(payload: Dict[str, Any], *, lang: str) -> List[str]:
             "analysis sections; do not treat missing data itself as bullish or bearish."
         )
         lines.append(
+            "- Evidence rule: unavailable, missing, out-of-window, or undated news means "
+            "there is no citable current-window news evidence; it does not prove that "
+            "no events or risks exist. Stale fundamentals are historical background, "
+            "not current fundamental evidence."
+        )
+        lines.append(
             "- Safety rule: use only status, source, warnings, and missing_reason "
             "from this summary; do not reproduce raw payloads, news body text, "
             "raw trend values, secrets, tokens, or webhooks."
@@ -342,6 +391,10 @@ def _data_limitation_lines(payload: Dict[str, Any], *, lang: str) -> List[str]:
     else:
         lines.append(
             "- 分析规则：辅助数据块缺失只限制对应分析段落，不要把缺失本身解释为利好或利空。"
+        )
+        lines.append(
+            "- 证据规则：新闻不可用、缺失、超出窗口或时间未知，只表示当前窗口没有可引用新闻证据，"
+            "不能证明没有事件或没有风险；陈旧基本面只能作历史背景，不是当前最新基本面证据。"
         )
         lines.append(
             "- 安全规则：只使用本摘要中的 status、source、warnings 和 missing_reason；"

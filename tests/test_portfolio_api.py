@@ -7,7 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -98,6 +98,7 @@ class PortfolioApiTestCase(unittest.TestCase):
         quantity: float = 10.0,
         market: str = "cn",
         currency: str = "CNY",
+        save_close: bool = True,
     ) -> int:
         create_resp = self.client.post(
             "/api/v1/portfolio/accounts",
@@ -121,7 +122,8 @@ class PortfolioApiTestCase(unittest.TestCase):
             },
         )
         self.assertEqual(trade_resp.status_code, 200, trade_resp.text)
-        self._save_close(symbol, date(2026, 1, 3), 110.0)
+        if save_close:
+            self._save_close(symbol, date(2026, 1, 3), 110.0)
         return account_id
 
     def test_account_event_snapshot_flow(self) -> None:
@@ -223,6 +225,148 @@ class PortfolioApiTestCase(unittest.TestCase):
         position = snapshot_resp.json()["accounts"][0]["positions"][0]
         self.assertEqual(position["price_source"], "history_close")
         self.assertAlmostEqual(position["last_price"], 118.0, places=6)
+
+    def test_snapshot_matches_only_exchange_qualified_daily_close_aliases(self) -> None:
+        account_id = self._create_position(
+            name="Shanghai ETF",
+            symbol="SH512480",
+            save_close=False,
+        )
+        self._save_close("512480.SH", date(2026, 1, 3), 1.068)
+
+        snapshot_resp = self.client.get(
+            "/api/v1/portfolio/snapshot",
+            params={"account_id": account_id, "as_of": "2026-01-03", "include_realtime": "false"},
+        )
+
+        self.assertEqual(snapshot_resp.status_code, 200, snapshot_resp.text)
+        position = snapshot_resp.json()["accounts"][0]["positions"][0]
+        self.assertEqual(position["symbol"], "SH512480")
+        self.assertEqual(position["price_source"], "history_close")
+        self.assertAlmostEqual(position["last_price"], 1.068, places=6)
+
+    def test_snapshot_does_not_match_bare_daily_code_to_explicit_exchange(self) -> None:
+        account_id = self._create_position(
+            name="Shenzhen ETF",
+            symbol="SZ159915",
+            save_close=False,
+        )
+        self._save_close("159915", date(2026, 1, 3), 3.604)
+
+        snapshot_resp = self.client.get(
+            "/api/v1/portfolio/snapshot",
+            params={"account_id": account_id, "as_of": "2026-01-03", "include_realtime": "false"},
+        )
+
+        self.assertEqual(snapshot_resp.status_code, 200, snapshot_resp.text)
+        position = snapshot_resp.json()["accounts"][0]["positions"][0]
+        self.assertEqual(position["symbol"], "SZ159915")
+        self.assertEqual(position["price_source"], "missing")
+        self.assertFalse(position["price_available"])
+
+    def test_current_snapshot_backfills_missing_daily_close_without_realtime_quote(self) -> None:
+        today = date.today()
+        create_resp = self.client.post(
+            "/api/v1/portfolio/accounts",
+            json={"name": "Cold Start", "broker": "Demo", "market": "cn", "base_currency": "CNY"},
+        )
+        self.assertEqual(create_resp.status_code, 200, create_resp.text)
+        account_id = create_resp.json()["id"]
+        trade_resp = self.client.post(
+            "/api/v1/portfolio/trades",
+            json={
+                "account_id": account_id,
+                "symbol": "SH512480",
+                "trade_date": today.isoformat(),
+                "side": "buy",
+                "quantity": 100,
+                "price": 1.0,
+                "fee": 0,
+                "tax": 0,
+                "market": "cn",
+                "currency": "CNY",
+            },
+        )
+        self.assertEqual(trade_resp.status_code, 200, trade_resp.text)
+        daily_data = pd.DataFrame(
+            [
+                {
+                    "date": today,
+                    "open": 1.05,
+                    "high": 1.08,
+                    "low": 1.04,
+                    "close": 1.068,
+                    "volume": 1000.0,
+                    "amount": 1068.0,
+                    "pct_chg": 1.0,
+                }
+            ]
+        )
+
+        with patch(
+            "src.services.portfolio_service.PortfolioService._fetch_realtime_position_price",
+            side_effect=AssertionError("include_realtime=false should not fetch realtime quote"),
+        ), patch(
+            "data_provider.base.DataFetcherManager.get_daily_data",
+            return_value=(daily_data, "test-daily"),
+        ) as daily_mock:
+            snapshot_resp = self.client.get(
+                "/api/v1/portfolio/snapshot",
+                params={
+                    "account_id": account_id,
+                    "as_of": today.isoformat(),
+                    "include_realtime": "false",
+                },
+            )
+
+        self.assertEqual(snapshot_resp.status_code, 200, snapshot_resp.text)
+        position = snapshot_resp.json()["accounts"][0]["positions"][0]
+        self.assertEqual(position["price_source"], "history_close")
+        self.assertAlmostEqual(position["last_price"], 1.068, places=6)
+        daily_mock.assert_called_once_with("SH512480", end_date=today.isoformat(), days=30)
+        stored_rows = self.db.get_data_range("512480.SH", today, today)
+        self.assertEqual(len(stored_rows), 1)
+        self.assertAlmostEqual(float(stored_rows[0].close), 1.068, places=6)
+
+    def test_current_snapshot_refreshes_stale_exchange_qualified_close(self) -> None:
+        today = date.today()
+        previous_day = today - timedelta(days=1)
+        account_id = self._create_position(
+            name="Stale Shanghai ETF",
+            symbol="SH512480",
+            save_close=False,
+        )
+        self._save_close("512480.SH", previous_day, 1.05)
+        daily_data = pd.DataFrame(
+            [
+                {
+                    "date": today,
+                    "open": 1.05,
+                    "high": 1.08,
+                    "low": 1.04,
+                    "close": 1.068,
+                    "volume": 1000.0,
+                    "amount": 1068.0,
+                    "pct_chg": 1.0,
+                }
+            ]
+        )
+
+        with patch(
+            "data_provider.base.DataFetcherManager.get_daily_data",
+            return_value=(daily_data, "test-daily"),
+        ) as daily_mock:
+            snapshot_resp = self.client.get(
+                "/api/v1/portfolio/snapshot",
+                params={"account_id": account_id, "as_of": today.isoformat(), "include_realtime": "false"},
+            )
+
+        self.assertEqual(snapshot_resp.status_code, 200, snapshot_resp.text)
+        position = snapshot_resp.json()["accounts"][0]["positions"][0]
+        self.assertEqual(position["price_date"], today.isoformat())
+        self.assertFalse(position["price_stale"])
+        self.assertAlmostEqual(position["last_price"], 1.068, places=6)
+        daily_mock.assert_called_once_with("SH512480", end_date=today.isoformat(), days=30)
 
     def test_snapshot_exposes_partial_quality_fields_for_mixed_position_markets(self) -> None:
         create_resp = self.client.post(
@@ -462,6 +606,104 @@ class PortfolioApiTestCase(unittest.TestCase):
         self.assertEqual(kwargs["portfolio_context"]["account_id"], account_id)
         self.assertEqual(kwargs["portfolio_context"]["quantity"], 10.0)
         self.assertEqual(kwargs["portfolio_context"]["cost_method"], "fifo")
+
+    def test_position_analysis_locks_single_configured_model(self) -> None:
+        account_id = self._create_position(quantity=10)
+        accepted_task = SimpleNamespace(
+            task_id="task-portfolio-model",
+            trace_id="trace-portfolio-model",
+            stock_code="600519",
+            analysis_phase="postmarket",
+            model="route-a",
+        )
+        queue = MagicMock()
+        queue.submit_tasks_batch.return_value = ([accepted_task], [])
+
+        with patch(
+            "src.services.portfolio_service.PortfolioService._fetch_realtime_position_price",
+            return_value=(None, None),
+        ), patch(
+            "api.v1.endpoints.portfolio.validate_analysis_models",
+            return_value=["route-a"],
+        ) as validate_models, patch(
+            "api.v1.endpoints.portfolio.get_task_queue",
+            return_value=queue,
+        ):
+            resp = self.client.post(
+                "/api/v1/portfolio/positions/600519/analysis",
+                json={
+                    "account_id": account_id,
+                    "analysis_phase": "postmarket",
+                    "model": "route-a",
+                },
+            )
+
+        self.assertEqual(resp.status_code, 202, resp.text)
+        self.assertEqual(resp.json()["model"], "route-a")
+        validate_models.assert_called_once()
+        self.assertEqual(validate_models.call_args.args[1], ["route-a"])
+        self.assertEqual(queue.submit_tasks_batch.call_args.kwargs["models"], ["route-a"])
+
+    def test_position_analysis_multi_model_returns_partial_batch_with_same_context(self) -> None:
+        account_id = self._create_position(quantity=10)
+        accepted_task = SimpleNamespace(
+            task_id="task-route-a",
+            trace_id="trace-route-a",
+            stock_code="600519",
+            analysis_phase="postmarket",
+            model="route-a",
+        )
+        duplicate = SimpleNamespace(
+            stock_code="600519",
+            existing_task_id="task-route-b",
+            model="route-b",
+        )
+        queue = MagicMock()
+        queue.submit_tasks_batch.return_value = ([accepted_task], [duplicate])
+
+        with patch(
+            "src.services.portfolio_service.PortfolioService._fetch_realtime_position_price",
+            return_value=(None, None),
+        ), patch(
+            "api.v1.endpoints.portfolio.validate_analysis_models",
+            return_value=["route-a", "route-b"],
+        ), patch(
+            "api.v1.endpoints.portfolio.get_task_queue",
+            return_value=queue,
+        ):
+            resp = self.client.post(
+                "/api/v1/portfolio/positions/600519/analysis",
+                json={
+                    "account_id": account_id,
+                    "analysis_phase": "postmarket",
+                    "models": ["route-a", "route-b"],
+                },
+            )
+
+        self.assertEqual(resp.status_code, 202, resp.text)
+        payload = resp.json()
+        self.assertEqual([item["model"] for item in payload["accepted"]], ["route-a"])
+        self.assertEqual([item["model"] for item in payload["duplicates"]], ["route-b"])
+        kwargs = queue.submit_tasks_batch.call_args.kwargs
+        self.assertEqual(kwargs["models"], ["route-a", "route-b"])
+        self.assertEqual(kwargs["portfolio_context"]["account_id"], account_id)
+        self.assertEqual(kwargs["portfolio_context"]["quantity"], 10.0)
+
+    def test_position_analysis_rejects_unknown_model_before_queue_submission(self) -> None:
+        account_id = self._create_position(quantity=10)
+        queue = MagicMock()
+        with patch(
+            "api.v1.endpoints.portfolio.validate_analysis_models",
+            side_effect=ValueError("模型 unknown 未配置"),
+        ), patch("api.v1.endpoints.portfolio.get_task_queue", return_value=queue):
+            resp = self.client.post(
+                "/api/v1/portfolio/positions/600519/analysis",
+                json={"account_id": account_id, "model": "unknown"},
+            )
+
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertEqual(resp.json()["error"], "validation_error")
+        queue.submit_tasks_batch.assert_not_called()
 
     def test_position_analysis_matches_exchange_suffix_position_symbol(self) -> None:
         account_id = self._create_position(symbol="600519.SH", quantity=10)

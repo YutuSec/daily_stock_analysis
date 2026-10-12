@@ -11,6 +11,7 @@ export type BacktestPhaseFilter = BacktestAnalysisPhase | 'all';
 
 export interface BacktestRunRequest {
   code?: string;
+  modelUsed?: string;
   force?: boolean;
   evalWindowDays?: number;
   minAgeDays?: number;
@@ -36,6 +37,7 @@ export interface BacktestResultItem {
   analysisHistoryId: number;
   code: string;
   stockName?: string;
+  modelUsed?: string;
   analysisDate?: string;
   evalWindowDays: number;
   engineVersion: string;
@@ -69,6 +71,15 @@ export interface BacktestResultItem {
   simulatedExitPrice?: number;
   simulatedExitReason?: string;
   simulatedReturnPct?: number;
+  holdingState?: 'holding' | 'empty' | 'unknown' | string;
+  holdingAction?: DecisionAction | null;
+  holdingActionApplicable?: boolean;
+  holdingActionEvaluable?: boolean;
+  holdingEvalStatus?: string;
+  holdingDirectionExpected?: string | null;
+  holdingDecisionCorrect?: boolean | null;
+  holdingOutcome?: string | null;
+  holdingDecisionReturnPct?: number | null;
 }
 
 export interface BacktestResultsResponse {
@@ -83,6 +94,7 @@ export interface BacktestResultsResponse {
 export interface PerformanceMetrics {
   scope: string;
   code?: string;
+  modelUsed?: string;
   evalWindowDays: number;
   engineVersion: string;
   computedAt?: string;
@@ -97,6 +109,15 @@ export interface PerformanceMetrics {
   neutralCount: number;
 
   directionAccuracyPct?: number;
+  directionEvaluableCount?: number;
+  holdingApplicableCount?: number;
+  holdingEvaluableCount?: number;
+  holdingUnavailableCount?: number;
+  holdingCorrectCount?: number;
+  holdingIncorrectCount?: number;
+  holdingNeutralCount?: number;
+  holdingDecisionAccuracyPct?: number;
+  avgHoldingDecisionReturnPct?: number;
   winRatePct?: number;
   neutralRatePct?: number;
   avgStockReturnPct?: number;

@@ -18,6 +18,7 @@ export const backtestApi = {
   run: async (params: BacktestRunRequest = {}): Promise<BacktestRunResponse> => {
     const requestData: Record<string, unknown> = {};
     if (params.code?.trim()) requestData.code = params.code.trim();
+    if (params.modelUsed?.trim()) requestData.model_used = params.modelUsed.trim();
     if (params.force) requestData.force = params.force;
     if (params.evalWindowDays != null) requestData.eval_window_days = params.evalWindowDays;
     if (params.minAgeDays != null) requestData.min_age_days = params.minAgeDays;
@@ -41,10 +42,11 @@ export const backtestApi = {
     analysisDateFrom?: string;
     analysisDateTo?: string;
     analysisPhase?: BacktestPhaseFilter;
+    modelUsed?: string;
     page?: number;
     limit?: number;
   } = {}): Promise<BacktestResultsResponse> => {
-    const { code, evalWindowDays, analysisDateFrom, analysisDateTo, analysisPhase, page = 1, limit = 20 } = params;
+    const { code, evalWindowDays, analysisDateFrom, analysisDateTo, analysisPhase, modelUsed, page = 1, limit = 20 } = params;
 
     const queryParams: Record<string, string | number> = { page, limit };
     if (code) queryParams.code = code;
@@ -52,6 +54,7 @@ export const backtestApi = {
     if (analysisDateFrom) queryParams.analysis_date_from = analysisDateFrom;
     if (analysisDateTo) queryParams.analysis_date_to = analysisDateTo;
     if (analysisPhase && analysisPhase !== 'all') queryParams.analysis_phase = analysisPhase;
+    if (modelUsed) queryParams.model_used = modelUsed;
 
     const response = await apiClient.get<Record<string, unknown>>(
       '/api/v1/backtest/results',
@@ -75,6 +78,7 @@ export const backtestApi = {
     analysisDateFrom?: string;
     analysisDateTo?: string;
     analysisPhase?: BacktestPhaseFilter;
+    modelUsed?: string;
   } = {}): Promise<PerformanceMetrics | null> => {
     try {
       const queryParams: Record<string, string | number> = {};
@@ -82,6 +86,7 @@ export const backtestApi = {
       if (params.analysisDateFrom) queryParams.analysis_date_from = params.analysisDateFrom;
       if (params.analysisDateTo) queryParams.analysis_date_to = params.analysisDateTo;
       if (params.analysisPhase && params.analysisPhase !== 'all') queryParams.analysis_phase = params.analysisPhase;
+      if (params.modelUsed) queryParams.model_used = params.modelUsed;
       const response = await apiClient.get<Record<string, unknown>>(
         '/api/v1/backtest/performance',
         { params: queryParams },
@@ -104,6 +109,7 @@ export const backtestApi = {
     analysisDateFrom?: string;
     analysisDateTo?: string;
     analysisPhase?: BacktestPhaseFilter;
+    modelUsed?: string;
   } = {}): Promise<PerformanceMetrics | null> => {
     try {
       const queryParams: Record<string, string | number> = {};
@@ -111,6 +117,7 @@ export const backtestApi = {
       if (params.analysisDateFrom) queryParams.analysis_date_from = params.analysisDateFrom;
       if (params.analysisDateTo) queryParams.analysis_date_to = params.analysisDateTo;
       if (params.analysisPhase && params.analysisPhase !== 'all') queryParams.analysis_phase = params.analysisPhase;
+      if (params.modelUsed) queryParams.model_used = params.modelUsed;
       const response = await apiClient.get<Record<string, unknown>>(
         `/api/v1/backtest/performance/${encodeURIComponent(code)}`,
         { params: queryParams },

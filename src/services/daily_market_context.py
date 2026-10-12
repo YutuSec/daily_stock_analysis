@@ -10,8 +10,11 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import select
 
 from src.core.market_review_lock import (
     release_market_review_lock,
@@ -22,7 +25,7 @@ from src.services.run_diagnostics import (
     activate_run_diagnostic_context,
     reset_run_diagnostic_context,
 )
-from src.storage import DatabaseManager
+from src.storage import DailyMarketRegime, DatabaseManager, utc_naive_now
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +75,8 @@ class DailyMarketContext:
     history_id: Optional[int] = None
     query_id: Optional[str] = None
     full_report: Optional[str] = None
+    regime: str = "unavailable"
+    regime_policy_version: str = "market-regime-v1"
 
     def to_safe_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -83,6 +88,8 @@ class DailyMarketContext:
         }
         if self.position_cap:
             payload["position_cap"] = self.position_cap
+        payload["regime"] = self.regime
+        payload["regime_policy_version"] = self.regime_policy_version
         return payload
 
 
@@ -300,6 +307,7 @@ class DailyMarketContextService:
                 query_id=getattr(record, "query_id", None),
             )
             if context is not None:
+                self._persist_regime_from_context(context, payload=payload if isinstance(payload, Mapping) else {})
                 return context
         return None
 
@@ -472,7 +480,7 @@ class DailyMarketContextService:
             else:
                 return None
 
-            return self._build_context_from_payload(
+            context = self._build_context_from_payload(
                 region=region,
                 trade_date=target_date,
                 payload=payload,
@@ -481,6 +489,27 @@ class DailyMarketContextService:
                 fallback_full_report=fallback_summary,
                 query_id=caller_query_id,
             )
+            if context is not None and persist_market_review_history:
+                persisted_history_id = self._latest_market_review_history_id(
+                    query_id=market_context_query_id,
+                )
+                if persisted_history_id is not None:
+                    context = DailyMarketContext(
+                        region=context.region,
+                        trade_date=context.trade_date,
+                        summary=context.summary,
+                        risk_tags=list(context.risk_tags or []),
+                        source=context.source,
+                        position_cap=context.position_cap,
+                        created_at=context.created_at,
+                        history_id=persisted_history_id,
+                        query_id=context.query_id,
+                        full_report=context.full_report,
+                        regime=context.regime,
+                        regime_policy_version=context.regime_policy_version,
+                    )
+                    self._persist_regime_from_context(context, payload=payload)
+            return context
         except Exception as exc:
             logger.warning(
                 "大盘复盘上下文生成失败，个股分析继续: %s",
@@ -629,7 +658,255 @@ class DailyMarketContextService:
             history_id=history_id if isinstance(history_id, int) else None,
             query_id=query_id if isinstance(query_id, str) and query_id else None,
             full_report=full_report,
+            regime=_derive_structured_regime(scoped_payload, risk_tags, position_cap),
+            regime_policy_version="market-regime-v1",
         )
+
+    def _persist_regime_from_context(
+        self,
+        context: DailyMarketContext,
+        *,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Persist the structured regime used by execution gates.
+
+        Keyword extraction can mark risk-off/cautious, but absence of keywords
+        is stored as unavailable unless the payload itself carries a structured
+        normal/cautious/risk_off regime.
+        """
+
+        policy = _execution_policy_for_regime(context.regime)
+        freshness_expires_at = market_context_freshness_expires_at(
+            context.region,
+            context.trade_date,
+        )
+        key = f"{context.region}:{context.trade_date.isoformat()}:{context.regime_policy_version}"
+        provenance = {
+            "source": context.source,
+            "history_id": context.history_id,
+            "query_id": context.query_id,
+            "risk_tags": list(context.risk_tags or []),
+            "position_cap": context.position_cap,
+            "structured_payload_regime": _structured_regime_from_payload(payload),
+            "keyword_absence_cannot_claim_normal": True,
+        }
+        try:
+            with self.db.session_scope() as session:
+                row = session.execute(
+                    select(DailyMarketRegime)
+                    .where(DailyMarketRegime.regime_key == key)
+                    .limit(1)
+                ).scalar_one_or_none()
+                if row is None:
+                    row = DailyMarketRegime(
+                        regime_key=key,
+                        region=context.region,
+                        session_date=context.trade_date,
+                        policy_version=context.regime_policy_version,
+                    )
+                    session.add(row)
+                row.regime = context.regime
+                row.allocation_multiplier = float(policy["allocation_multiplier"])
+                row.entry_allowed = bool(policy["entry_allowed"])
+                row.source_report_id = context.history_id
+                row.source_query_id = context.query_id
+                row.provenance_json = json.dumps(provenance, ensure_ascii=False, sort_keys=True)
+                row.freshness_expires_at = freshness_expires_at
+                row.updated_at = utc_naive_now()
+        except Exception as exc:
+            logger.warning("持久化结构化大盘 regime 失败: %s", exc)
+
+    def _latest_market_review_history_id(self, *, query_id: str) -> Optional[int]:
+        try:
+            getter = getattr(self.db, "get_latest_analysis_history_id", None)
+            if not callable(getter):
+                return None
+            history_id = getter(
+                query_id=query_id,
+                code=MARKET_REVIEW_HISTORY_CODE,
+                report_type=MARKET_REVIEW_REPORT_TYPE,
+            )
+            if isinstance(history_id, int) and not isinstance(history_id, bool) and history_id > 0:
+                return history_id
+        except Exception as exc:
+            logger.warning("查询刚生成的大盘复盘历史 id 失败，跳过 regime 反写: %s", exc)
+        return None
+
+
+def market_context_freshness_expires_at(region: str, trade_date: date) -> Optional[datetime]:
+    """Return the UTC-naive close of the next actual trading session.
+
+    This helper is intentionally fail-closed for paper-trading regime gates:
+    unlike the generic trading-calendar helpers, missing calendars or calendar
+    errors return ``None`` instead of a natural-day fallback.
+    """
+
+    resolved = _market_context_next_session_close(region, trade_date)
+    return resolved[1] if resolved is not None else None
+
+
+def market_context_completed_session_lag(
+    region: str,
+    context_session_date: date,
+    *,
+    current_time: datetime,
+    max_scan_days: int = 370,
+) -> Optional[int]:
+    """Count completed exchange sessions after a context date up to ``current_time``.
+
+    Returns ``None`` when the exchange calendar cannot be trusted.  Callers
+    should treat ``None`` as stale/unavailable for new-risk entry gates.
+    """
+
+    market = str(region or "").strip().lower()
+    if not isinstance(context_session_date, date):
+        return None
+    calendar_parts = _market_context_calendar(market)
+    if calendar_parts is None:
+        return None
+    cal, _ex, tz_name = calendar_parts
+    try:
+        context_session = _calendar_session_for_date(cal, context_session_date)
+        if context_session is None:
+            return None
+
+        market_now = _to_market_aware(current_time, tz_name)
+        completed = 0
+        candidate = context_session_date + timedelta(days=1)
+        scanned = 0
+        while candidate <= market_now.date():
+            scanned += 1
+            if scanned > max_scan_days:
+                return None
+            session = _calendar_session_for_date(cal, candidate)
+            if session is not None:
+                close_utc_naive = _calendar_session_close_utc_naive(cal, session, tz_name)
+                if close_utc_naive is None:
+                    return None
+                now_utc_naive = _to_utc_naive(current_time)
+                if close_utc_naive <= now_utc_naive:
+                    completed += 1
+            candidate += timedelta(days=1)
+        return completed
+    except Exception as exc:
+        logger.warning("大盘 regime 交易会话新鲜度计算失败（fail-closed）: %s", exc)
+        return None
+
+
+def resolve_market_context_freshness_expires_at(
+    region: str,
+    session_date: date,
+    stored_expires_at: Optional[datetime],
+) -> Optional[datetime]:
+    """Resolve persisted freshness while safely upgrading legacy same-day expiries."""
+
+    if not isinstance(session_date, date):
+        return None
+    if _is_legacy_same_day_freshness_expiry(session_date, stored_expires_at):
+        return market_context_freshness_expires_at(region, session_date)
+    if isinstance(stored_expires_at, datetime):
+        return _to_utc_naive(stored_expires_at)
+    return market_context_freshness_expires_at(region, session_date)
+
+
+def _market_context_next_session_close(region: str, trade_date: date) -> Optional[Tuple[date, datetime]]:
+    market = str(region or "").strip().lower()
+    calendar_parts = _market_context_calendar(market)
+    if calendar_parts is None or not isinstance(trade_date, date):
+        return None
+    cal, _ex, tz_name = calendar_parts
+    try:
+        session = _calendar_session_for_date(cal, trade_date)
+        if session is None:
+            return None
+        next_session = cal.next_session(session)
+        close_utc_naive = _calendar_session_close_utc_naive(cal, next_session, tz_name)
+        if close_utc_naive is None:
+            return None
+        return next_session.date(), close_utc_naive
+    except Exception as exc:
+        logger.warning("大盘 regime 下一交易日有效期计算失败（fail-closed）: %s", exc)
+        return None
+
+
+def _market_context_calendar(region: str) -> Optional[Tuple[Any, str, str]]:
+    try:
+        from src.core import trading_calendar
+
+        if not getattr(trading_calendar, "_XCALS_AVAILABLE", False):
+            return None
+        exchange_map = getattr(trading_calendar, "MARKET_EXCHANGE", {})
+        timezone_map = getattr(trading_calendar, "MARKET_TIMEZONE", {})
+        ex = exchange_map.get(region)
+        tz_name = timezone_map.get(region)
+        if not ex or not tz_name:
+            return None
+        xcals = getattr(trading_calendar, "xcals", None)
+        if xcals is None:
+            return None
+        return xcals.get_calendar(ex), ex, tz_name
+    except Exception as exc:
+        logger.warning("大盘 regime 交易日历不可用（fail-closed）: %s", exc)
+        return None
+
+
+def _calendar_session_for_date(cal: Any, value: date) -> Optional[Any]:
+    try:
+        if not cal.is_session(value):
+            return None
+        return cal.date_to_session(value, direction="previous")
+    except Exception:
+        return None
+
+
+def _calendar_session_close_utc_naive(cal: Any, session: Any, tz_name: str) -> Optional[datetime]:
+    return _calendar_timestamp_to_utc_naive(cal.session_close(session), tz_name)
+
+
+def _calendar_timestamp_to_utc_naive(value: Any, tz_name: str) -> Optional[datetime]:
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "to_pydatetime"):
+            dt = value.to_pydatetime()
+        elif isinstance(value, datetime):
+            dt = value
+        else:
+            return None
+        market_tz = ZoneInfo(tz_name)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=market_tz)
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _to_market_aware(value: datetime, tz_name: str) -> datetime:
+    tz = ZoneInfo(tz_name)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc).astimezone(tz)
+    return value.astimezone(tz)
+
+
+def _to_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _is_legacy_same_day_freshness_expiry(
+    session_date: date,
+    stored_expires_at: Optional[datetime],
+) -> bool:
+    if not isinstance(stored_expires_at, datetime):
+        return False
+    if stored_expires_at.date() != session_date:
+        return False
+    return (
+        stored_expires_at.hour == 23
+        and stored_expires_at.minute >= 59
+        and stored_expires_at.second >= 0
+    )
 
 
 def format_daily_market_context_prompt_section(
@@ -954,6 +1231,95 @@ def _extract_position_cap(text: str) -> Optional[str]:
         return cap_match.group(1).replace(" ", "")
     low_position_match = re.search(r"(轻仓|低仓位|小仓|low position|small position)", text, re.IGNORECASE)
     return low_position_match.group(1) if low_position_match else None
+
+
+def _structured_regime_from_payload(payload: Mapping[str, Any]) -> Optional[str]:
+    """Return an explicit structured regime, if the upstream report supplied one.
+
+    Textual summaries are allowed to make a report riskier, but absence of risk
+    words is not evidence that the market is healthy.  A ``normal`` regime must
+    therefore come from a structured field.
+    """
+
+    for key in (
+        "market_regime",
+        "regime",
+        "execution_regime",
+        "risk_regime",
+        "market_state",
+    ):
+        value = payload.get(key)
+        if not isinstance(value, str):
+            continue
+        normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "healthy": "normal",
+            "neutral": "normal",
+            "green": "normal",
+            "yellow": "cautious",
+            "conservative": "cautious",
+            "weak": "cautious",
+            "red": "risk_off",
+            "riskoff": "risk_off",
+            "high_risk": "risk_off",
+            "risk": "risk_off",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized in {"normal", "cautious", "risk_off", "unavailable"}:
+            return normalized
+    market_light = payload.get("market_light")
+    if isinstance(market_light, Mapping):
+        status = str(market_light.get("status") or "").strip().lower()
+        if status == "green":
+            return "normal"
+        if status == "yellow":
+            return "cautious"
+        if status == "red":
+            return "risk_off"
+    return None
+
+
+def _derive_structured_regime(
+    payload: Mapping[str, Any],
+    risk_tags: Sequence[str],
+    position_cap: Optional[str],
+) -> str:
+    explicit = _structured_regime_from_payload(payload)
+    if explicit:
+        return explicit
+    tag_set = {str(tag).strip().lower() for tag in risk_tags if str(tag).strip()}
+    if tag_set & {"high_risk", "risk_off", "market_cooling"}:
+        return "risk_off"
+    if tag_set & {"conservative", "weak"} or position_cap:
+        return "cautious"
+    return "unavailable"
+
+
+def _execution_policy_for_regime(regime: str) -> Dict[str, Any]:
+    normalized = str(regime or "unavailable").strip().lower()
+    policy = {
+        "normal": {
+            "entry_allowed": True,
+            "allocation_multiplier": 1.0,
+            "reasons": [],
+        },
+        "cautious": {
+            "entry_allowed": True,
+            "allocation_multiplier": 0.5,
+            "reasons": ["market_context_cautious"],
+        },
+        "risk_off": {
+            "entry_allowed": False,
+            "allocation_multiplier": 0.0,
+            "reasons": ["market_context_risk_off"],
+        },
+        "unavailable": {
+            "entry_allowed": False,
+            "allocation_multiplier": 0.0,
+            "reasons": ["market_context_unavailable"],
+        },
+    }
+    return dict(policy.get(normalized, policy["unavailable"]))
 
 
 def _coerce_context_mapping(context: Any) -> Dict[str, Any]:

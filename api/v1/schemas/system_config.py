@@ -48,7 +48,7 @@ class SystemConfigFieldSchema(BaseModel):
     title: Optional[str] = Field(None, description="Display title")
     description: Optional[str] = Field(None, description="Field description")
     category: Literal["base", "data_source", "ai_model", "notification", "system", "agent", "backtest", "uncategorized"]
-    data_type: Literal["string", "integer", "number", "boolean", "array", "json", "time"]
+    data_type: Literal["string", "integer", "number", "boolean", "array", "list", "json", "time"]
     ui_control: Literal["text", "password", "number", "select", "textarea", "switch", "time"]
     is_sensitive: bool
     is_required: bool

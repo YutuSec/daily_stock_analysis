@@ -101,16 +101,20 @@ class MarketCommand(BotCommand):
             from src.core.trading_calendar import (
                 get_open_markets_today,
                 compute_effective_region,
+                MARKET_TIMEZONE,
             )
 
-            open_markets = get_open_markets_today()
+            requested_region = compute_effective_region(
+                getattr(config, "market_review_region", "cn") or "cn", set(MARKET_TIMEZONE)
+            )
+            open_markets = get_open_markets_today(markets=set((requested_region or '').split(',')) - {''})
             return compute_effective_region(
                 getattr(config, "market_review_region", "cn") or "cn",
                 open_markets,
             )
         except Exception as exc:
-            logger.warning("交易日过滤失败，按配置继续执行大盘复盘: %s", exc)
-            return None
+            logger.warning("交易日过滤失败，暂停大盘复盘: %s", exc)
+            raise
 
     def _run_market_review(
         self,

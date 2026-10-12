@@ -30,6 +30,7 @@ export interface PortfolioAccountCreateRequest {
 }
 
 export interface PortfolioPositionItem {
+  positionId?: number;
   symbol: string;
   market: string;
   currency: string;
@@ -54,6 +55,8 @@ export interface PortfolioPositionAnalysisRequest {
   accountId?: number;
   analysisPhase?: 'auto' | 'premarket' | 'intraday' | 'postmarket';
   force?: boolean;
+  model?: string;
+  models?: string[];
 }
 
 export interface PortfolioAccountSnapshot {

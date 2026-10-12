@@ -57,6 +57,8 @@ class BacktestServiceTestCase(unittest.TestCase):
                     code="600519",
                     name="贵州茅台",
                     report_type="simple",
+                    model_used="provider/model-a",
+                    raw_result=json.dumps({"model_used": "provider/model-a"}),
                     sentiment_score=80,
                     operation_advice="买入",
                     trend_prediction="看多",
@@ -219,6 +221,60 @@ class BacktestServiceTestCase(unittest.TestCase):
         stats3 = service.run_backtest(code="600519", force=True, eval_window_days=3, min_age_days=0, limit=10)
         self.assertEqual(stats3["saved"], 1)
         self.assertEqual(self._count_results(), 1)
+
+    def test_backtest_can_filter_and_summarize_by_model(self) -> None:
+        with self.db.get_session() as session:
+            session.add(
+                AnalysisHistory(
+                    query_id="q-model-b",
+                    code="600519",
+                    name="贵州茅台",
+                    report_type="simple",
+                    model_used="provider/model-b",
+                    raw_result=json.dumps({"model_used": "provider/model-b"}),
+                    sentiment_score=70,
+                    operation_advice="买入",
+                    trend_prediction="看多",
+                    analysis_summary="model-b",
+                    stop_loss=95.0,
+                    take_profit=110.0,
+                    created_at=datetime(2024, 1, 1, 0, 0, 0),
+                    context_snapshot=json.dumps({"enhanced_context": {"date": "2024-01-01"}}),
+                )
+            )
+            session.commit()
+
+        service = BacktestService(self.db)
+        stats = service.run_backtest(
+            code="600519",
+            model_used="provider/model-b",
+            force=False,
+            eval_window_days=3,
+            min_age_days=0,
+            limit=10,
+        )
+        self.assertEqual(stats["processed"], 1)
+        self.assertEqual(stats["diagnostics"]["model_used"], "provider/model-b")
+
+        evaluations = service.get_recent_evaluations(
+            code="600519",
+            model_used="provider/model-b",
+            eval_window_days=3,
+            limit=10,
+            page=1,
+        )
+        self.assertEqual(evaluations["total"], 1)
+        self.assertEqual(evaluations["items"][0]["model_used"], "provider/model-b")
+
+        summary = service.get_summary(
+            scope="stock",
+            code="600519",
+            model_used="provider/model-b",
+            eval_window_days=3,
+        )
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["model_used"], "provider/model-b")
+        self.assertEqual(summary["total_evaluations"], 1)
 
     def test_run_backtest_accepts_dotted_exchange_prefix_and_filters_analysis_date_range(self) -> None:
         service = BacktestService(self.db)
@@ -1727,6 +1783,126 @@ class BacktestServiceTestCase(unittest.TestCase):
         self.assertAlmostEqual(result.simulated_exit_price, 110.0)
         self.assertEqual(result.simulated_exit_reason, "take_profit")
         self.assertAlmostEqual(result.simulated_return_pct, 10.0)
+
+    def test_run_backtest_exposes_direction_and_frozen_holding_metrics(self) -> None:
+        with self.db.get_session() as session:
+            history = session.query(AnalysisHistory).filter(AnalysisHistory.query_id == "q1").one()
+            history.raw_result = json.dumps(
+                {
+                    "model_used": "provider/model-a",
+                    "action": "sell",
+                    "holding_state": "holding",
+                    "position_actions": {
+                        "holding": {"action": "hold", "advice": "继续持有"},
+                    },
+                },
+                ensure_ascii=False,
+            )
+            session.commit()
+
+        service = BacktestService(self.db)
+        service.run_backtest(code="600519", force=True, eval_window_days=3, min_age_days=0, limit=10)
+
+        with self.db.get_session() as session:
+            row = session.query(BacktestResult).one()
+            self.assertEqual(row.start_price, 100.0)
+            self.assertEqual(row.direction_expected, "down")
+            self.assertFalse(row.direction_correct)
+            self.assertEqual(row.holding_state, "holding")
+            self.assertEqual(row.holding_action, "hold")
+            self.assertTrue(row.holding_action_applicable)
+            self.assertTrue(row.holding_action_evaluable)
+            self.assertTrue(row.holding_decision_correct)
+            self.assertAlmostEqual(row.holding_decision_return_pct, 7.0)
+
+        summary = service.get_summary(
+            scope="overall",
+            code=None,
+            eval_window_days=3,
+            model_used="provider/model-a",
+        )
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["direction_evaluable_count"], 1)
+        self.assertAlmostEqual(summary["direction_accuracy_pct"], 0.0)
+        self.assertEqual(summary["holding_applicable_count"], 1)
+        self.assertEqual(summary["holding_evaluable_count"], 1)
+        self.assertAlmostEqual(summary["holding_decision_accuracy_pct"], 100.0)
+
+    def test_empty_position_backtest_displays_effective_watch_but_preserves_general_metric(self) -> None:
+        with self.db.get_session() as session:
+            history = session.query(AnalysisHistory).filter(AnalysisHistory.query_id == "q1").one()
+            history.sentiment_score = 37
+            history.operation_advice = "减仓"
+            history.raw_result = json.dumps(
+                {
+                    "model_used": "provider/model-a",
+                    "sentiment_score": 37,
+                    "operation_advice": "减仓",
+                    "action": "reduce",
+                    "action_label": "减仓",
+                    "holding_state": "empty",
+                    "position_actions": {
+                        "empty": {"action": "watch", "advice": "空仓观望"},
+                        "holding": {"action": "reduce", "advice": "持仓减仓"},
+                    },
+                },
+                ensure_ascii=False,
+            )
+            session.commit()
+
+        service = BacktestService(self.db)
+        service.run_backtest(code="600519", force=True, eval_window_days=3, min_age_days=0, limit=10)
+
+        with self.db.get_session() as session:
+            row = session.query(BacktestResult).one()
+            # General direction remains the score/report action, keeping the
+            # existing general-vs-holding two-metric backtest contract.
+            self.assertEqual(row.direction_expected, "down")
+            self.assertEqual(row.holding_state, "empty")
+            self.assertEqual(row.holding_action, "reduce")
+            self.assertFalse(row.holding_action_applicable)
+            self.assertFalse(row.holding_action_evaluable)
+
+        item = service.get_recent_evaluations(
+            code="600519",
+            eval_window_days=3,
+            limit=10,
+            page=1,
+        )["items"][0]
+        self.assertEqual(item["operation_advice"], "观望")
+        self.assertEqual(item["action"], "watch")
+        self.assertEqual(item["action_label"], "观望")
+        self.assertEqual(item["holding_action"], "reduce")
+        self.assertFalse(item["holding_action_applicable"])
+
+    def test_legacy_position_advice_does_not_fabricate_holding_metric(self) -> None:
+        with self.db.get_session() as session:
+            history = session.query(AnalysisHistory).filter(AnalysisHistory.query_id == "q1").one()
+            history.raw_result = json.dumps(
+                {
+                    "holding_state": "holding",
+                    "dashboard": {
+                        "core_conclusion": {
+                            "position_advice": {
+                                "has_position": {"action": "hold", "advice": "继续持有"},
+                            }
+                        }
+                    },
+                },
+                ensure_ascii=False,
+            )
+            session.commit()
+
+        service = BacktestService(self.db)
+        service.run_backtest(code="600519", force=True, eval_window_days=3, min_age_days=0, limit=10)
+
+        data = service.get_recent_evaluations(code="600519", eval_window_days=3, limit=10, page=1)
+        item = data["items"][0]
+        self.assertEqual(item["holding_state"], "holding")
+        self.assertIsNone(item["holding_action"])
+        self.assertFalse(item["holding_action_applicable"])
+        self.assertFalse(item["holding_action_evaluable"])
+        self.assertEqual(item["holding_eval_status"], "unavailable")
 
     def test_summaries_created_after_run(self) -> None:
         """Verify both overall and per-stock BacktestSummary rows are created."""

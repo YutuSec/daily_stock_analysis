@@ -44,6 +44,8 @@ from api.v1.schemas.analysis import (
     DuplicateTaskErrorResponse,
     MarketReviewRequest,
     MarketReviewAccepted,
+    AnalysisModelsResponse,
+    AnalysisModelInfo,
 )
 from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.history import (
@@ -76,7 +78,7 @@ from src.market_phase_summary import (
 )
 from src.services.stock_code_utils import is_code_like, resolve_index_stock_code_for_analysis
 from src.report_language import get_localized_stock_name, normalize_report_language
-from src.schemas.decision_action import build_action_fields
+from src.schemas.decision_action import display_action_fields, normalize_holding_state
 from src.services.name_to_code_resolver import resolve_name_to_code
 from src.services.task_queue import (
     get_task_queue,
@@ -85,6 +87,11 @@ from src.services.task_queue import (
 )
 from src.services.run_diagnostics import build_run_diagnostic_summary
 from src.services.run_flow import build_task_run_flow_snapshot
+from src.services.analysis_model_service import (
+    list_analysis_models,
+    validate_analysis_models,
+)
+from src.services.portfolio_service import VALID_MARKETS
 from src.utils.data_processing import (
     normalize_model_used,
     parse_json_field,
@@ -99,6 +106,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _SUPPORTED_FREE_TEXT_RE = re.compile(r"^[A-Za-z0-9.*\-+\u3400-\u9fff\s]+$")
+
+
+@router.get(
+    "/models",
+    response_model=AnalysisModelsResponse,
+    summary="获取可选分析模型",
+)
+def get_analysis_models(config: Config = Depends(get_config_dep)) -> AnalysisModelsResponse:
+    """Expose configured model route names without provider credentials."""
+    models = list_analysis_models(config)
+    configured_default = str(getattr(config, "litellm_model", "") or "").strip()
+    default_model = configured_default if configured_default in models else (models[0] if models else None)
+    return AnalysisModelsResponse(
+        models=[
+            AnalysisModelInfo(model=model, is_default=model == default_model)
+            for model in models
+        ],
+        default_model=default_model,
+        comparison_available=len(models) >= 2,
+        supported_markets=sorted(VALID_MARKETS),
+    )
 
 
 def _get_task_trace_id(task: Any) -> Optional[str]:
@@ -326,10 +354,22 @@ def trigger_analysis(
     
     stock_codes = unique_codes
 
+    comparison_models = getattr(request, "models", None)
+    single_model = getattr(request, "model", None)
+    raw_models = comparison_models or ([single_model] if single_model else [])
+    try:
+        requested_models = validate_analysis_models(config, raw_models)
+    except ValueError as exc:
+        raise api_error(400, "validation_error", str(exc)) from exc
+
+    if comparison_models and not request.async_mode:
+        raise api_error(400, "validation_error", "多模型比较仅支持 async_mode=true")
+
     # Limit the number of stocks in a single request to prevent DoS
     MAX_BATCH_SIZE = 50
-    if len(stock_codes) > MAX_BATCH_SIZE:
-        raise api_error(400, "validation_error", f"单次分析请求最多支持 {MAX_BATCH_SIZE} 只股票")
+    task_count = len(stock_codes) * max(1, len(requested_models))
+    if task_count > MAX_BATCH_SIZE:
+        raise api_error(400, "validation_error", f"单次分析请求最多创建 {MAX_BATCH_SIZE} 个任务")
 
     if not stock_codes:
         raise api_error(400, "validation_error", "股票代码不能为空或仅包含空白字符")
@@ -342,15 +382,20 @@ def trigger_analysis(
                 "validation_error",
                 "同步模式仅支持单只股票分析，请使用 async_mode=true 进行批量分析",
             )
-        return _handle_sync_analysis(stock_codes[0], request)
+        return _handle_sync_analysis(
+            stock_codes[0],
+            request,
+            requested_models[0] if requested_models else None,
+        )
 
     # Async mode submits one task per stock.
-    return _handle_async_analysis_batch(stock_codes, request)
+    return _handle_async_analysis_batch(stock_codes, request, requested_models)
 
 
 def _handle_async_analysis_batch(
     stock_codes: list,
-    request: AnalyzeRequest
+    request: AnalyzeRequest,
+    requested_models: Optional[list[str]] = None,
 ) -> JSONResponse:
     """
     Handle asynchronous analysis requests, including batch submission.
@@ -385,6 +430,8 @@ def _handle_async_analysis_batch(
         submit_kwargs["report_language"] = report_language
     if skills is not None:
         submit_kwargs["skills"] = skills
+    if requested_models:
+        submit_kwargs["models"] = requested_models
 
     accepted_tasks, duplicate_errors = task_queue.submit_tasks_batch(**submit_kwargs)
 
@@ -396,6 +443,7 @@ def _handle_async_analysis_batch(
             status="pending",
             message=f"分析任务已加入队列: {task.stock_code}",
             analysis_phase=task.analysis_phase,
+            model=getattr(task, "model", None),
         )
         for task in accepted_tasks
     ]
@@ -404,12 +452,14 @@ def _handle_async_analysis_batch(
             stock_code=dup.stock_code,
             existing_task_id=dup.existing_task_id,
             message=str(dup),
+            model=getattr(dup, "model", None),
         )
         for dup in duplicate_errors
     ]
     
     # 单只股票且被拒绝：保持 409 兼容性
-    if len(stock_codes) == 1 and duplicates:
+    expected_task_count = len(stock_codes) * max(1, len(requested_models or []))
+    if expected_task_count == 1 and duplicates:
         dup = duplicates[0]
         error_response = DuplicateTaskErrorResponse(
             error="duplicate_task",
@@ -423,13 +473,14 @@ def _handle_async_analysis_batch(
         )
     
     # 单只股票成功：保持原有响应格式兼容性
-    if len(stock_codes) == 1 and accepted:
+    if expected_task_count == 1 and accepted:
         task_accepted = TaskAccepted(
             task_id=accepted[0].task_id,
             trace_id=accepted[0].trace_id,
             status="pending",
             message=accepted[0].message,
             analysis_phase=accepted[0].analysis_phase,
+            model=accepted[0].model,
         )
         return JSONResponse(
             status_code=202,
@@ -450,7 +501,8 @@ def _handle_async_analysis_batch(
 
 def _handle_sync_analysis(
     stock_code: str,
-    request: AnalyzeRequest
+    request: AnalyzeRequest,
+    model: Optional[str] = None,
 ) -> AnalysisResultResponse:
     """
     处理同步分析请求
@@ -473,6 +525,7 @@ def _handle_sync_analysis(
             skills=getattr(request, "skills", None),
             analysis_phase=request.analysis_phase,
             report_language=getattr(request, "report_language", None),
+            model=model,
         )
 
         if result is None:
@@ -641,6 +694,7 @@ def get_task_list(
             selection_source=t.selection_source,
             analysis_phase=t.analysis_phase,
             skills=getattr(t, "skills", None),
+            model=getattr(t, "model", None),
         )
         for t in all_tasks
     ]
@@ -906,9 +960,20 @@ def _ensure_report_action_fields(report_data: Dict[str, Any]) -> Dict[str, Any]:
     report_language = normalize_report_language(
         meta.get("report_language") or raw_result.get("report_language")
     )
-    action_fields = build_action_fields(
+    holding_state = _first_non_empty_report_value(
+        raw_result.get("holding_state"),
+        details.get("holding_state"),
+        summary.get("holding_state"),
+    )
+    position_actions = _first_non_empty_report_value(
+        raw_result.get("position_actions"),
+        details.get("position_actions"),
+        summary.get("position_actions"),
+    )
+    action_fields = display_action_fields(
         operation_advice=raw_result.get("operation_advice") or summary.get("operation_advice"),
         explicit_action=raw_result.get("action") or summary.get("action"),
+        action_label=raw_result.get("action_label") or summary.get("action_label"),
         report_type=meta.get("report_type"),
         report_language=report_language,
         sentiment_score=_first_non_empty_report_value(
@@ -916,8 +981,11 @@ def _ensure_report_action_fields(report_data: Dict[str, Any]) -> Dict[str, Any]:
             raw_result.get("sentiment_score"),
         ),
         guardrail_reason=_extract_guardrail_reason(raw_result),
-        align_with_score=True,
+        holding_state=holding_state,
+        position_actions=position_actions,
     )
+    if normalize_holding_state(holding_state) != "unknown":
+        summary["operation_advice"] = action_fields["action_label"]
     summary["action"] = action_fields["action"]
     summary["action_label"] = action_fields["action_label"]
     enriched_report["summary"] = summary
@@ -1082,6 +1150,7 @@ def get_analysis_status(task_id: str) -> TaskStatus:
             selection_source=task.selection_source,
             analysis_phase=task.analysis_phase,
             skills=getattr(task, "skills", None),
+            model=getattr(task, "model", None),
         )
     
     # 2. 从数据库查询已完成的记录
@@ -1185,14 +1254,17 @@ def get_analysis_status(task_id: str) -> TaskStatus:
                 )
 
             raw_dict = raw_result if isinstance(raw_result, dict) else {}
-            action_fields = build_action_fields(
+            holding_state = raw_dict.get("holding_state")
+            action_fields = display_action_fields(
                 operation_advice=raw_dict.get("operation_advice") or record.operation_advice,
                 explicit_action=raw_dict.get("action"),
+                action_label=raw_dict.get("action_label"),
                 report_type=getattr(record, 'report_type', None),
                 report_language=report_language,
                 sentiment_score=record.sentiment_score if record.sentiment_score is not None else raw_dict.get("sentiment_score"),
                 guardrail_reason=_extract_guardrail_reason(raw_dict),
-                align_with_score=True,
+                holding_state=holding_state,
+                position_actions=raw_dict.get("position_actions"),
             )
 
             # Build report from DB record so completed tasks return real data
@@ -1212,7 +1284,11 @@ def get_analysis_status(task_id: str) -> TaskStatus:
                 ),
                 summary=ReportSummary(
                     sentiment_score=record.sentiment_score,
-                    operation_advice=record.operation_advice,
+                    operation_advice=(
+                        action_fields["action_label"]
+                        if normalize_holding_state(holding_state) != "unknown"
+                        else record.operation_advice
+                    ),
                     action=action_fields["action"],
                     action_label=action_fields["action_label"],
                     trend_prediction=record.trend_prediction,
@@ -1248,6 +1324,7 @@ def get_analysis_status(task_id: str) -> TaskStatus:
                 ),
                 error=None,
                 skills=skills,
+                model=model_used,
             )
 
     except Exception as e:
@@ -1398,13 +1475,24 @@ def _build_analysis_report(
                 raw_result_data = fallback_raw_result_payload
         if not raw_result_data and isinstance(details_data, dict):
             raw_result_data = details_data
-    action_fields = build_action_fields(
+    holding_state = _first_non_empty_report_value(
+        raw_result_data.get("holding_state"),
+        details_data.get("holding_state"),
+        summary_data.get("holding_state"),
+    )
+    position_actions = _first_non_empty_report_value(
+        raw_result_data.get("position_actions"),
+        details_data.get("position_actions"),
+        summary_data.get("position_actions"),
+    )
+    action_fields = display_action_fields(
         operation_advice=(
             raw_result_data.get("operation_advice")
             or details_data.get("operation_advice")
             or summary_data.get("operation_advice")
         ),
         explicit_action=raw_result_data.get("action") or details_data.get("action") or summary_data.get("action"),
+        action_label=raw_result_data.get("action_label") or details_data.get("action_label") or summary_data.get("action_label"),
         report_type=meta.report_type,
         report_language=report_language,
         sentiment_score=_first_non_empty_report_value(
@@ -1413,12 +1501,17 @@ def _build_analysis_report(
             details_data.get("sentiment_score"),
         ),
         guardrail_reason=_extract_guardrail_reason(raw_result_data),
-        align_with_score=True,
+        holding_state=holding_state,
+        position_actions=position_actions,
     )
 
     summary = ReportSummary(
         analysis_summary=summary_data.get("analysis_summary"),
-        operation_advice=summary_data.get("operation_advice"),
+        operation_advice=(
+            action_fields["action_label"]
+            if normalize_holding_state(holding_state) != "unknown"
+            else summary_data.get("operation_advice")
+        ),
         action=action_fields["action"],
         action_label=action_fields["action_label"],
         trend_prediction=summary_data.get("trend_prediction"),

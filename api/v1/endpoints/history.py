@@ -10,7 +10,7 @@
 """
 
 import logging
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Depends, Body
 
@@ -43,7 +43,7 @@ from src.report_language import (
     normalize_report_language,
 )
 from src.services.history_service import HistoryService, MarkdownReportGenerationError
-from src.schemas.decision_action import build_action_fields
+from src.schemas.decision_action import display_action_fields, normalize_holding_state
 from src.utils.data_processing import (
     normalize_model_used,
     extract_fundamental_detail_fields,
@@ -51,6 +51,7 @@ from src.utils.data_processing import (
     extract_market_structure_detail_field,
     extract_realtime_detail_fields,
 )
+from src.utils.sanitize import sanitize_diagnostic_text
 from src.analysis_context_pack_overview import (
     extract_analysis_context_pack_overview,
     sanitize_context_snapshot_for_api,
@@ -150,6 +151,10 @@ def _extract_guardrail_reason(raw_result: Any) -> Optional[str]:
 def get_history_list(
     stock_code: Optional[str] = Query(None, description="股票代码筛选"),
     report_type: Optional[str] = Query(None, description="报告类型筛选，如 market_review"),
+    model_used: Annotated[
+        Optional[str],
+        Query(max_length=255, description="LLM 模型筛选（精确匹配）"),
+    ] = None,
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
     page: int = Query(1, ge=1, description="页码（从 1 开始）"),
@@ -180,6 +185,7 @@ def get_history_list(
         result = service.get_history_list(
             stock_code=stock_code,
             report_type=report_type,
+            model_used=model_used,
             start_date=start_date,
             end_date=end_date,
             page=page,
@@ -340,6 +346,10 @@ def delete_history_records(
 def get_stock_bar(
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
+    model_used: Annotated[
+        Optional[str],
+        Query(max_length=255, description="LLM 模型筛选（精确匹配）"),
+    ] = None,
     limit: int = Query(200, ge=1, le=500, description="最大返回数量"),
     db_manager: DatabaseManager = Depends(get_database_manager),
 ) -> StockBarResponse:
@@ -358,6 +368,7 @@ def get_stock_bar(
             start_date=start,
             end_date=end,
             limit=fetch_limit,
+            model_used=model_used,
         )
 
         # Deduplicate by normalized code, keeping the record with highest id
@@ -368,11 +379,30 @@ def get_stock_bar(
             if norm_code not in seen or record.id > seen[norm_code].id:
                 seen[norm_code] = record
 
+        latest_attempts = {}
+        for attempt in db_manager.get_latest_analysis_attempts(
+            model_used=model_used,
+            start_date=start,
+            end_date=end,
+            limit=fetch_limit,
+        ):
+            display_code = service._display_stock_code(getattr(attempt, "code", "") or "")
+            norm_code = _normalize_code_for_grouping(display_code)
+            attempt_model = normalize_model_used(getattr(attempt, "model_used", None)) or ""
+            attempt_key = (norm_code, attempt_model)
+            if not norm_code or attempt_key in latest_attempts:
+                continue
+            latest_attempts[attempt_key] = attempt
+
         items = []
         for norm_code in seen:
             record = seen[norm_code]
             raw_result = parse_json_field(getattr(record, "raw_result", None))
-            model_used = raw_result.get("model_used") if isinstance(raw_result, dict) else None
+            record_model_used = getattr(record, "model_used", None)
+            if not record_model_used and isinstance(raw_result, dict):
+                record_model_used = raw_result.get("model_used")
+            normalized_record_model = normalize_model_used(record_model_used) or ""
+            latest_attempt = latest_attempts.get((norm_code, normalized_record_model))
             sentiment_score = _coalesce_int(
                 record.sentiment_score,
                 _raw_result_value(raw_result, "sentiment_score"),
@@ -381,7 +411,7 @@ def get_stock_bar(
                 record.operation_advice,
                 _raw_result_value(raw_result, "operation_advice"),
             )
-            action_fields = build_action_fields(
+            action_fields = display_action_fields(
                 operation_advice=operation_advice,
                 explicit_action=_raw_result_value(raw_result, "action"),
                 report_type=record.report_type,
@@ -390,14 +420,51 @@ def get_stock_bar(
                 ),
                 sentiment_score=sentiment_score,
                 guardrail_reason=_extract_guardrail_reason(raw_result),
-                align_with_score=True,
+                holding_state=_raw_result_value(raw_result, "holding_state"),
+                position_actions=_raw_result_value(raw_result, "position_actions"),
             )
+            raw_attempt_status, raw_error_message = HistoryService._analysis_attempt_status(
+                raw_result,
+                report_type=record.report_type,
+            )
+            raw_status = "completed" if raw_attempt_status == "success" else raw_attempt_status
+            if raw_status in {"failed", "degraded"}:
+                action_fields = {"action": None, "action_label": None}
+            error_message = raw_error_message
+            serialized_created_at = service._serialize_created_at(record.created_at)
 
             display_stock_code = service._display_stock_code(record.code)
             analysis_count = db_manager.get_analysis_history_paginated(
                 code=HistoryService._history_code_filter_candidates(display_stock_code),
+                model_used=model_used,
                 limit=1,
             )[1]
+            analysis_status = raw_status
+            latest_attempt_time = None
+            latest_attempt_error = None
+            last_success_time = (
+                service._serialize_created_at(record.created_at)
+                if raw_status == "completed"
+                else None
+            )
+            if latest_attempt is not None:
+                latest_attempt_time = service._serialize_created_at(getattr(latest_attempt, "created_at", None))
+                attempt_status = str(getattr(latest_attempt, "status", "") or "").strip().lower()
+                attempt_created_at = getattr(latest_attempt, "created_at", None)
+                if (
+                    attempt_status in {"failed", "degraded"}
+                    and attempt_created_at is not None
+                    and record.created_at is not None
+                    and attempt_created_at >= record.created_at
+                ):
+                    analysis_status = attempt_status
+                    latest_attempt_error = sanitize_diagnostic_text(
+                        getattr(latest_attempt, "error_message", None),
+                        max_length=300,
+                    )
+                    error_message = str(latest_attempt_error or "").strip()[:300] or error_message
+                    serialized_created_at = latest_attempt_time or serialized_created_at
+                    action_fields = {"action": None, "action_label": None}
             items.append(
                 StockBarItem(
                     id=record.id,
@@ -405,16 +472,33 @@ def get_stock_bar(
                     stock_name=record.name,
                     report_type=record.report_type,
                     sentiment_score=sentiment_score,
-                    operation_advice=operation_advice,
+                    operation_advice=(
+                        "分析失败"
+                        if analysis_status in {"failed", "degraded"}
+                        else
+                        action_fields["action_label"]
+                        if normalize_holding_state(
+                            _raw_result_value(raw_result, "holding_state")
+                        ) != "unknown"
+                        else operation_advice
+                    ),
                     action=action_fields["action"],
                     action_label=action_fields["action_label"],
+                    analysis_status=analysis_status,
                     analysis_count=analysis_count,
-                    last_analysis_time=service._serialize_created_at(record.created_at),
-                    model_used=normalize_model_used(model_used),
+                    last_analysis_time=serialized_created_at,
+                    model_used=normalized_record_model or None,
                     market_phase_summary=service._display_market_phase_summary(
                         record.code,
                         getattr(record, "context_snapshot", None),
                     ),
+                    latest_attempt_time=latest_attempt_time or serialized_created_at,
+                    latest_attempt_error=(
+                        str(latest_attempt_error or "").strip()[:300]
+                        if latest_attempt_error
+                        else error_message
+                    ),
+                    last_success_time=last_success_time,
                 )
             )
 
@@ -532,6 +616,8 @@ def get_history_detail(
             ),
             action=result.get("action"),
             action_label=result.get("action_label"),
+            analysis_status=result.get("analysis_status") or "success",
+            error_message=result.get("error_message"),
             trend_prediction=localize_trend_prediction(
                 result.get("trend_prediction"),
                 report_language,

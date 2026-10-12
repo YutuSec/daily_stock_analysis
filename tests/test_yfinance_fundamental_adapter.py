@@ -9,6 +9,7 @@ graceful degradation when yfinance is unavailable.
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pandas as pd
@@ -52,6 +53,31 @@ class TestYfinanceSymbolConversion(unittest.TestCase):
 
 
 class TestYfinanceFundamentalAdapter(unittest.TestCase):
+    def setUp(self) -> None:
+        # Keep the rolling-365-day fixture independent of the machine's date.
+        # Replace only this adapter's pandas reference, not pandas globally.
+        class FixtureTimestamp(pd.Timestamp):
+            @classmethod
+            def now(cls, tz=None):
+                return pd.Timestamp("2026-06-01", tz=tz)
+
+        clock = patch(
+            "data_provider.yfinance_fundamental_adapter.pd",
+            SimpleNamespace(**{**vars(pd), "Timestamp": FixtureTimestamp}),
+        )
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def test_dividend_rolling_year_boundary(self) -> None:
+        dividends = pd.Series(
+            [9.0, 1.0, 2.0],
+            index=pd.DatetimeIndex(["2025-05-31", "2025-06-01", "2026-05-31"], tz="America/New_York"),
+        )
+        with patch("yfinance.Ticker", return_value=_build_mock_ticker({"currency": "USD"}, dividends=dividends)):
+            result = YfinanceFundamentalAdapter().get_fundamental_bundle("AAPL")
+        self.assertEqual(result["earnings"]["dividend"]["ttm_event_count"], 2)
+        self.assertEqual(result["earnings"]["dividend"]["ttm_cash_dividend_per_share"], 3.0)
+
     def test_populates_growth_earnings_dividend_boards_for_us_stock(self) -> None:
         info = {
             "financialCurrency": "USD",

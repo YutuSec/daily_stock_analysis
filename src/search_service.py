@@ -15,6 +15,7 @@ import logging
 import re
 import os
 import random
+import hashlib
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -144,10 +145,16 @@ class SearchResponse:
     success: bool = True
     error_message: Optional[str] = None
     search_time: float = 0.0  # 搜索耗时（秒）
+    error_type: Optional[str] = None
+    retry_after_seconds: Optional[int] = None
+    usage_credits: Optional[float] = None
     
     def to_context(self, max_results: int = 5) -> str:
         """将搜索结果转换为可用于 AI 分析的上下文"""
-        if not self.success or not self.results:
+        if not self.success:
+            detail = f"原因：{self.error_message}" if self.error_message else "原因：搜索服务不可用"
+            return f"搜索 '{self.query}' 暂不可用，{detail}。不能据此判断无相关新闻。"
+        if not self.results:
             return f"搜索 '{self.query}' 未找到相关结果。"
         
         lines = [f"【{self.query} 搜索结果】（来源：{self.provider}）"]
@@ -173,6 +180,7 @@ class BaseSearchProvider(ABC):
         self._key_cycle = cycle(api_keys) if api_keys else None
         self._key_usage: Dict[str, int] = {key: 0 for key in api_keys}
         self._key_errors: Dict[str, int] = {key: 0 for key in api_keys}
+        self._key_blocked_until: Dict[str, float] = {}
         self._state_lock = threading.RLock()
     
     @property
@@ -193,19 +201,37 @@ class BaseSearchProvider(ABC):
         with self._state_lock:
             if not self._key_cycle:
                 return None
+            now = time.monotonic()
             
             # 最多尝试所有 key
             for _ in range(len(self._api_keys)):
                 key = next(self._key_cycle)
+                blocked_until = self._key_blocked_until.get(key, 0.0)
+                if blocked_until > now:
+                    continue
+                if blocked_until:
+                    # This key's cooldown has expired. Clear only this key's
+                    # terminal error state so a recovered key can re-enter
+                    # rotation even when another key is still cooling down.
+                    self._key_blocked_until.pop(key, None)
+                    self._key_errors[key] = 0
                 # 跳过错误次数过多的 key（超过 3 次）
                 if self._key_errors.get(key, 0) < 3:
                     return key
             
+            if any(self._key_blocked_until.get(key, 0.0) > now for key in self._api_keys):
+                logger.warning(f"[{self._name}] 所有 API Key 当前处于冷却/不可用状态，交给下一搜索引擎兜底")
+                return None
+
             # 所有 key 都有问题，重置错误计数并返回第一个
             logger.warning(f"[{self._name}] 所有 API Key 都有错误记录，重置错误计数")
             self._key_errors = {key: 0 for key in self._api_keys}
             return self._api_keys[0] if self._api_keys else None
-    
+
+    def _has_configured_keys(self) -> bool:
+        with self._state_lock:
+            return bool(self._api_keys)
+
     def _record_success(self, key: str) -> None:
         """记录成功使用"""
         with self._state_lock:
@@ -213,13 +239,97 @@ class BaseSearchProvider(ABC):
             # 成功后减少错误计数
             if key in self._key_errors and self._key_errors[key] > 0:
                 self._key_errors[key] -= 1
+            self._key_blocked_until.pop(key, None)
     
-    def _record_error(self, key: str) -> None:
+    @staticmethod
+    def _redacted_key_label(key: str) -> str:
+        digest = hashlib.sha256(str(key or "").encode("utf-8")).hexdigest()[:10]
+        return f"sha256:{digest}"
+
+    def _sanitize_error_message(self, message: Any) -> str:
+        text = str(message or "")
+        for key in self._api_keys:
+            if key:
+                text = text.replace(key, "[REDACTED_API_KEY]")
+        text = re.sub(r"Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED_API_KEY]", text, flags=re.IGNORECASE)
+        text = re.sub(r"tvly-[A-Za-z0-9_-]+", "[REDACTED_TAVILY_KEY]", text)
+        return text
+
+    @staticmethod
+    def _retry_after_from_message(message: Any) -> Optional[int]:
+        text = str(message or "")
+        match = re.search(r"retry[-_\s]?after[=:]?\s*(\d+)", text, flags=re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return max(1, min(int(match.group(1)), 3600))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _classify_error_message(error: Any) -> str:
+        text = str(error or "").lower()
+        if (
+            "unauthorized" in text
+            or "401" in text
+            or "invalid api key" in text
+            or "invalid_api_key" in text
+            or "missing api key" in text
+            or "api key is invalid" in text
+        ):
+            return "auth_failed"
+        if "forbidden" in text or "permission" in text or "403" in text:
+            return "permission_denied"
+        if "rate limit" in text or "too many requests" in text or "429" in text:
+            return "rate_limited"
+        if "quota" in text or "credit" in text or "usage limit" in text:
+            return "quota_exceeded"
+        if "timeout" in text or "timed out" in text:
+            return "timeout"
+        if any(
+            marker in text
+            for marker in (
+                "failed to resolve",
+                "name resolution",
+                "nodename nor servname",
+                "temporary failure in name resolution",
+                "connection",
+                "network",
+                "max retries exceeded",
+                "ssl",
+            )
+        ):
+            return "network_error"
+        return "provider_error"
+
+    def _record_error(
+        self,
+        key: str,
+        *,
+        error_type: Optional[str] = None,
+        retry_after_seconds: Optional[int] = None,
+    ) -> None:
         """记录错误"""
+        error_type = error_type or "provider_error"
         with self._state_lock:
             self._key_errors[key] = self._key_errors.get(key, 0) + 1
+            if error_type in {"auth_failed", "permission_denied"}:
+                self._key_errors[key] = max(self._key_errors[key], 3)
+                self._key_blocked_until[key] = time.monotonic() + 24 * 60 * 60
+            elif error_type == "quota_exceeded":
+                self._key_errors[key] = max(self._key_errors[key], 3)
+                self._key_blocked_until[key] = time.monotonic() + max(300, retry_after_seconds or 3600)
+            elif error_type == "rate_limited":
+                self._key_errors[key] = max(self._key_errors[key], 3)
+                self._key_blocked_until[key] = time.monotonic() + max(1, retry_after_seconds or 60)
             error_count = self._key_errors[key]
-        logger.warning(f"[{self._name}] API Key {key[:8]}... 错误计数: {error_count}")
+        logger.warning(
+            "[%s] API Key %s 错误计数: %s, error_type=%s",
+            self._name,
+            self._redacted_key_label(key),
+            error_count,
+            error_type,
+        )
     
     @abstractmethod
     def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
@@ -238,12 +348,22 @@ class BaseSearchProvider(ABC):
         """Run the shared search flow with an optional preselected API key."""
         api_key = api_key or self._get_next_key()
         if not api_key:
+            if self._has_configured_keys():
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self._name,
+                    success=False,
+                    error_message=f"{self._name} 当前无可用 API Key，可能处于冷却/故障保护，稍后自动重试或交给下一搜索引擎兜底",
+                    error_type="no_available_key",
+                )
             return SearchResponse(
                 query=query,
                 results=[],
                 provider=self._name,
                 success=False,
-                error_message=f"{self._name} 未配置 API Key"
+                error_message=f"{self._name} 未配置 API Key",
+                error_type="not_configured",
             )
 
         start_time = time.time()
@@ -255,21 +375,32 @@ class BaseSearchProvider(ABC):
                 self._record_success(api_key)
                 logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
             else:
-                self._record_error(api_key)
+                self._record_error(
+                    api_key,
+                    error_type=response.error_type,
+                    retry_after_seconds=response.retry_after_seconds,
+                )
+                if response.error_message:
+                    response.error_message = self._sanitize_error_message(response.error_message)
 
             return response
 
         except Exception as e:
-            self._record_error(api_key)
+            error_type = self._classify_error_message(e)
+            retry_after = self._retry_after_from_message(e)
+            self._record_error(api_key, error_type=error_type, retry_after_seconds=retry_after)
             elapsed = time.time() - start_time
-            logger.error(f"[{self._name}] 搜索 '{query}' 失败: {e}")
+            sanitized_error = self._sanitize_error_message(e)
+            logger.error(f"[{self._name}] 搜索 '{query}' 失败: {sanitized_error}")
             return SearchResponse(
                 query=query,
                 results=[],
                 provider=self._name,
                 success=False,
-                error_message=str(e),
-                search_time=elapsed
+                error_message=sanitized_error,
+                search_time=elapsed,
+                error_type=error_type,
+                retry_after_seconds=retry_after,
             )
 
     def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
@@ -313,25 +444,39 @@ class TavilySearchProvider(BaseSearchProvider):
         """执行 Tavily 搜索"""
         try:
             from tavily import TavilyClient
+            try:
+                from tavily.errors import (
+                    BadRequestError,
+                    ForbiddenError,
+                    InvalidAPIKeyError,
+                    MissingAPIKeyError,
+                    TavilyKeylessLimitError,
+                    TimeoutError as TavilyTimeoutError,
+                    UsageLimitExceededError,
+                )
+            except Exception:  # pragma: no cover - compatibility with older SDKs
+                BadRequestError = ForbiddenError = InvalidAPIKeyError = MissingAPIKeyError = None  # type: ignore[assignment]
+                TavilyKeylessLimitError = TavilyTimeoutError = UsageLimitExceededError = None  # type: ignore[assignment]
         except ImportError:
             return SearchResponse(
                 query=query,
                 results=[],
                 provider=self.name,
                 success=False,
-                error_message="tavily-python 未安装，请运行: pip install tavily-python"
+                error_message="tavily-python 未安装，请运行: pip install tavily-python",
+                error_type="dependency_missing",
             )
         
         try:
             client = TavilyClient(api_key=api_key)
             
-            # 执行搜索（优化：使用advanced深度、限制最近几天）
             search_kwargs: Dict[str, Any] = {
                 "query": query,
-                "search_depth": "advanced",  # advanced 获取更多结果
+                "search_depth": "advanced",
                 "max_results": max_results,
                 "include_answer": False,
                 "include_raw_content": False,
+                "include_usage": True,
                 "days": days,  # 搜索最近天数的内容
             }
             if topic is not None:
@@ -344,6 +489,13 @@ class TavilySearchProvider(BaseSearchProvider):
             # 记录原始响应到日志
             logger.info(f"[Tavily] 搜索完成，query='{query}', 返回 {len(response.get('results', []))} 条结果")
             logger.debug(f"[Tavily] 原始响应: {response}")
+            usage = response.get("usage") if isinstance(response, dict) else None
+            usage_credits = None
+            if isinstance(usage, dict):
+                try:
+                    usage_credits = float(usage.get("credits"))
+                except (TypeError, ValueError):
+                    usage_credits = None
             
             # 解析结果
             results = []
@@ -361,21 +513,75 @@ class TavilySearchProvider(BaseSearchProvider):
                 results=results,
                 provider=self.name,
                 success=True,
+                usage_credits=usage_credits,
             )
             
         except Exception as e:
-            error_msg = str(e)
-            # 检查是否是配额问题
-            if 'rate limit' in error_msg.lower() or 'quota' in error_msg.lower():
+            error_type = self._classify_tavily_error(
+                e,
+                usage_limit_cls=UsageLimitExceededError,
+                keyless_limit_cls=TavilyKeylessLimitError,
+                invalid_key_cls=InvalidAPIKeyError,
+                missing_key_cls=MissingAPIKeyError,
+                forbidden_cls=ForbiddenError,
+                bad_request_cls=BadRequestError,
+                timeout_cls=TavilyTimeoutError,
+            )
+            retry_after = self._retry_after_from_message(e)
+            if error_type == "rate_limited" and retry_after is None:
+                retry_after = 60
+            error_msg = self._sanitize_error_message(e)
+            if error_type == "quota_exceeded":
                 error_msg = f"API 配额已用尽: {error_msg}"
+            elif error_type == "rate_limited":
+                error_msg = f"API 触发限速: {error_msg}"
+            elif error_type in {"auth_failed", "permission_denied"}:
+                error_msg = f"API 认证或权限失败: {error_msg}"
             
             return SearchResponse(
                 query=query,
                 results=[],
                 provider=self.name,
                 success=False,
-                error_message=error_msg
+                error_message=error_msg,
+                error_type=error_type,
+                retry_after_seconds=retry_after,
             )
+
+    @classmethod
+    def _classify_tavily_error(
+        cls,
+        error: Any,
+        *,
+        usage_limit_cls: Any = None,
+        keyless_limit_cls: Any = None,
+        invalid_key_cls: Any = None,
+        missing_key_cls: Any = None,
+        forbidden_cls: Any = None,
+        bad_request_cls: Any = None,
+        timeout_cls: Any = None,
+    ) -> str:
+        if usage_limit_cls is not None and isinstance(error, usage_limit_cls):
+            text = str(error or "").lower()
+            if any(marker in text for marker in ("excessive", "too many", "rate")):
+                return "rate_limited"
+            return "quota_exceeded"
+        if keyless_limit_cls is not None and isinstance(error, keyless_limit_cls):
+            return "quota_exceeded"
+        if invalid_key_cls is not None and isinstance(error, invalid_key_cls):
+            return "auth_failed"
+        if missing_key_cls is not None and isinstance(error, missing_key_cls):
+            return "auth_failed"
+        if forbidden_cls is not None and isinstance(error, forbidden_cls):
+            text = str(error or "").lower()
+            if any(marker in text for marker in ("432", "433", "quota", "credit", "usage limit")):
+                return "quota_exceeded"
+            return "permission_denied"
+        if bad_request_cls is not None and isinstance(error, bad_request_cls):
+            return "bad_request"
+        if timeout_cls is not None and isinstance(error, timeout_cls):
+            return "timeout"
+        return cls._classify_error_message(error)
 
     def search(
         self,
@@ -388,41 +594,7 @@ class TavilySearchProvider(BaseSearchProvider):
         if topic is None:
             return super().search(query, max_results=max_results, days=days)
 
-        api_key = self._get_next_key()
-        if not api_key:
-            return SearchResponse(
-                query=query,
-                results=[],
-                provider=self._name,
-                success=False,
-                error_message=f"{self._name} 未配置 API Key"
-            )
-
-        start_time = time.time()
-        try:
-            response = self._do_search(query, api_key, max_results, days=days, topic=topic)
-            response.search_time = time.time() - start_time
-
-            if response.success:
-                self._record_success(api_key)
-                logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
-            else:
-                self._record_error(api_key)
-
-            return response
-
-        except Exception as e:
-            self._record_error(api_key)
-            elapsed = time.time() - start_time
-            logger.error(f"[{self._name}] 搜索 '{query}' 失败: {e}")
-            return SearchResponse(
-                query=query,
-                results=[],
-                provider=self._name,
-                success=False,
-                error_message=str(e),
-                search_time=elapsed
-            )
+        return self._execute_search(query, max_results=max_results, days=days, topic=topic)
     
     @staticmethod
     def _extract_domain(url: str) -> str:
@@ -1307,10 +1479,20 @@ class MiniMaxSearchProvider(BaseSearchProvider):
             self._consecutive_failures = 0
             self._circuit_open_until = 0.0
 
-    def _record_error(self, key: str) -> None:
+    def _record_error(
+        self,
+        key: str,
+        *,
+        error_type: Optional[str] = None,
+        retry_after_seconds: Optional[int] = None,
+    ) -> None:
         warning_message = None
         with self._state_lock:
-            super()._record_error(key)
+            super()._record_error(
+                key,
+                error_type=error_type,
+                retry_after_seconds=retry_after_seconds,
+            )
             self._consecutive_failures += 1
             if self._consecutive_failures >= self._CB_FAILURE_THRESHOLD:
                 self._circuit_open_until = time.time() + self._CB_COOLDOWN_SECONDS

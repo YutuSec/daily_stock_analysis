@@ -107,6 +107,43 @@ class RealtimeSource(Enum):
 
 
 @dataclass
+class UnifiedAuctionSnapshot:
+    """Dedicated opening-auction snapshot; never a realtime quote alias."""
+
+    code: str
+    market: str
+    phase: str
+    virtual_price: Optional[float]
+    matched_volume: Optional[float]
+    unmatched_volume: Optional[float] = None
+    unmatched_side: Optional[str] = None
+    source: str = ""
+    provider_timestamp: Optional[str] = None
+    fetched_at: Optional[str] = None
+    stale_seconds: Optional[int] = None
+    is_stale: Optional[bool] = None
+    provenance: Optional[Dict[str, Any]] = field(default_factory=dict)
+
+    def has_attributable_data(self) -> bool:
+        provenance = self.provenance if isinstance(self.provenance, dict) else {}
+        tushare_auction_window = (
+            provenance.get("api_name") == "stk_auction"
+            and provenance.get("trade_date")
+            and provenance.get("official_publish_window")
+        )
+        return bool(
+            self.source
+            and self.code
+            and self.market
+            and self.phase
+            and self.virtual_price is not None
+            and self.matched_volume is not None
+            and (self.provider_timestamp or tushare_auction_window)
+            and self.fetched_at
+        )
+
+
+@dataclass
 class UnifiedRealtimeQuote:
     """
     统一实时行情数据结构

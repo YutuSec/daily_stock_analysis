@@ -39,3 +39,24 @@ def test_history_signal_preserves_applied_guardrail() -> None:
 
     assert signal["action"] == "hold"
     assert signal["action_label"] == "Hold"
+
+
+def test_history_signal_uses_frozen_empty_branch_for_public_comparison() -> None:
+    signal = _record_to_signal(
+        _record(
+            operation_advice="减仓",
+            sentiment_score=37,
+            report_language="zh",
+            raw_result=(
+                '{"operation_advice":"减仓","action":"reduce",'
+                '"holding_state":"empty","position_actions":{'
+                '"empty":{"action":"watch","advice":"观望"},'
+                '"holding":{"action":"reduce","advice":"减仓"}}}'
+            ),
+        ),
+        report_language="zh",
+    )
+
+    assert signal["operation_advice"] == "观望"
+    assert signal["action"] == "watch"
+    assert signal["action_label"] == "观望"

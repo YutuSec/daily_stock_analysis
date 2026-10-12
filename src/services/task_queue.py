@@ -39,14 +39,16 @@ from src.services.stock_code_utils import resolve_index_stock_code_for_analysis
 logger = logging.getLogger(__name__)
 
 
-def _dedupe_stock_code_key(stock_code: str) -> str:
+def _dedupe_stock_code_key(stock_code: str, model: Optional[str] = None) -> str:
     """
     Build the internal duplicate-detection key for a stock code.
 
     The task queue should treat equivalent market code shapes as the same
     underlying stock, e.g. ``600519`` and ``600519.SH``.
     """
-    return resolve_index_stock_code_for_analysis(normalize_stock_code(stock_code))
+    stock_key = resolve_index_stock_code_for_analysis(normalize_stock_code(stock_code))
+    selected_model = str(model or "").strip()
+    return f"{stock_key}|model={selected_model}" if selected_model else stock_key
 
 
 class TaskStatus(str, Enum):
@@ -85,6 +87,7 @@ class TaskInfo:
     portfolio_context: Optional[Dict[str, Any]] = None
     skills: Optional[List[str]] = None
     report_language: Optional[str] = None
+    model: Optional[str] = None
     trace_id: Optional[str] = None
     flow_events: List[Dict[str, Any]] = field(default_factory=list)
     
@@ -107,6 +110,7 @@ class TaskInfo:
             "original_query": self.original_query,
             "selection_source": self.selection_source,
             "skills": self.skills,
+            "model": self.model,
         }
     
     def copy(self) -> 'TaskInfo':
@@ -131,6 +135,7 @@ class TaskInfo:
             portfolio_context=dict(self.portfolio_context) if isinstance(self.portfolio_context, dict) else None,
             skills=list(self.skills) if self.skills is not None else None,
             report_language=self.report_language,
+            model=self.model,
             trace_id=self.trace_id or self.task_id,
             flow_events=copy.deepcopy(self.flow_events),
         )
@@ -142,10 +147,12 @@ class DuplicateTaskError(Exception):
     
     当股票已在分析中时抛出此异常
     """
-    def __init__(self, stock_code: str, existing_task_id: str):
+    def __init__(self, stock_code: str, existing_task_id: str, model: Optional[str] = None):
         self.stock_code = stock_code
         self.existing_task_id = existing_task_id
-        super().__init__(f"股票 {stock_code} 正在分析中 (task_id: {existing_task_id})")
+        self.model = model
+        model_label = f"，模型 {model}" if model else ""
+        super().__init__(f"股票 {stock_code}{model_label} 正在分析中 (task_id: {existing_task_id})")
 
 
 class AnalysisTaskQueue:
@@ -332,6 +339,7 @@ class AnalysisTaskQueue:
         force_refresh: bool = False,
         skills: Optional[List[str]] = None,
         report_language: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> TaskInfo:
         """
         Submit a single analysis task.
@@ -367,6 +375,7 @@ class AnalysisTaskQueue:
             force_refresh=force_refresh,
             skills=skills,
             report_language=report_language,
+            models=[model] if model else None,
         )
         if duplicates:
             raise duplicates[0]
@@ -386,6 +395,7 @@ class AnalysisTaskQueue:
         notify: bool = True,
         skills: Optional[List[str]] = None,
         report_language: Optional[str] = None,
+        models: Optional[List[str]] = None,
     ) -> Tuple[List[TaskInfo], List[DuplicateTaskError]]:
         """
         Submit analysis tasks in batch.
@@ -403,56 +413,73 @@ class AnalysisTaskQueue:
             normalized for normalized in (resolve_index_stock_code_for_analysis(code) for code in stock_codes)
             if normalized
         ]
+        requested_models: List[Optional[str]] = [None]
+        if models:
+            requested_models = []
+            seen_models = set()
+            for raw_model in models:
+                model = str(raw_model or "").strip()
+                if model and model not in seen_models:
+                    seen_models.add(model)
+                    requested_models.append(model)
 
         with self._data_lock:
             for stock_code in canonical_codes:
-                dedupe_key = _dedupe_stock_code_key(stock_code)
-                if dedupe_key in self._analyzing_stocks:
-                    existing_task_id = self._analyzing_stocks[dedupe_key]
-                    duplicates.append(DuplicateTaskError(stock_code, existing_task_id))
-                    continue
+                for requested_model in requested_models:
+                    dedupe_key = _dedupe_stock_code_key(stock_code, requested_model)
+                    if dedupe_key in self._analyzing_stocks:
+                        existing_task_id = self._analyzing_stocks[dedupe_key]
+                        duplicates.append(DuplicateTaskError(stock_code, existing_task_id, requested_model))
+                        continue
 
-                task_id = uuid.uuid4().hex
-                task_skills = list(skills) if skills is not None else None
-                task_info = TaskInfo(
-                    task_id=task_id,
-                    trace_id=task_id,
-                    stock_code=stock_code,
-                    stock_name=stock_name,
-                    status=TaskStatus.PENDING,
-                    message="任务已加入队列",
-                    report_type=report_type,
-                    analysis_phase=analysis_phase or "auto",
-                    original_query=original_query,
-                    selection_source=selection_source,
-                    query_source=query_source or "api",
-                    portfolio_context=dict(portfolio_context) if isinstance(portfolio_context, dict) else None,
-                    skills=task_skills,
-                    report_language=report_language,
-                )
-                self._tasks[task_id] = task_info
-                self._analyzing_stocks[dedupe_key] = task_id
-
-                try:
-                    future = self.executor.submit(
-                        self._execute_task,
-                        task_id,
-                        stock_code,
-                        report_type,
-                        force_refresh,
-                        notify,
-                        task_skills,
-                        report_language,
+                    task_id = uuid.uuid4().hex
+                    task_skills = list(skills) if skills is not None else None
+                    task_info = TaskInfo(
+                        task_id=task_id,
+                        trace_id=task_id,
+                        stock_code=stock_code,
+                        stock_name=stock_name,
+                        status=TaskStatus.PENDING,
+                        message="任务已加入队列",
+                        report_type=report_type,
+                        analysis_phase=analysis_phase or "auto",
+                        original_query=original_query,
+                        selection_source=selection_source,
+                        query_source=query_source or "api",
+                        portfolio_context=dict(portfolio_context) if isinstance(portfolio_context, dict) else None,
+                        skills=task_skills,
+                        report_language=report_language,
+                        model=requested_model,
                     )
-                except Exception:
-                    # Roll back the current batch to avoid partial submission.
-                    self._rollback_submitted_tasks_locked(created_task_ids + [task_id])
-                    raise
+                    self._tasks[task_id] = task_info
+                    self._analyzing_stocks[dedupe_key] = task_id
 
-                self._futures[task_id] = future
-                accepted.append(task_info)
-                created_task_ids.append(task_id)
-                logger.info(f"[TaskQueue] 任务已提交: {stock_code} -> {task_id}")
+                    try:
+                        future = self.executor.submit(
+                            self._execute_task,
+                            task_id,
+                            stock_code,
+                            report_type,
+                            force_refresh,
+                            notify,
+                            task_skills,
+                            report_language,
+                            requested_model,
+                        )
+                    except Exception:
+                        # Roll back the current batch to avoid partial submission.
+                        self._rollback_submitted_tasks_locked(created_task_ids + [task_id])
+                        raise
+
+                    self._futures[task_id] = future
+                    accepted.append(task_info)
+                    created_task_ids.append(task_id)
+                    logger.info(
+                        "[TaskQueue] 任务已提交: %s (%s) -> %s",
+                        stock_code,
+                        requested_model or "default",
+                        task_id,
+                    )
 
             # Keep task_created ordered before worker-emitted task_started/task_completed.
             # Broadcasting here also preserves batch rollback semantics because we only
@@ -514,7 +541,7 @@ class AnalysisTaskQueue:
 
             task = self._tasks.pop(task_id, None)
             if task:
-                dedupe_key = _dedupe_stock_code_key(task.stock_code)
+                dedupe_key = _dedupe_stock_code_key(task.stock_code, task.model)
                 if self._analyzing_stocks.get(dedupe_key) == task_id:
                     del self._analyzing_stocks[dedupe_key]
     
@@ -667,6 +694,7 @@ class AnalysisTaskQueue:
         notify: bool = True,
         skills: Optional[List[str]] = None,
         report_language: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         执行分析任务（在线程池中运行）
@@ -729,6 +757,7 @@ class AnalysisTaskQueue:
                 query_source=query_source,
                 portfolio_context=portfolio_context,
                 report_language=report_language,
+                model=model,
             )
             reset_run_diagnostic_context(diag_token)
             diag_token = None
@@ -746,7 +775,7 @@ class AnalysisTaskQueue:
                         task.stock_name = result.get("stock_name", task.stock_name)
                         
                         # 从分析中集合移除
-                        dedupe_key = _dedupe_stock_code_key(task.stock_code)
+                        dedupe_key = _dedupe_stock_code_key(task.stock_code, task.model)
                         if dedupe_key in self._analyzing_stocks:
                             del self._analyzing_stocks[dedupe_key]
                 
@@ -776,7 +805,7 @@ class AnalysisTaskQueue:
                     task.message = f"分析失败: {error_msg[:50]}"
                     
                     # 从分析中集合移除
-                    dedupe_key = _dedupe_stock_code_key(task.stock_code)
+                    dedupe_key = _dedupe_stock_code_key(task.stock_code, task.model)
                     if dedupe_key in self._analyzing_stocks:
                         del self._analyzing_stocks[dedupe_key]
             

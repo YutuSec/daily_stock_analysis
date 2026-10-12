@@ -78,6 +78,11 @@ from src.notification_sender.gotify_sender import resolve_gotify_message_endpoin
 from src.notification_sender.ntfy_sender import resolve_ntfy_endpoint
 from src.services.stock_list_parser import split_stock_list
 from src.services.generation_backend_status_service import GenerationBackendStatusService
+from src.services.runtime_settings_service import (
+    MARKET_OPPORTUNITY_MODE_KEY,
+    RuntimeSettingConflictError,
+    RuntimeSettingsService,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -285,9 +290,40 @@ class SystemConfigService:
         "astrbot": ("ASTRBOT_URL",),
     }
 
-    def __init__(self, manager: Optional[ConfigManager] = None, runtime_scheduler: Optional[Any] = None):
+    def __init__(
+        self,
+        manager: Optional[ConfigManager] = None,
+        runtime_scheduler: Optional[Any] = None,
+        runtime_settings_service: Optional[RuntimeSettingsService] = None,
+    ):
         self._manager = manager or ConfigManager()
         self._runtime_scheduler = runtime_scheduler
+        self._runtime_settings_service = runtime_settings_service
+
+    def _runtime_settings(self) -> RuntimeSettingsService:
+        if self._runtime_settings_service is None:
+            self._runtime_settings_service = RuntimeSettingsService(config=Config.get_instance())
+        return self._runtime_settings_service
+
+    def _runtime_market_opportunity_mode(self):
+        return self._runtime_settings().get_market_opportunity_mode()
+
+    def _combined_config_version(self) -> str:
+        runtime_mode = self._runtime_market_opportunity_mode()
+        return f"env:{self._manager.get_config_version()}|runtime:{runtime_mode.version or 0}"
+
+    @staticmethod
+    def _split_combined_config_version(config_version: str) -> Tuple[str, Optional[int]]:
+        text = str(config_version or "")
+        if "|runtime:" not in text:
+            return text, None
+        env_part, runtime_part = text.split("|runtime:", 1)
+        env_version = env_part[4:] if env_part.startswith("env:") else env_part
+        try:
+            runtime_version = int(runtime_part)
+        except (TypeError, ValueError):
+            runtime_version = None
+        return env_version, runtime_version
 
     def get_schema(self) -> Dict[str, Any]:
         """Return grouped schema metadata for UI rendering."""
@@ -432,9 +468,11 @@ class SystemConfigService:
         """Return display config values with mask metadata for server-masked fields."""
         saved_config_map = self._build_display_config_map(self._manager.read_config_map())
         runtime_config_map = self._build_runtime_display_config_map(saved_config_map)
+        runtime_market_mode = self._runtime_market_opportunity_mode()
         config_map = {
             **runtime_config_map,
             **saved_config_map,
+            MARKET_OPPORTUNITY_MODE_KEY: runtime_market_mode.value,
         }
         registered_keys = set(get_registered_field_keys())
         all_keys = set(config_map.keys()) | registered_keys
@@ -453,7 +491,9 @@ class SystemConfigService:
 
         items: List[Dict[str, Any]] = []
         for key in all_keys:
-            raw_value_exists = key in saved_config_map
+            raw_value_exists = key in saved_config_map or (
+                key == MARKET_OPPORTUNITY_MODE_KEY and runtime_market_mode.source == "database"
+            )
             raw_value = config_map.get(key, "")
             field_schema = schema_by_key[key]
             display_value = self._resolve_display_value(raw_value, field_schema, raw_value_exists)
@@ -480,10 +520,10 @@ class SystemConfigService:
         )
 
         return {
-            "config_version": self._manager.get_config_version(),
+            "config_version": self._combined_config_version(),
             "mask_token": mask_token,
             "items": items,
-            "updated_at": self._manager.get_updated_at(),
+            "updated_at": runtime_market_mode.updated_at or self._manager.get_updated_at(),
         }
 
     def validate(self, items: Sequence[Dict[str, str]], mask_token: str = "******") -> Dict[str, Any]:
@@ -689,9 +729,10 @@ class SystemConfigService:
         reload_now: bool = True,
     ) -> Dict[str, Any]:
         """Merge imported `.env` assignments into the active config."""
+        expected_env_version, _ = self._split_combined_config_version(config_version)
         current_version = self._manager.get_config_version()
-        if current_version != config_version:
-            raise ConfigConflictError(current_version=current_version)
+        if current_version != expected_env_version:
+            raise ConfigConflictError(current_version=self._combined_config_version())
 
         updates = self._parse_imported_env_content(content)
         return self.update(
@@ -1993,9 +2034,10 @@ class SystemConfigService:
         reload_now: bool = True,
     ) -> Dict[str, Any]:
         """Validate and persist updates into `.env`, then reload runtime config."""
+        expected_env_version, expected_runtime_version = self._split_combined_config_version(config_version)
         current_version = self._manager.get_config_version()
-        if current_version != config_version:
-            raise ConfigConflictError(current_version=current_version)
+        if current_version != expected_env_version:
+            raise ConfigConflictError(current_version=self._combined_config_version())
 
         issues = self._collect_issues(items=items, mask_token=mask_token)
         errors = [issue for issue in issues if issue["severity"] == "error"]
@@ -2005,6 +2047,7 @@ class SystemConfigService:
         previous_map = self._manager.read_config_map()
         submitted_keys: Set[str] = set()
         updates: List[Tuple[str, str]] = []
+        runtime_updates: List[Tuple[str, str]] = []
         sensitive_keys: Set[str] = set()
         for item in items:
             key = item["key"].upper()
@@ -2012,15 +2055,36 @@ class SystemConfigService:
             field_schema = get_field_definition(key, value)
             normalized_value = self._normalize_value_for_storage(value, field_schema)
             submitted_keys.add(key)
+            if key == MARKET_OPPORTUNITY_MODE_KEY:
+                runtime_updates.append((key, normalized_value))
+                continue
             updates.append((key, normalized_value))
             if bool(field_schema.get("is_sensitive", False)):
                 sensitive_keys.add(key)
 
-        updated_keys, skipped_masked_keys, new_version = self._manager.apply_updates(
-            updates=updates,
-            sensitive_keys=sensitive_keys,
-            mask_token=mask_token,
-        )
+        if updates:
+            updated_keys, skipped_masked_keys, _ = self._manager.apply_updates(
+                updates=updates,
+                sensitive_keys=sensitive_keys,
+                mask_token=mask_token,
+            )
+        else:
+            updated_keys, skipped_masked_keys = [], []
+
+        runtime_updated_keys: List[str] = []
+        for _key, value in runtime_updates:
+            try:
+                self._runtime_settings().set_market_opportunity_mode(
+                    value,
+                    expected_version=expected_runtime_version,
+                    actor="settings",
+                    reason="settings_update",
+                )
+                runtime_updated_keys.append(MARKET_OPPORTUNITY_MODE_KEY)
+            except RuntimeSettingConflictError as exc:
+                raise ConfigConflictError(
+                    current_version=self._combined_config_version()
+                ) from exc
 
         warnings: List[str] = []
         reload_triggered = False
@@ -2059,6 +2123,9 @@ class SystemConfigService:
             "SCHEDULE_ENABLED",
             "SCHEDULE_TIME",
             "SCHEDULE_TIMES",
+            "PAPER_TRADING_ENABLED",
+            "PAPER_TRADING_INTRADAY_ENABLED",
+            "PAPER_TRADING_INTRADAY_INTERVAL_MINUTES",
         }:
             try:
                 self._runtime_scheduler.reconcile_from_config(
@@ -2070,11 +2137,11 @@ class SystemConfigService:
 
         return {
             "success": True,
-            "config_version": new_version,
-            "applied_count": len(updated_keys),
+            "config_version": self._combined_config_version(),
+            "applied_count": len(updated_keys) + len(runtime_updated_keys),
             "skipped_masked_count": len(skipped_masked_keys),
             "reload_triggered": reload_triggered,
-            "updated_keys": updated_keys,
+            "updated_keys": updated_keys + runtime_updated_keys,
             "warnings": warnings,
         }
 
@@ -3170,6 +3237,7 @@ class SystemConfigService:
     def _is_setup_relevant_env_key(key: str) -> bool:
         if key in {
             "STOCK_LIST",
+            "DATABASE_URL",
             "DATABASE_PATH",
             "LITELLM_CONFIG",
             "LITELLM_MODEL",
@@ -3750,6 +3818,41 @@ class SystemConfigService:
         )
 
     def _build_setup_storage_check(self, effective_map: Dict[str, str]) -> Dict[str, Any]:
+        database_url = (effective_map.get("DATABASE_URL") or "").strip()
+        if database_url:
+            try:
+                parsed = urlparse(database_url)
+            except ValueError:
+                parsed = None
+            backend = ((parsed.scheme if parsed else "") or "").split("+", 1)[0].lower()
+            if backend == "sqlite" and parsed:
+                return self._setup_check(
+                    "storage",
+                    "数据库 / 本地存储",
+                    "system",
+                    True,
+                    "configured",
+                    "已通过 DATABASE_URL 配置 SQLite 兼容/回滚存储。",
+                )
+            if backend != "postgresql" or not parsed or not parsed.hostname:
+                return self._setup_check(
+                    "storage",
+                    "数据库 / 本地存储",
+                    "system",
+                    True,
+                    "needs_action",
+                    "DATABASE_URL 格式无效或不是受支持的 PostgreSQL/SQLite URL。",
+                    "请配置 postgresql+psycopg://user@host:5432/database 或 sqlite:///path 格式。",
+                )
+            return self._setup_check(
+                "storage",
+                "数据库 / 本地存储",
+                "system",
+                True,
+                "configured",
+                f"已配置 PostgreSQL: {parsed.hostname}:{parsed.port or 5432}",
+            )
+
         db_path = Path((effective_map.get("DATABASE_PATH") or "./data/stock_analysis.db").strip()).expanduser()
         parent = db_path.parent if db_path.parent != Path("") else Path(".")
         probe = parent

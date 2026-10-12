@@ -368,6 +368,8 @@ daily_stock_analysis/
 
 > 行为说明：搜索服务与社交舆情服务为可选增强链路。任一服务初始化失败时，系统会记录 warning 并降级为跳过该服务，仅影响对应环节，不会阻塞技术面主链路和主任务流。
 
+> Tavily 保留 `advanced` 检索深度，不因临时额度不足静默降级。搜索响应区分 `quota_exceeded`（用量上限）、`rate_limited`（限速）、`auth_failed` / `permission_denied`（密钥/权限）和网络/超时。已识别的错误只冷却对应密钥：用量上限默认 1 小时，限速默认 60 秒（可读取异常中的 Retry-After），认证/权限默认 24 小时；冷却到期后自动恢复尝试，无需重启。冷却期间沿既有顺序尝试其他可用搜索源，所有来源均失败时保持失败，不把“无法检索”解释为“没有利空”。记录返回的用量信息及脱敏错误，不记录密钥明文。
+
 ### 新闻检索可解释排序（Issue #1356）
 
 `search_stock_news` 对每条候选新闻会计算「可解释相关度」并落地为 3 类标签：
@@ -444,6 +446,11 @@ daily_stock_analysis/
 >   - `AnalysisReport.details.sector_rankings` = 结构化报告详情中的板块涨跌榜（用于前端板块联动展示）。
 >   - `AnalysisReport.details.concept_rankings` = 结构化报告详情中的概念/题材涨跌榜（用于前端关联板块信号匹配，以及通知表格按类型区分行业/概念）。
 > - 板块涨跌榜使用数据源顺序：与全局 priority 一致。
+> - A 股基本面中的估值、财报组合、资金流、龙虎榜和板块独立并发获取，共享阶段截止时间；并发仍受现有提供商工作线程上限约束，不会因单个慢接口无限增加线程。单项请求受 `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` 限制，财报组合包含多个接口，可使用剩余阶段预算。
+> - 财报组合在每个子块完成后保存独立快照；后续机构/股东等接口超时，不会丢弃已经取得的财报。返回后不再接受迟到结果修改该快照。失败块仍显示错误，不能把“请求失败”理解成“没有资金流/未上龙虎榜”。
+> - 机构/股东接口使用显式报告期和接口要求的股票代码：机构季度为 `YYYYQ`，十大股东为带市场前缀的代码与 `YYYYMMDD`。不调用接口默认股票/旧报告期，也不拿机构推荐或股东户数替代持仓。
+> - 资金净流入金额与净占比分开：只读取金额列，不将百分比、排名当成元。个股资金流附带 `stock_flow_meta` 日期、来源及有效性；缺失或陈旧数据不进入当前资金偏向。龙虎榜默认查询带起止日期的明细；机构买卖统计不能证明完整榜单，近一月统计不能替代精确 20 日窗口。接口失败或无法判定时保留未知。
+> - 行业涨跌榜在东财失败/超时/无有效排名时可降级到新浪 HTTPS，同样保留超时与节流；机会池东财成分接口优先传 `BK` 板块代码，已有新浪概念成分替补仅用于匹配的概念。行业涨跌幅不是行业资金净流入，不能跨指标冒充数据恢复。
 > - 超时控制为 `best-effort` 软超时：阶段会按预算快速降级继续执行，但不保证硬中断底层三方调用。
 > - `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS=8.0` 表示新增基本面阶段的目标预算，不是严格硬 SLA；Windows、Docker 或免费数据源被限流时可继续调高到 `12-15s`。
 > - 若要硬 SLA，请在后续版本升级为子进程隔离执行并在超时后强制终止。
@@ -464,6 +471,7 @@ daily_stock_analysis/
 | `SCHEDULE_ENABLED` | 启用定时任务 | `false` |
 | `SCHEDULE_TIME` | 定时执行时间 | `18:00` |
 | `SCHEDULE_TIMES` | 多个定时执行时间，逗号分隔；为空时使用 `SCHEDULE_TIME` | 空 |
+| `SCHEDULE_MULTI_MODEL_ENABLED` | 定时任务按当前实际配置的全部 LLM 逐一独立运行，并禁用跨模型 fallback；报告文件名包含模型名 | `false` |
 | `LOG_DIR` | 日志目录 | `./logs` |
 | `SAVE_CONTEXT_SNAPSHOT` | 保存分析历史 `context_snapshot`；设为 `false` 时新历史不保存 enhanced_context、market_phase_summary、AnalysisContextPack overview 或诊断快照，但不关闭当次 Prompt 低敏摘要 | `true` |
 
@@ -753,6 +761,8 @@ python main.py --schedule --no-run-immediately
 >
 > Web/API runtime scheduler 的立即执行入口只会在没有分析任务运行时接受请求；如果已有分析在执行，会返回忙碌状态而不是假装排队成功。
 
+> 单模型和多模型定时批次都会在分析结束或失败后分别尝试机会池补偿与盘后模拟监控；一个阶段失败不跳过另一个阶段，也不删除已保存的报告。所有阶段尝试完成后汇总失败给调度器。盘中与开盘确认服务异常也会记录到调度失败状态，而不是更新成功时间；正常休市、无待监控对象与未触发成交不视为异常。
+
 #### 环境变量方式
 
 你也可以通过环境变量配置定时行为（适用于 Docker 或 .env）：
@@ -784,6 +794,8 @@ docker run -e SCHEDULE_ENABLED=true -e SCHEDULE_RUN_IMMEDIATELY=false ...
 
 #### 交易日判断（Issue #373）
 
+交易日过滤支持 A 股纯数字及 SH/SZ/SS/BJ 前缀、点分前缀、后缀（例如 `SZ159915`、`SH.513980`、`002714.SZ`）。只解析所属市场，不改写自选代码或合并不同交易所的标的；休市日自动分析跳过这些股票，不生成或推送新的个股报告。显式 `--force-run` 和关闭交易日检查的行为保持不变。
+
 默认根据自选股市场（A 股 / 港股 / 美股 / 日股 / 韩股）和 `MARKET_REVIEW_REGION` 判断是否为交易日：
 - 使用 `exchange-calendars` 区分 A 股 / 港股 / 美股 / 日股 / 韩股各自的交易日历（含节假日）
 - 混合持仓时，每只股票只在其市场开市日分析，休市股票当日跳过
@@ -794,9 +806,13 @@ docker run -e SCHEDULE_ENABLED=true -e SCHEDULE_RUN_IMMEDIATELY=false ...
 - 交易日盘中或收盘前运行时，会以上一个已完成交易日作为复用目标；交易日收盘后运行时，当日数据已存在则可直接跳过，不存在则继续抓取
 - 覆盖方式：`TRADING_DAY_CHECK_ENABLED=false` 或 命令行 `--force-run`
 
+交易日证据缺失、依赖未安装或查询异常时，不再默认放行；定时分析记录失败，日志标明 `calendar_unavailable`。只检查本次股票和大盘涉及的市场，避免其他市场日历故障影响本次任务。无法识别所属市场的代码也不自动放行。人工研究可显式使用上述覆盖方式。
+
+定时批次中部分股票失败时，已成功报告仍保存，但整批记录失败；CLI、Web 调度和后台回调的失败返回均不会推进成功时间。共享租约记录失败并释放运行状态，后续定时任务仍可执行；这不等于自动重试或补发通知。
+
 #### 市场阶段基线（Issue #1386 P0）
 
-P0 只新增内部市场阶段推断基线，不改变现有每日收盘报告、交易日跳过、断点续传、API、Web、Bot、Agent 或 GitHub Actions 默认行为。阶段推断用于后续 P1+ 的上下文契约准备；未安装 `exchange-calendars` 或日历异常时，阶段返回 `unknown`，但现有交易日判断和最新可复用交易日逻辑仍保持原来的 fail-open 行为。
+市场阶段推断使用内部 regular-session 基线；未安装 `exchange-calendars` 或日历异常时阶段返回 `unknown`。交易日过滤要求可信日历证据；历史数据的最新可复用日期回退仅用于数据检索，不是自动分析或交易的许可。
 
 阶段枚举基于 regular session 语义：
 
@@ -1240,6 +1256,7 @@ PUSHOVER_API_TOKEN=your_api_token
 ### Baostock
 - 免费，无需配置
 - 作为备用数据源
+- 登录与查询的 socket 超时由 `BAOSTOCK_SOCKET_TIMEOUT` 控制（默认 30 秒），超时后切换到下一个数据源
 
 ### YFinance
 - 免费，无需配置
@@ -1376,9 +1393,21 @@ python main.py --debug
 兼容性核验结论：除配置和模型侧语义外，该决策稳定性链路覆盖 `src/analyzer.py`、`src/core/pipeline.py`、`src/core/backtest_engine.py`、`src/report_language.py` 及 `src/agent` 决策路径的运行时行为，建议复核报告决策类型映射与回测入口联动。
 核验路径：相关逻辑在上述运行时路径与对应测试（`tests/test_backtest_engine.py`、`tests/test_analyzer_news_prompt.py`、`tests/test_decision_stability.py`、`tests/test_agent_pipeline.py` 等）中生效；未在 `src/config.py`、`src/report.py`、存储/持久化链路新增配置字段或清理逻辑。
 
-### 建议动作 Taxonomy（#1390 P0）
+### 统一评分与建议动作契约
 
-个股报告在保留 `operation_advice` 自由文本的同时，新增可选 `action` / `action_label` 字段，作为 Web 历史列表、同股历史、StockBar 和回测结果行的结构化展示辅助。`decision_type` 仍保持旧的 `buy|hold|sell` 三态统计口径；`action` 为空时不会改写既有 `decision_type` 推断链。
+个股报告使用一套统一的机器可读契约：`raw_score` 保存模型原始评分，`adjusted_score` 保存最终评分，兼容字段 `sentiment_score` 始终等于 `adjusted_score`。通用评分动作由最终评分区间确定并保留为行情判断证据；当报告冻结了明确持仓状态时，账户有效动作再从对应 `position_actions` 分支解析，首页、历史记录、DecisionSignal 与模拟交易统一消费该有效动作，不再各自解释同一条建议。
+
+可选数据缺失只写入 `limitations` 并降低 `confidence_level`，不能把评分硬压到 59 或把买入改成观望。只有完整的结构化 `guardrail` 同时包含 `applied=true`、稳定的 `reason_code`、明确的 `reason`、`raw_score`、`adjusted_score` 和算术一致的 `score_delta` 时，才允许改变最终评分；最终动作仍必须与调整后评分区间一致。只有叙述性理由、旧自由文本或 `applied=false` 的候选规则不能改变最终动作。
+
+报告还可显式输出 `position_actions.empty` 与 `position_actions.holding`，分别表达空仓者和持仓者的结构化动作及说明。报告保存的低敏 `holding_state` 决定账户有效动作：`empty` 只消费空仓分支，`holding` 只消费持仓分支，`unknown` 不猜测所有权。空仓报告不能把顶层或错误分支中的 `hold/reduce/sell` 展示或执行为账户动作；缺少合法空仓分支时安全降级为 `watch/avoid`。通用评分动作仍作为行情判断与审计证据保留，历史 API、首页和新 DecisionSignal 使用持仓感知后的有效动作。系统不会用当前可变持仓反向改写历史报告，也不会重写 SQLite 历史行。
+
+LLM 调用失败、余额/鉴权错误、JSON 解析失败或 schema 校验失败只写入 `analysis_attempts` 尝试状态，不再写入 `analysis_history` 作为有效报告。首页个股栏在同股票、同模型维度上优先展示最新失败/降级 attempt 的原因，并同时显示最近一次成功报告时间，避免旧成功报告被误认为今日分析成功。
+
+标准个股报告路径按 provider 选择结构化输出方式；模型的分析温度仍沿用 `LLM_TEMPERATURE`/运行时配置，不会为了结构稳定而主动降低。官方 DeepSeek Responses 路由仅限当前 DeepSeek 文档支持的 V4 模型族（例如 `deepseek/deepseek-v4-pro`、`deepseek/deepseek-v4-flash`，且 Base URL 为 `https://api.deepseek.com`），优先使用 Responses API 的 `json_schema` 结构化最终输出，并显式保留 thinking effort；它不再把报告提交伪装成 `submit_analysis_report` 工具调用，也不会为了格式提交关闭 thinking。报告首轮和完整性补全重试都会继续留在该官方 Responses JSON Schema 路径，不会因为 `_structured_resubmission` 回落到旧 Tool Call 或跨到配置的 fallback 模型。由于 DeepSeek 的 `max_output_tokens` 同时计算思考与最终正文，官方报告路径从首轮起直接使用当前官方最大输出 384K（393216）token，而不是按 16K/32K 分阶段；该值只是生成上限，实际按真实输出计量。系统会先检查 Responses 的 `status` / `incomplete_details`，并且只从 `message/output_text` 提取报告，绝不把 `reasoning_text` 拼进 JSON。若 Responses API 不可用、返回空内容，或明确以 `incomplete/max_output_tokens` 结束，系统只对同一个受支持 DeepSeek V4 模型做一次 Chat Completions JSON Output 降级，降级同样使用 393216 token 上限，不再放大预算。`content_filter`、已经 `completed` 但 JSON/报告核心字段/交易关键字段不合格，以及 Chat 降级再次截断时仍 fail-closed：不跨模型、不解析自由文本、不生成 DecisionSignal 或模拟交易计划。`deepseek-chat` 等旧 Chat 兼容模型、非官方 DeepSeek 代理、Claude/Gemini/OpenAI 兼容路径仍沿用各自既有结构化能力；保留 Tool Schema 的路径继续只接受一个同名工具调用，普通文本、空参数、错误工具、多工具调用、版本不匹配或非法 JSON 都会 fail-closed。提示词仍保留市场阶段、大盘环境、市场结构、技术面、量价/筹码、基本面、新闻、持仓状态、风险收益和动作时机的完整分析链路，并明确原始分/调整分、空仓/持仓分支、字段语义及前后一致性。local CLI 和 Agent 等非该原生工具路径继续使用各自既有契约，不被 `analysis-report-tool-v1` 误判。
+
+新的 `analysis-report-tool-v1` 将报告展示门禁与交易执行门禁分层。Tool Schema 与接收端只把 JSON 语法、唯一工具、schema version、评分、结构化 `action`、`confidence_level` 和 `position_actions.*.action` 作为报告级阻断字段；`stock_name`、`trend_prediction`、旧 `operation_advice`、`decision_type`、`analysis_summary`、`key_points`、`risk_warning`、`buy_reason`、新闻、基本面、热点、核心一句话、`risk_alerts`、`action_checklist`、`search_performed`、置信理由和数据限制等展示/说明/元数据字段缺失或形态漂移时不会让整份报告失败，系统会保存为空、归一化为文本/列表或记录限制说明。
+
+买入/加仓报告要进入监控计划，仍必须额外满足买入动作契约：`entry_leg_schema_version=entry-legs-v1`、至少一个合法 `close_between` 入场批次、唯一且递增的批次顺序、有效分配比例、明确止损、明确最终目标、`exit_leg_schema_version=exit-legs-v1`、递增退出目标且退出比例合计约为 1.0，并满足 `止损 < 入场区间 < 最终目标`；同时必须给出会被执行层消费的阶段化 `action_window`、`immediate_action`、`watch_conditions` 和 `next_check_time`。既有评分—动作统一规则仍然生效：若模型给出高分但写成观望，统一动作变为买入后也必须补齐同一买入契约；补齐失败时报告可以作为阅读结果保留，但不会生成 DecisionSignal 或模拟交易计划。证据不足时模型应输出与评分一致的 `watch/avoid`，不能为通过校验编造价格。回滚方式为回退本次报告 Tool Schema/完整性校验改动；无需变更 `.env`。
 
 | `action` | 常见来源文本 | `decision_type` 桥接 |
 | --- | --- | --- |
@@ -1388,12 +1417,10 @@ python main.py --debug
 | `watch` | `watch`、`观望`、`等待`、`wait` | `hold` |
 | `reduce` | `reduce`、`减仓`、`trim` | `sell` |
 | `sell` | `sell`、`卖出`、`清仓`、`strong_sell`、`强烈卖出` | `sell` |
-| `avoid` | `avoid`、`回避`、`规避`、`不建议买入`、`避免买入`、`do not buy` | `hold` |
-| `alert` | `alert`、`风险预警`、`警惕`、`触发告警`、`risk alert` | `hold` |
+| `avoid` | `avoid`、`回避`、`规避`、`不建议买入`、`避免买入`、`do not buy` | `sell` |
+| `alert` | `alert`、`风险预警`、`警惕`、`触发告警`、`risk alert` | `sell` |
 
-上表的 `decision_type` 桥接只说明八态 action 与旧三态统计口径的兼容关系；#1390 P0 不会把 `action` 自动反写到既有 `decision_type`。若上游显式 `action` 与 `decision_type` 同时存在但语义不一致，三态统计、回测和旧报表口径仍以 `decision_type` / 原有推断链为准，`action/action_label` 只承担结构化展示辅助。
-
-未知或歧义建议不会兜底成 `watch` 或 `hold`，而是返回空 `action/action_label`。Web 历史卡片、StockBar、同股历史抽屉和回测结果行会在旧记录缺少 `action/action_label` 时从 `operation_advice` 做展示级 fallback；该 fallback 只影响前端标签，不等价于稳定 API action 或后续信号资产。Web 展示层在同时收到 `action` 与 `action_label` 时，会优先按当前界面语言从 `action` 生成标签；API 中的 `action_label` 仍按报告语言生成，供非 Web 客户端或无 `action` 的兼容展示使用。大盘复盘和其他非个股报告不会产生交易 `action`，只保留 `operation_advice` 文本。`dashboard.phase_decision.immediate_action` 属于市场阶段护栏报告字段，不参与 #1390 P0 的八态 action 派生；最终市场阶段仍来自 `report.meta.market_phase_summary.phase`。
+未知或歧义的旧建议不会被静默猜成 `watch` 或 `hold`。Web 可对旧记录保留展示级 fallback，但新报告的公开动作、三态统计和后续信号资产均以统一后的最终 `action` 为准。大盘复盘和其他非个股报告不会产生交易动作；`dashboard.phase_decision.immediate_action` 仍是独立的市场阶段字段。
 
 #1390 P0 不会把后续信号资产字段平铺到现有 summary、历史列表、StockBar 或回测响应。#1390 P1 开始通过独立 `DecisionSignal` 资源承接 `horizon`、`plan_quality`、`status` 等更细粒度计划字段，仍不改变既有报告主契约、不回填历史、不新增配置项。
 
@@ -1445,13 +1472,18 @@ P5 在 Web `/decision-signals` 页面筛选区下方展示当前 outcome engine 
 
 回测模块自动对历史 AI 分析记录进行事后验证，评估分析建议的准确性。
 
+需要在本地用多个 LLM 生成独立报告并按模型比较回测表现时，参见 [多 LLM 本地分析与回测对比](llm-comparison-backtest.md)。
+
 ### 工作原理
 
 1. 选取已过冷却期（默认 14 天）的 `AnalysisHistory` 记录
 2. 获取分析日之后的日线数据（前向 K 线）
-3. 根据操作建议推断预期方向，与实际走势对比
-4. 评估止盈/止损命中情况，模拟执行收益
-5. 汇总为整体和单股两个维度的表现指标
+3. 使用报告生成时冻结的通用最终动作计算方向指标
+4. 对明确保存了持仓状态与持仓动作的报告，单独计算持仓决策指标
+5. 评估止盈/止损命中情况，模拟执行收益
+6. 汇总为整体、单股和模型维度的表现指标
+
+逐条回测结果中的 `action/action_label/operation_advice` 按报告冻结持仓状态展示账户有效动作，避免空仓报告显示“减仓/卖出”；方向准确率仍使用第 3 步的通用最终动作，持仓指标仍使用第 4 步的持仓分支，因此两套指标不会因展示纠正而合并。
 
 ### 操作建议映射
 
@@ -1473,19 +1505,34 @@ P5 在 Web `/decision-signals` 页面筛选区下方展示当前 outcome engine 
 | `BACKTEST_MIN_AGE_DAYS` | `14` | 仅回测 N 天前的记录，避免数据不完整 |
 | `BACKTEST_ENGINE_VERSION` | `v1` | 引擎版本号，升级逻辑时用于区分结果 |
 | `BACKTEST_NEUTRAL_BAND_PCT` | `2.0` | 中性区间阈值（%），±2% 内视为震荡 |
+| `PAPER_TRADING_ENABLED` | `false` | 是否在报告保存后建立条件计划，并运行纸面模拟交易监控 |
+| `PAPER_TRADING_INTRADAY_ENABLED` | `false` | 是否在 schedule 模式中启用盘中实时行情轮询 |
+| `PAPER_TRADING_INTRADAY_INTERVAL_MINUTES` | `5` | 盘中纸面监控轮询间隔（分钟） |
+| `PAPER_TRADING_INTRADAY_MIN_FACTOR_DOMAINS` | `2` | 自动模拟开仓至少需要几个可用且通过的市场因子 |
+| `PAPER_TRADING_INTRADAY_MIN_COMPOSITE_SCORE` | `0.6` | 自动模拟开仓的市场因子加权综合分阈值 |
+| `PAPER_TRADING_INTRADAY_MIN_RISK_REWARD` | `1.2` | 自动模拟开仓的最小盈亏比 |
+| `PAPER_TRADING_INTRADAY_MAX_QUOTE_STALE_SECONDS` | `360` | 盘中监控可接受的最大行情陈旧秒数 |
 
 ### 自动运行
 
 回测在每日分析流程完成后自动触发（非阻塞，失败不影响通知推送）。也可通过 API 手动触发。
+
+模拟交易是独立的可选指标，不改变 14 天回测。启用后，双模型定时批次会先完成全部模型报告，再运行一次盘后监控；盘后/定时报告从下一交易时段接管，连续竞价期间完成的人工 Web/API 分析可在同一交易时段立即接管旧入场计划。最新观望或不可执行报告会冻结旧计划未成交腿，已成交 lot 则继续监控，并可由成交后的同模型 `position_actions.holding.stop_loss/target_price` 安全、幂等地收紧或更新风险线。自动开仓仍必须满足报告明确规则、有效止损/止盈、最低盈亏比、至少两个市场因子和市场因子加权综合分阈值；显式 `exit_legs` 分段止盈会按全部退出比例计算加权目标价和收益风险比，每个目标腿只执行一次，旧 `take_profit` 仍保持单目标兼容。因 `risk_reward_below_policy` 拒绝的计划会创建一次同模型纠偏重分析请求，且在替代报告落库前保持不可执行/阻塞，不降低阈值、不静默改价。大盘风口机会池的 `MARKET_OPPORTUNITY_MODE` 通过共享数据库运行时设置热切换，Web/API 保存后 server 与 analyzer 下一轮读取同一值，无需重启容器；`.env` 仅作为数据库缺失时的启动默认。规则、T+1、无前视约束、API 与回滚方式见 [混合模拟交易监控](paper-trading.md) 和 [大盘风口机会池](market-opportunity-pool.md)。
 
 ### 评估指标
 
 | 指标 | 说明 |
 |------|------|
 | `direction_accuracy_pct` | 方向预测准确率（预期方向与实际一致） |
+| `direction_evaluable_count` | 可进入方向准确率统计的记录数 |
+| `holding_decision_accuracy_pct` | 持仓决策准确率，仅统计分析时明确冻结持仓动作且未来行情充足的记录 |
+| `holding_applicable_count` / `holding_evaluable_count` | 具备冻结持仓动作的记录数 / 同时具备足够未来行情的可计分记录数 |
+| `avg_holding_decision_return_pct` | 按分析日收盘价起算的持仓动作执行收益；保持暴露使用股票收益，减仓/退出按现金 0% |
 | `win_rate_pct` | 胜率（胜 / (胜+负)，不含中性） |
 | `avg_stock_return_pct` | 平均股票收益率 |
 | `avg_simulated_return_pct` | 平均模拟执行收益率（含止盈止损退出） |
+
+方向指标与持仓指标相互独立。通用 `buy/add` 预期上涨，`hold` 预期不显著下跌，`reduce/sell/avoid` 预期下跌；持仓指标中 `buy/add` 预期上涨、`hold` 预期不显著下跌、`reduce/sell/avoid` 预期下跌，`watch/alert` 因未明确暴露动作而标记不可用。两套指标都从分析日收盘价起算，持仓指标只读取报告生成时冻结的低敏状态，不查询当前组合，也不保存账户、数量或成本。
 | `stop_loss_trigger_rate` | 止损触发率（仅统计配置了止损的记录） |
 | `take_profit_trigger_rate` | 止盈触发率（仅统计配置了止盈的记录） |
 
@@ -1509,7 +1556,7 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 ### 功能特性
 
 - 📝 **配置管理** - 查看/修改自选股列表
-- 🗂️ **首页三视图** - 首页新增「历史 / 自选 / 今日」工作区，默认进入历史视图；自选页支持批量提交全部或仅提交“今日未分析”股票
+- 🗂️ **首页三视图** - 首页新增「历史 / 自选 / 今日」工作区，默认进入历史视图；历史页可勾选或全选当前个股后点击“分析所选”，自选页支持批量提交全部或仅提交“今日未分析”股票；大盘复盘记录不会混入个股批量任务
 - 🧭 **界面语言切换** - 登录态与退出态均支持界面语言快速切换（`zh` / `en`），独立于 `REPORT_LANGUAGE`，用于静态 UI 文案与导航骨架
 - 🚀 **快速分析** - 通过 API 接口触发个股分析；首页也提供“大盘复盘”按钮，可在 Docker/server 模式下后台触发大盘复盘
 - 🎯 **策略选择** - 首页支持显式选择分析策略 skill；不传 `skills` 时按系统默认策略运行，便于保持与历史行为兼容
@@ -1790,7 +1837,7 @@ worker 会把 `triggered`、`skipped`、`degraded`、`failed` 写入 `alert_trig
 - 删除账户使用软删除语义：默认账户列表、快照、风险、录入入口和事件列表不再显示该账户，但交易、现金流水和公司行动不会被物理清理；如需纠正单条流水，需在账户归档前使用事件列表里的删除修正入口。
 - 交易去重优先使用账户内唯一的 `trade_uid`，缺失时回退到基于日期、代码、方向、数量、价格、费用、税费、币种的确定性哈希。
 - 卖出会先校验可用数量，超卖返回 `409 portfolio_oversell`；并发写入冲突时可能返回 `409 portfolio_busy`。
-- 持仓快照的 `positions[]` 会返回 `price_source`、`price_date`、`price_stale`、`price_available` 等价格元信息；当天快照默认会先尝试实时行情，实时价不可用或非正值时再回退到 `as_of` 当天或之前最近的历史收盘价；传入 `include_realtime=false` 时会跳过实时行情并直接使用本地历史收盘价回退路径，Web 持仓页用该模式优先渲染持仓列表，避免外部实时行情源变慢时阻塞首屏。历史 `as_of` 快照不会拉取实时价，也不会再把成本价静默当作现价；缺价持仓会标记 `price_available=false` 并从市值与未实现盈亏汇总中排除。
+- 持仓快照的 `positions[]` 会返回 `price_source`、`price_date`、`price_stale`、`price_available` 等价格元信息；当天快照默认会先尝试实时行情，实时价不可用或非正值时再回退到 `as_of` 当天或之前最近的历史收盘价；传入 `include_realtime=false` 时会跳过实时行情并直接使用收盘价，Web 持仓页使用该模式。当天本地没有 `as_of` 当日收盘价时，后端会通过现有日线数据源补拉截至 `as_of` 的 K 线、保存到本地数据库后重新估值，不会为此调用实时行情接口。A 股日线只在交易所明确的格式之间匹配，例如 `SH512480` 与 `512480.SH` 等价；裸代码 `512480` 不会被推断为某个交易所。历史 `as_of` 快照不会触发在线补拉，也不会再把成本价静默当作现价；最终仍缺价的持仓会标记 `price_available=false` 并从市值与未实现盈亏汇总中排除。
 - 汇率刷新会先尝试在线源；若在线获取失败，则回退到最近一次缓存并标记 `is_stale=true`，避免快照和风险页整体不可用。
 - 当 `PORTFOLIO_FX_UPDATE_ENABLED=false` 时，手动刷新接口会明确返回“在线刷新已禁用”，页面不会误导为“当前没有可刷新的汇率对”。
 - 风险摘要包含集中度、回撤、止损接近度等信息；`sector_concentration` 会优先尝试按板块归类，失败时降级到 `UNCLASSIFIED`，不会阻断风险结果返回。

@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import and_, delete, desc, func, select
+from sqlalchemy import and_, case, delete, desc, func, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from src.storage import (
@@ -712,21 +712,68 @@ class PortfolioRepository:
         return close[0] if close is not None else None
 
     def get_latest_close_with_date(self, symbol: str, as_of: date) -> Optional[Tuple[float, date]]:
+        candidates = self._daily_close_code_candidates(symbol)
+        if not candidates:
+            return None
+
         with self.db.get_session() as session:
             row = session.execute(
                 select(StockDaily)
                 .where(
                     and_(
-                        StockDaily.code == symbol,
+                        StockDaily.code.in_(candidates),
                         StockDaily.date <= as_of,
                     )
                 )
-                .order_by(desc(StockDaily.date))
+                .order_by(
+                    desc(StockDaily.date),
+                    case((StockDaily.code == candidates[0], 0), else_=1),
+                )
                 .limit(1)
             ).scalar_one_or_none()
             if row is None or row.close is None:
                 return None
             return float(row.close), row.date
+
+    @staticmethod
+    def _daily_close_code_candidates(symbol: str) -> List[str]:
+        """Return strict storage aliases without inferring an exchange from a bare code."""
+
+        raw = (symbol or "").strip().upper()
+        if not raw:
+            return []
+
+        exchange: Optional[str] = None
+        digits: Optional[str] = None
+
+        for prefix in ("SH.", "SS.", "SZ.", "BJ."):
+            if raw.startswith(prefix) and raw[len(prefix) :].isdigit():
+                exchange = prefix[:2]
+                digits = raw[len(prefix) :]
+                break
+
+        if exchange is None:
+            for prefix in ("SH", "SS", "SZ", "BJ"):
+                if raw.startswith(prefix) and raw[len(prefix) :].isdigit():
+                    exchange = prefix
+                    digits = raw[len(prefix) :]
+                    break
+
+        if exchange is None and "." in raw:
+            base, suffix = raw.rsplit(".", 1)
+            if base.isdigit() and suffix in {"SH", "SS", "SZ", "BJ"}:
+                exchange = suffix
+                digits = base
+
+        if exchange is None or digits is None:
+            return [raw]
+
+        exchange = "SH" if exchange == "SS" else exchange
+        prefix_code = f"{exchange}{digits}"
+        suffix_code = f"{digits}.{exchange}"
+        if raw not in {prefix_code, suffix_code}:
+            return [raw, prefix_code, suffix_code]
+        return [raw, suffix_code if raw == prefix_code else prefix_code]
 
     def save_fx_rate(
         self,
@@ -859,6 +906,35 @@ class PortfolioRepository:
                     seen.add(identity)
                     identities.append(identity)
             return identities
+
+    def cached_position_id_map(
+        self,
+        *,
+        account_id: int,
+        cost_method: str,
+    ) -> Dict[Tuple[str, str, str], int]:
+        with self.db.get_session() as session:
+            rows = session.execute(
+                select(
+                    PortfolioPosition.symbol,
+                    PortfolioPosition.market,
+                    PortfolioPosition.currency,
+                    PortfolioPosition.id,
+                )
+                .where(
+                    PortfolioPosition.account_id == int(account_id),
+                    PortfolioPosition.cost_method == cost_method,
+                    PortfolioPosition.quantity > 0,
+                )
+            ).all()
+            return {
+                (
+                    str(symbol or ""),
+                    str(market or "").lower(),
+                    str(currency or "").upper(),
+                ): int(row_id)
+                for symbol, market, currency, row_id in rows
+            }
 
     # ------------------------------------------------------------------
     # Snapshot / position cache

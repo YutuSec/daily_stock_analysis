@@ -392,6 +392,10 @@ class PytdxFetcher(BaseFetcher):
         }
         
         df = df.rename(columns=column_mapping)
+        from .volume_units import lots_to_shares
+        if 'volume' in df:
+            df['volume'] = df['volume'].map(lots_to_shares)
+        df.attrs['volume_unit'] = 'shares'
         
         # 计算涨跌幅（pytdx 不返回涨跌幅，需要自己计算）
         if 'pct_chg' not in df.columns and 'close' in df.columns:

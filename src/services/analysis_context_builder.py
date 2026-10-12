@@ -277,6 +277,19 @@ def _build_technical_block(
             warnings=list(warnings),
         )
     }
+    style_indicators = (artifacts.metadata or {}).get("paper_trading_style_indicators")
+    if isinstance(style_indicators, Mapping):
+        items["paper_trading_style_indicators"] = AnalysisContextItem(
+            status=ContextFieldStatus.AVAILABLE,
+            value=dict(style_indicators),
+            source="pipeline.style_indicator_snapshot",
+            metadata={
+                "trading_style": style_indicators.get("trading_style"),
+                "analysis_window_sessions": style_indicators.get("analysis_window_sessions"),
+                "core_ma_windows": style_indicators.get("core_ma_windows"),
+                "volatility_windows": style_indicators.get("volatility_windows"),
+            },
+        )
     if has_realtime_overlay:
         items["intraday_overlay"] = AnalysisContextItem(
             status=ContextFieldStatus.ESTIMATED,
@@ -473,16 +486,49 @@ def _build_portfolio_block(artifacts: PipelineAnalysisArtifacts) -> Optional[Ana
         "market",
         "currency",
         "quantity",
+        "total_quantity",
+        "available_quantity",
+        "frozen_quantity",
         "avg_cost",
+        "weighted_average_price",
         "total_cost",
+        "lot_count",
         "unrealized_pnl_base",
         "unrealized_pnl_pct",
+        "unrealized_pnl",
+        "unrealized_return_pct",
+        "market_value",
+        "latest_price",
+        "observed_at",
+        "mark_source",
+        "mark_stale",
+        "valuation_complete",
         "price_source",
         "price_provider",
         "price_date",
         "price_stale",
         "price_available",
         "cost_method",
+        "source",
+        "source_model",
+        "stock_code",
+        "stock_name",
+        "holding_state",
+        "sync_origin",
+        "sync_status",
+        "capital_account_id",
+        "cash",
+        "book_equity",
+        "exposure",
+        "total_exposure_pct",
+        "symbol_concentration_pct",
+        "opened_on",
+        "earliest_opened_on",
+        "latest_opened_on",
+        "stop_loss",
+        "target_price",
+        "stop_loss_lots",
+        "target_price_lots",
     )
     items = {
         key: AnalysisContextItem(status=item_status, value=context.get(key))

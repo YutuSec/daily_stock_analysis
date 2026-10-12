@@ -643,7 +643,8 @@ class TestAgentResultConversion(unittest.TestCase):
         self.assertEqual(result.name, "贵州茅台")
         self.assertEqual(result.sentiment_score, 80)
         self.assertEqual(result.trend_prediction, "看多")
-        self.assertEqual(result.decision_type, "hold")
+        self.assertEqual(result.decision_type, "buy")
+        self.assertEqual(result.operation_advice, "买入")
         self.assertIn("agent:gemini", result.data_sources)
         self.assertIsNotNone(result.dashboard)
 
@@ -712,8 +713,8 @@ class TestAgentResultConversion(unittest.TestCase):
         self.assertEqual(result.operation_advice, "观望")
         self.assertIn("Max steps exceeded", result.error_message)
 
-    def test_convert_agent_dashboard_preserves_explicit_action(self):
-        """Explicit Agent action is display taxonomy; decision_type remains the legacy bridge."""
+    def test_convert_agent_dashboard_preserves_score_compatible_explicit_action(self):
+        """A score-compatible explicit Agent action remains the canonical action."""
         pipeline = self._make_pipeline()
 
         from src.agent.executor import AgentResult
@@ -738,7 +739,7 @@ class TestAgentResultConversion(unittest.TestCase):
         )
         raw_result = result.to_dict()
 
-        self.assertEqual(result.operation_advice, "持有观察")
+        self.assertEqual(result.operation_advice, "观望")
         self.assertEqual(result.decision_type, "hold")
         self.assertEqual(result.action, "watch")
         self.assertEqual(result.action_label, "观望")
@@ -778,14 +779,14 @@ class TestAgentResultConversion(unittest.TestCase):
         )
         raw_result = result.to_dict()
 
-        self.assertEqual(result.operation_advice, "持有观察")
+        self.assertEqual(result.operation_advice, "观望")
         self.assertEqual(result.action, "watch")
         self.assertEqual(result.action_label, "观望")
         self.assertEqual(raw_result["action"], "watch")
         self.assertEqual(raw_result["action_label"], "观望")
 
-    def test_final_action_refresh_ignores_stale_pre_guardrail_action(self):
-        """Post-processing can rewrite advice; refreshed action must follow the final advice."""
+    def test_final_action_refresh_ignores_unstructured_advice_rewrite(self):
+        """A prose-only rewrite cannot override the canonical score action."""
         pipeline = self._make_pipeline()
 
         from src.agent.executor import AgentResult
@@ -818,8 +819,9 @@ class TestAgentResultConversion(unittest.TestCase):
             previous_operation_advice=previous_operation_advice,
         )
 
-        self.assertEqual(result.action, "hold")
-        self.assertEqual(result.action_label, "持有")
+        self.assertEqual(result.action, "buy")
+        self.assertEqual(result.action_label, "买入")
+        self.assertEqual(result.operation_advice, "买入")
 
     def test_convert_invalid_dashboard_preserves_local_trend_result(self):
         """Invalid Agent dashboard should not erase already-computed trend data."""
@@ -933,8 +935,8 @@ class TestAgentResultConversion(unittest.TestCase):
         self.assertEqual(result.operation_advice, "买入")
         self.assertEqual(result.decision_type, "buy")
 
-    def test_convert_missing_decision_type_preserves_conditional_hold_advice(self):
-        """Condition-hold wording should remain hold when decision_type is not provided."""
+    def test_convert_missing_decision_type_aligns_conditional_advice_to_score(self):
+        """Legacy conditional prose cannot contradict the canonical score band."""
         pipeline = self._make_pipeline()
 
         from src.agent.executor import AgentResult
@@ -966,8 +968,8 @@ class TestAgentResultConversion(unittest.TestCase):
             trend_result=trend_result,
         )
 
-        self.assertEqual(result.operation_advice, "不跌破支撑位继续持有")
-        self.assertEqual(result.decision_type, "hold")
+        self.assertEqual(result.operation_advice, "买入")
+        self.assertEqual(result.decision_type, "buy")
 
     def test_convert_empty_top_level_advice_uses_nested_dashboard_advice(self):
         """Empty top-level advice dict should not block nested dashboard fallback."""
@@ -998,9 +1000,9 @@ class TestAgentResultConversion(unittest.TestCase):
             "q-nested-advice",
         )
 
-        self.assertEqual(result.operation_advice, "减仓")
-        self.assertEqual(result.decision_type, "sell")
-        self.assertEqual(result.dashboard["operation_advice"], "减仓")
+        self.assertEqual(result.operation_advice, "观望")
+        self.assertEqual(result.decision_type, "hold")
+        self.assertEqual(result.dashboard["operation_advice"], "观望")
 
     def test_convert_placeholder_top_level_advice_uses_nested_dashboard_advice(self):
         """Placeholder advice dict should not block nested dashboard fallback."""
@@ -1034,9 +1036,9 @@ class TestAgentResultConversion(unittest.TestCase):
             "q-placeholder-advice",
         )
 
-        self.assertEqual(result.operation_advice, "减仓")
-        self.assertEqual(result.decision_type, "sell")
-        self.assertEqual(result.dashboard["operation_advice"], "减仓")
+        self.assertEqual(result.operation_advice, "观望")
+        self.assertEqual(result.decision_type, "hold")
+        self.assertEqual(result.dashboard["operation_advice"], "观望")
 
     def test_convert_malformed_top_level_summary_uses_nested_dashboard_summary(self):
         """Malformed top-level analysis_summary should not block nested dashboard fallback."""
@@ -1192,8 +1194,8 @@ class TestAgentResultConversion(unittest.TestCase):
             "Trend view: Bullish; action advice: Buy.",
         )
 
-    def test_convert_non_dict_advice_conflict_keeps_advice_decision(self):
-        """Conflict between trend fallback and explicit non-dict advice should keep advice decision."""
+    def test_convert_non_dict_advice_conflict_aligns_to_score(self):
+        """Conflicting legacy prose is replaced by the canonical score action."""
         pipeline = self._make_pipeline()
 
         from src.agent.executor import AgentResult
@@ -1226,8 +1228,8 @@ class TestAgentResultConversion(unittest.TestCase):
             trend_result=trend_result,
         )
 
-        self.assertEqual(result.operation_advice, "减仓")
-        self.assertEqual(result.decision_type, "sell")
+        self.assertEqual(result.operation_advice, "买入")
+        self.assertEqual(result.decision_type, "buy")
 
     def test_convert_partial_dashboard_uses_trend_fallback_for_missing_scalars(self):
         """Partial Agent dashboards should keep AI fields while filling missing scalars locally."""
@@ -1377,11 +1379,11 @@ class TestAgentResultConversion(unittest.TestCase):
         from src.stock_analyzer import BuySignal, TrendAnalysisResult, TrendStatus
 
         cases = [
-            (BuySignal.STRONG_BUY, "buy", "强烈买入"),
-            (BuySignal.STRONG_SELL, "sell", "强烈卖出"),
+            (BuySignal.STRONG_BUY, 80, "buy", "买入"),
+            (BuySignal.STRONG_SELL, 10, "sell", "卖出"),
         ]
 
-        for buy_signal, expected_decision, expected_advice in cases:
+        for buy_signal, score, expected_decision, expected_advice in cases:
             with self.subTest(buy_signal=buy_signal):
                 agent_result = AgentResult(
                     success=True,
@@ -1393,7 +1395,7 @@ class TestAgentResultConversion(unittest.TestCase):
                     code="600519",
                     trend_status=TrendStatus.BULL,
                     buy_signal=buy_signal,
-                    signal_score=80,
+                    signal_score=score,
                 )
 
                 result = pipeline._agent_result_to_analysis_result(
@@ -1798,10 +1800,10 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             )
 
             self.assertIsNotNone(result)
-            self.assertEqual(result.decision_type, "hold")
-            self.assertEqual(result.operation_advice, "洗盘观察")
-            self.assertEqual(result.dashboard.get("decision_type"), "hold")
-            self.assertEqual(result.dashboard.get("operation_advice"), "洗盘观察")
+            self.assertEqual(result.decision_type, "sell")
+            self.assertEqual(result.operation_advice, "减仓")
+            self.assertEqual(result.dashboard.get("decision_type"), "sell")
+            self.assertEqual(result.dashboard.get("operation_advice"), "减仓")
             self.assertEqual(result.dashboard.get("sentiment_score"), result.sentiment_score)
 
     def test_analyze_with_agent_phase_integrity_fills_missing_phase_decision(self):

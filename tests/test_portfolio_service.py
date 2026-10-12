@@ -244,7 +244,11 @@ class PortfolioServiceTestCase(unittest.TestCase):
             PortfolioService,
             "_fetch_realtime_position_price",
             side_effect=AssertionError("fast portfolio snapshot should not fetch realtime quote"),
-        ):
+        ), patch.object(
+            self.service,
+            "_backfill_position_daily_close",
+            return_value=False,
+        ) as daily_backfill:
             snapshot = self.service.get_portfolio_snapshot(
                 account_id=aid,
                 as_of=today,
@@ -258,6 +262,35 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertEqual(pos["price_date"], (today - timedelta(days=1)).isoformat())
         self.assertTrue(pos["price_stale"])
         self.assertTrue(pos["price_available"])
+        daily_backfill.assert_called_once_with(symbol="600519", as_of_date=today)
+
+    def test_daily_close_backfill_throttles_duplicate_snapshot_and_risk_fetches(self) -> None:
+        today = date.today()
+        daily_data = pd.DataFrame(
+            [
+                {
+                    "date": today - timedelta(days=1),
+                    "open": 1.0,
+                    "high": 1.0,
+                    "low": 1.0,
+                    "close": 1.0,
+                    "volume": 1.0,
+                    "amount": 1.0,
+                    "pct_chg": 0.0,
+                }
+            ]
+        )
+
+        with patch(
+            "data_provider.base.DataFetcherManager.get_daily_data",
+            return_value=(daily_data, "unit-test"),
+        ) as daily_mock:
+            first = self.service._backfill_position_daily_close(symbol="SH512481", as_of_date=today)
+            second = self.service._backfill_position_daily_close(symbol="SH512481", as_of_date=today)
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        daily_mock.assert_called_once_with("SH512481", end_date=today.isoformat(), days=30)
 
     def test_current_snapshot_does_not_serialize_non_bulk_realtime_prefetch(self) -> None:
         today = date.today()
@@ -630,7 +663,7 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertIsNone(positions[0]["unrealized_pnl_pct"])
         self.assertAlmostEqual(positions[0]["last_price"], 0.0, places=6)
 
-    def test_symbol_filter_matches_legacy_prefix_suffix_variants(self) -> None:
+    def test_bare_symbol_filter_does_not_infer_exchange_variants(self) -> None:
         account = self.service.create_account(name="Legacy", broker="Demo", market="cn", base_currency="CNY")
         aid = account["id"]
         for symbol in ["600519", "SH600519", "600519.SH", "600519.SS"]:
@@ -649,7 +682,7 @@ class PortfolioServiceTestCase(unittest.TestCase):
             )
 
         rows = self.service.list_trade_events(account_id=aid, symbol="600519", page=1, page_size=20)["items"]
-        self.assertEqual({row["symbol"] for row in rows}, {"600519", "SH600519", "600519.SH", "600519.SS"})
+        self.assertEqual({row["symbol"] for row in rows}, {"600519"})
 
     def test_symbol_filter_matches_legacy_hk_variants(self) -> None:
         account = self.service.create_account(name="Legacy HK", broker="Demo", market="hk", base_currency="HKD")
@@ -1256,8 +1289,8 @@ class PortfolioServiceTestCase(unittest.TestCase):
             cash_dividend_per_share=1.0,
         )
 
-        trades = self.service.list_trade_events(account_id=aid, symbol="600519", page=1, page_size=20)
-        actions = self.service.list_corporate_action_events(account_id=aid, symbol="600519", page=1, page_size=20)
+        trades = self.service.list_trade_events(account_id=aid, symbol="SH600519", page=1, page_size=20)
+        actions = self.service.list_corporate_action_events(account_id=aid, symbol="SH600519", page=1, page_size=20)
 
         self.assertEqual(trades["total"], 1)
         self.assertEqual(actions["total"], 1)
@@ -1291,8 +1324,8 @@ class PortfolioServiceTestCase(unittest.TestCase):
             cash_dividend_per_share=1.0,
         )
 
-        trades = self.service.list_trade_events(account_id=aid, symbol="600519", page=1, page_size=20)
-        actions = self.service.list_corporate_action_events(account_id=aid, symbol="600519", page=1, page_size=20)
+        trades = self.service.list_trade_events(account_id=aid, symbol="600519.SH", page=1, page_size=20)
+        actions = self.service.list_corporate_action_events(account_id=aid, symbol="600519.SH", page=1, page_size=20)
 
         self.assertEqual(trades["total"], 1)
         self.assertEqual(actions["total"], 1)

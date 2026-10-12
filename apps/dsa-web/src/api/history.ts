@@ -25,11 +25,12 @@ export const historyApi = {
    * @param params 筛选和分页参数
    */
   getList: async (params: GetHistoryListParams = {}): Promise<HistoryListResponse> => {
-    const { stockCode, reportType, startDate, endDate, page = 1, limit = 20 } = params;
+    const { stockCode, reportType, modelUsed, startDate, endDate, page = 1, limit = 20 } = params;
 
     const queryParams: Record<string, string | number> = { page, limit };
     if (stockCode) queryParams.stock_code = stockCode;
     if (reportType) queryParams.report_type = reportType;
+    if (modelUsed) queryParams.model_used = modelUsed;
     if (startDate) queryParams.start_date = startDate;
     if (endDate) queryParams.end_date = endDate;
 
@@ -127,11 +128,13 @@ export const historyApi = {
   getStockBarList: async (params: {
     startDate?: string;
     endDate?: string;
+    modelUsed?: string;
     limit?: number;
   } = {}): Promise<StockBarResponse> => {
     const queryParams: Record<string, string | number> = {};
     if (params.startDate) queryParams.start_date = params.startDate;
     if (params.endDate) queryParams.end_date = params.endDate;
+    if (params.modelUsed) queryParams.model_used = params.modelUsed;
     if (params.limit) queryParams.limit = params.limit;
 
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/history/stocks', {

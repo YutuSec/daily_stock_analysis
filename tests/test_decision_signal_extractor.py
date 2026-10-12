@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import os
+import json
 
 import pytest
 
-from src.analyzer import AnalysisResult
+from src.analyzer import AnalysisResult, GeminiAnalyzer
 from src.config import Config
 from src.services.decision_signal_extractor import (
     build_decision_signal_payload_from_report,
@@ -86,6 +87,359 @@ def test_build_payload_rejects_invalid_profile_source() -> None:
         )
 
 
+def test_native_tool_buy_without_executable_contract_is_not_persistable() -> None:
+    result = _result(report_schema_version="analysis-report-tool-v1")
+    result.action = "buy"
+    result.dashboard["phase_decision"]["entry_mode"] = "conditional"
+
+    payload = build_decision_signal_payload_from_report(
+        result,
+        trace_id="trace-native-tool-incomplete-buy",
+        query_source="api",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is None
+
+
+def test_native_tool_buy_with_execution_contract_ignores_missing_display_fields() -> None:
+    result = _result(report_schema_version="analysis-report-tool-v1")
+    result.action = "buy"
+    result.position_actions = {
+        "empty": {"action": "buy"},
+        "holding": {"action": "hold"},
+    }
+    result.analysis_summary = ""
+    result.key_points = ""
+    result.news_summary = ""
+    result.fundamental_analysis = ""
+    result.dashboard = {
+        "battle_plan": {
+            "sniper_points": {
+                "ideal_buy": 1690,
+                "secondary_buy": 1700,
+                "stop_loss": 1600,
+                "take_profit": 1850,
+                "final_target": 1850,
+                "entry_leg_schema_version": "entry-legs-v1",
+                "entry_legs": [
+                    {
+                        "leg_id": "initial",
+                        "role": "initial",
+                        "sequence": 1,
+                        "allocation_fraction": 1.0,
+                        "max_executions": 1,
+                        "price_rules": [{"type": "close_between", "low": 1690, "high": 1700}],
+                        "prerequisites": [],
+                    }
+                ],
+                "exit_leg_schema_version": "exit-legs-v1",
+                "exit_legs": [
+                    {
+                        "leg_id": "tp1",
+                        "role": "final_take_profit",
+                        "sequence": 1,
+                        "allocation_fraction": 1.0,
+                        "target_price": 1850,
+                    }
+                ],
+            }
+        },
+        "phase_decision": {
+            "entry_mode": "conditional",
+            "action_window": "下个交易日盘中跟踪",
+            "immediate_action": "等待确认",
+            "watch_conditions": ["放量站稳"],
+            "next_check_time": "下个交易日 09:35",
+        },
+        "intelligence": {"risk_alerts": "估值偏高"},
+    }
+
+    payload = build_decision_signal_payload_from_report(
+        result,
+        trace_id="trace-native-tool-executable-buy",
+        query_source="api",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    assert payload["action"] == "buy"
+    assert payload["entry_low"] == 1690
+    assert payload["entry_high"] == 1700
+    assert payload["stop_loss"] == 1600
+    assert payload["target_price"] == 1850
+    assert payload["metadata"]["entry_mode"] == "conditional"
+
+
+def test_native_tool_watch_with_ideal_prices_does_not_upgrade_to_buy_signal() -> None:
+    result = _result(
+        report_schema_version="analysis-report-tool-v1",
+        action="watch",
+        decision_type="hold",
+        operation_advice="观望，等待触发条件",
+    )
+    result.position_actions = {
+        "empty": {"action": "watch"},
+        "holding": {"action": "hold"},
+    }
+    result.dashboard = {
+        "battle_plan": {
+            "sniper_points": {
+                "ideal_buy": 1690,
+                "secondary_buy": 1700,
+                "stop_loss": 1600,
+                "take_profit": 1850,
+                "final_target": 1850,
+                "entry_leg_schema_version": "entry-legs-v1",
+                "entry_legs": [
+                    {
+                        "leg_id": "initial",
+                        "role": "initial",
+                        "sequence": 1,
+                        "allocation_fraction": 1.0,
+                        "max_executions": 1,
+                        "price_rules": [{"type": "close_between", "low": 1690, "high": 1700}],
+                        "prerequisites": [],
+                    }
+                ],
+                "exit_leg_schema_version": "exit-legs-v1",
+                "exit_legs": [
+                    {
+                        "leg_id": "tp1",
+                        "role": "final_take_profit",
+                        "sequence": 1,
+                        "allocation_fraction": 1.0,
+                        "target_price": 1850,
+                    }
+                ],
+            }
+        },
+        "phase_decision": {
+            "entry_mode": "none",
+            "action_window": "下个交易日盘中跟踪",
+            "immediate_action": "等待确认",
+            "watch_conditions": ["放量站稳"],
+            "next_check_time": "下个交易日 09:35",
+        },
+    }
+
+    payload = build_decision_signal_payload_from_report(
+        result,
+        trace_id="trace-native-tool-watch-price-plan",
+        query_source="api",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    assert payload["action"] == "watch"
+    assert payload["metadata"]["entry_mode"] == "none"
+
+
+def test_parse_response_native_high_score_watch_reaches_signal_as_watch_not_buy() -> None:
+    payload = {
+        "report_schema_version": GeminiAnalyzer.ANALYSIS_REPORT_TOOL_SCHEMA_VERSION,
+        "stock_name": "贵州茅台",
+        "raw_score": 72,
+        "adjusted_score": 72,
+        "sentiment_score": 72,
+        "trend_prediction": "看多",
+        "operation_advice": "观望，等待触发条件",
+        "decision_type": "hold",
+        "action": "watch",
+        "position_actions": {
+            "empty": {"action": "watch"},
+            "holding": {"action": "hold"},
+        },
+        "confidence_level": "中",
+        "analysis_summary": "分数偏强但还未触发入场条件。",
+        "dashboard": {
+            "battle_plan": {
+                "sniper_points": {
+                    "ideal_buy": 1690,
+                    "secondary_buy": 1700,
+                    "stop_loss": 1600,
+                    "take_profit": 1850,
+                    "final_target": 1850,
+                    "entry_leg_schema_version": "entry-legs-v1",
+                    "entry_legs": [
+                        {
+                            "leg_id": "initial",
+                            "role": "initial",
+                            "sequence": 1,
+                            "allocation_fraction": 1.0,
+                            "max_executions": 1,
+                            "price_rules": [{"type": "close_between", "low": 1690, "high": 1700}],
+                            "prerequisites": [],
+                        }
+                    ],
+                    "exit_leg_schema_version": "exit-legs-v1",
+                    "exit_legs": [
+                        {
+                            "leg_id": "tp1",
+                            "role": "final_take_profit",
+                            "sequence": 1,
+                            "allocation_fraction": 1.0,
+                            "target_price": 1850,
+                        }
+                    ],
+                }
+            },
+            "phase_decision": {
+                "entry_mode": "none",
+                "action_window": "下个交易日盘中跟踪",
+                "immediate_action": "等待确认",
+                "watch_conditions": ["放量站稳"],
+                "next_check_time": "下个交易日 09:35",
+            },
+        },
+    }
+    result = GeminiAnalyzer()._parse_response(
+        json.dumps(payload, ensure_ascii=False),
+        "600519",
+        "贵州茅台",
+    )
+
+    signal_payload = build_decision_signal_payload_from_report(
+        result,
+        trace_id="trace-parse-native-watch-high-score",
+        query_source="api",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert result.action == "watch"
+    assert signal_payload is not None
+    assert signal_payload["action"] == "watch"
+    assert signal_payload["metadata"]["raw_action"] == "watch"
+    assert signal_payload["metadata"]["final_action"] == "watch"
+    assert signal_payload["metadata"]["entry_mode"] == "none"
+
+
+def test_native_tool_conditional_watch_is_rejected_even_with_complete_price_plan() -> None:
+    result = _result(
+        report_schema_version="analysis-report-tool-v1",
+        action="watch",
+        decision_type="hold",
+        operation_advice="观望但给出条件价",
+    )
+    result.position_actions = {
+        "empty": {"action": "watch"},
+        "holding": {"action": "hold"},
+    }
+    result.dashboard = {
+        "battle_plan": {
+            "sniper_points": {
+                "ideal_buy": 1690,
+                "secondary_buy": 1700,
+                "stop_loss": 1600,
+                "take_profit": 1850,
+                "final_target": 1850,
+                "entry_leg_schema_version": "entry-legs-v1",
+                "entry_legs": [
+                    {
+                        "leg_id": "initial",
+                        "role": "initial",
+                        "sequence": 1,
+                        "allocation_fraction": 1.0,
+                        "max_executions": 1,
+                        "price_rules": [{"type": "close_between", "low": 1690, "high": 1700}],
+                        "prerequisites": [],
+                    }
+                ],
+                "exit_leg_schema_version": "exit-legs-v1",
+                "exit_legs": [
+                    {
+                        "leg_id": "tp1",
+                        "role": "final_take_profit",
+                        "sequence": 1,
+                        "allocation_fraction": 1.0,
+                        "target_price": 1850,
+                    }
+                ],
+            }
+        },
+        "phase_decision": {
+            "entry_mode": "conditional",
+            "action_window": "下个交易日盘中跟踪",
+            "immediate_action": "等待确认",
+            "watch_conditions": ["放量站稳"],
+            "next_check_time": "下个交易日 09:35",
+        },
+    }
+
+    payload = build_decision_signal_payload_from_report(
+        result,
+        trace_id="trace-native-tool-conditional-watch",
+        query_source="api",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is None
+
+
+def test_native_tool_buy_with_empty_watch_conditions_is_not_persistable() -> None:
+    result = _result(report_schema_version="analysis-report-tool-v1")
+    result.action = "buy"
+    result.position_actions = {
+        "empty": {"action": "buy"},
+        "holding": {"action": "hold"},
+    }
+    result.dashboard = {
+        "battle_plan": {
+            "sniper_points": {
+                "ideal_buy": 1690,
+                "secondary_buy": 1700,
+                "stop_loss": 1600,
+                "take_profit": 1850,
+                "final_target": 1850,
+                "entry_leg_schema_version": "entry-legs-v1",
+                "entry_legs": [
+                    {
+                        "leg_id": "initial",
+                        "role": "initial",
+                        "sequence": 1,
+                        "allocation_fraction": 1.0,
+                        "max_executions": 1,
+                        "price_rules": [{"type": "close_between", "low": 1690, "high": 1700}],
+                        "prerequisites": [],
+                    }
+                ],
+                "exit_leg_schema_version": "exit-legs-v1",
+                "exit_legs": [
+                    {
+                        "leg_id": "tp1",
+                        "role": "final_take_profit",
+                        "sequence": 1,
+                        "allocation_fraction": 1.0,
+                        "target_price": 1850,
+                    }
+                ],
+            }
+        },
+        "phase_decision": {
+            "entry_mode": "conditional",
+            "action_window": "下个交易日盘中跟踪",
+            "immediate_action": "等待确认",
+            "watch_conditions": [],
+            "next_check_time": "下个交易日 09:35",
+        },
+    }
+
+    payload = build_decision_signal_payload_from_report(
+        result,
+        trace_id="trace-native-tool-empty-watch-conditions",
+        query_source="api",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is None
+
+
 def test_build_payload_includes_tw_market() -> None:
     """A Taiwan (`tw`) stock is now first-class on the DecisionSignal write path
     (service VALID_MARKETS accepts tw, matching jp/kr).
@@ -113,8 +467,48 @@ def test_build_payload_includes_tw_market() -> None:
     assert payload["action"] == "buy"
 
 
+def test_intraday_analysis_uses_frozen_position_style_horizon() -> None:
+    payload = build_decision_signal_payload_from_report(
+        _result(),
+        context_snapshot={
+            "market_phase_summary": {"phase": "intraday"},
+            "enhanced_context": {
+                "paper_trading_style_context": {
+                    "trading_style": "position",
+                    "settings": {
+                        "compatible_horizons": ["3d", "5d", "10d", "swing"],
+                        "default_signal_horizon": "swing",
+                    },
+                },
+                "paper_trading_style_indicators": {
+                    "history_sufficient": True,
+                    "bars_observed": 220,
+                },
+            },
+        },
+        source_report_id=902,
+        trace_id="trace-position-intraday",
+        query_source="api",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    assert payload["market_phase"] == "intraday"
+    assert payload["horizon"] == "swing"
+
+
 def test_build_payload_maps_report_context_and_price_plan() -> None:
     result = _result()
+    result.position_actions = {
+        "empty": {"action": "buy", "reason": "空仓可试仓"},
+        "holding": {
+            "action": "reduce",
+            "reason": "已有持仓先降风险",
+            "stop_loss": 1660.0,
+            "target_price": 1820.0,
+        },
+    }
     result.market_phase_summary = {"phase": "postmarket"}
     result.analysis_context_pack_overview = {"data_quality": {"overall_score": 55, "level": "fair"}}
     context_snapshot = {
@@ -149,7 +543,7 @@ def test_build_payload_maps_report_context_and_price_plan() -> None:
     assert payload["trace_id"] == "trace-88"
     assert payload["decision_profile"] == "balanced"
     assert payload["trigger_source"] == "api"
-    assert payload["action"] == "buy"
+    assert payload["action"] == "reduce"
     assert payload["confidence"] == 0.8
     assert payload["score"] == 82
     assert payload["market_phase"] == "intraday"
@@ -175,6 +569,47 @@ def test_build_payload_maps_report_context_and_price_plan() -> None:
         "minutes_to_close": 120,
     }
     assert payload["metadata"]["holding_state"] == "holding"
+    assert payload["metadata"]["base_action"] == "buy"
+    assert payload["metadata"]["effective_action_source"] == "position_actions.holding"
+    assert payload["metadata"]["action_adjustment_reason"] == "holding_state_resolution"
+    assert payload["metadata"]["position_actions"]["holding"]["action"] == "reduce"
+    assert payload["metadata"]["position_actions"]["holding"]["reason"] == "已有持仓先降风险"
+    assert payload["metadata"]["position_actions"]["holding"]["stop_loss"] == 1660.0
+    assert payload["metadata"]["position_actions"]["holding"]["target_price"] == 1820.0
+
+
+def test_build_payload_uses_empty_branch_instead_of_holder_reduce_action() -> None:
+    result = _result(
+        code="002173.SZ",
+        name="创新医疗",
+        sentiment_score=37,
+        operation_advice="减仓",
+        action="reduce",
+        decision_type="sell",
+    )
+    result.holding_state = "empty"
+    result.position_actions = {
+        "empty": {"action": "watch", "advice": "空仓者观望"},
+        "holding": {"action": "reduce", "advice": "持仓者减仓"},
+    }
+
+    payload = build_decision_signal_payload_from_report(
+        result,
+        portfolio_context={"quantity": 0},
+        source_report_id=126,
+        trace_id="trace-empty-innovation-medical",
+        query_source="schedule",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    assert payload["action"] == "watch"
+    assert payload["action_label"] == "观望"
+    assert payload["metadata"]["holding_state"] == "empty"
+    assert payload["metadata"]["base_action"] == "reduce"
+    assert payload["metadata"]["effective_action_source"] == "position_actions.empty"
+    assert payload["metadata"]["action_adjustment_reason"] == "holding_state_resolution"
 
 
 def test_build_payload_adds_market_structure_metadata() -> None:
@@ -221,6 +656,52 @@ def test_build_payload_adds_market_structure_metadata() -> None:
     assert metadata["theme_phase"] == "accelerating"
     assert metadata["stock_role"] == "follower"
     assert metadata["market_structure_risk_tags"] == ["theme_data_partial"]
+
+
+def test_build_payload_freezes_paper_trading_style_context_from_snapshot() -> None:
+    style_context = {
+        "trading_style": "trend",
+        "policy_version": "trading-style-v1",
+        "source": "paper_trading_style_override_config",
+        "matched_override_key": "cn:600519",
+        "settings": {
+            "analysis_window_sessions": 500,
+            "max_holding_sessions": 180,
+            "core_ma_windows": [20, 60, 120, 250],
+        },
+    }
+    indicators = {
+        "analysis_window_sessions": 500,
+        "bars_observed": 500,
+        "history_sufficient": True,
+    }
+    payload = build_decision_signal_payload_from_report(
+        _result(),
+        context_snapshot={
+            "enhanced_context": {
+                "paper_trading_style_context": style_context,
+                "paper_trading_style_indicators": indicators,
+            }
+        },
+        source_report_id=99,
+        trace_id="trace-style-freeze",
+        query_source="system",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    metadata = payload["metadata"]
+    assert metadata["paper_trading_style"] == "trend"
+    assert metadata["paper_trading_style_context"] == style_context
+    assert metadata["paper_trading_style_indicators"]["bars_observed"] == 500
+    evidence = metadata["paper_trading_style_evidence"]
+    assert evidence["source"] == "analysis_context_snapshot"
+    assert evidence["analysis_window_sessions"] == 500
+    assert evidence["history_sufficient"] is True
+    assert payload["horizon"] == "long"
+    assert metadata["horizon_source"] == "paper_trading_style_default"
+    assert metadata["paper_trading_horizon_source"] == "paper_trading_style_default"
 
 
 def test_build_payload_uses_result_fallbacks_and_optional_catalysts() -> None:
@@ -282,7 +763,7 @@ def test_build_payload_aligns_high_neutral_action_without_guardrail_to_buy() -> 
     assert payload["metadata"]["score_scale"]["score_band"] == "60-79"
 
 
-def test_build_payload_keeps_high_neutral_action_with_guardrail_reason() -> None:
+def test_build_payload_ignores_narrative_only_guardrail_reason() -> None:
     result = _result(
         sentiment_score=72,
         operation_advice="持有/观望待回踩",
@@ -299,11 +780,11 @@ def test_build_payload_keeps_high_neutral_action_with_guardrail_reason() -> None
     )
 
     assert payload is not None
-    assert payload["action"] == "watch"
-    assert payload["action_label"] == "观望"
+    assert payload["action"] == "buy"
+    assert payload["action_label"] == "买入"
     assert payload["metadata"]["raw_action"] == "watch"
-    assert payload["metadata"]["final_action"] == "watch"
-    assert payload["metadata"]["guardrail_reason"] == "持有/观望待回踩"
+    assert payload["metadata"]["final_action"] == "buy"
+    assert "guardrail_reason" not in payload["metadata"]
 
 
 def test_build_payload_uses_stability_calibration_raw_and_adjusted_scores() -> None:
@@ -337,7 +818,7 @@ def test_build_payload_uses_stability_calibration_raw_and_adjusted_scores() -> N
     assert payload["metadata"]["score_scale"]["score_band"] == "40-59"
     assert payload["metadata"]["raw_action"] == "watch"
     assert payload["metadata"]["final_action"] == "watch"
-    assert payload["metadata"]["guardrail_reason"] == "资金流较弱，按风险规则降级"
+    assert "guardrail_reason" not in payload["metadata"]
 
 
 def test_build_payload_aligns_low_neutral_action_to_reduce() -> None:
@@ -564,7 +1045,7 @@ def test_extract_and_persist_reuses_stability_score_metadata(isolated_db) -> Non
     assert persisted["metadata"]["adjusted_score"] == 59
     assert persisted["metadata"]["raw_action"] == "watch"
     assert persisted["metadata"]["final_action"] == "watch"
-    assert persisted["metadata"]["guardrail_reason"] == "资金流较弱，按风险规则降级"
+    assert "guardrail_reason" not in persisted["metadata"]
 
 
 def test_extract_and_persist_writes_tw_signal(isolated_db) -> None:

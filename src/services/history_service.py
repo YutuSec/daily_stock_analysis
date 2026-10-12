@@ -12,6 +12,7 @@ Responsibilities:
 from __future__ import annotations
 import json
 import logging
+import re
 from datetime import date, datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING
 
@@ -39,8 +40,11 @@ from src.schemas.decision_action import (
     display_action_fields,
     display_action_fields_for_result,
     display_operation_advice_for_result,
+    normalize_holding_state,
 )
 from src.schemas.decision_scale import extract_decision_guardrail_reason
+from src.schemas.report_schema import AnalysisReportSchema
+from src.utils.sanitize import sanitize_diagnostic_text
 from src.utils.sniper_points import find_sniper_points
 from src.utils.data_processing import (
     extract_realtime_detail_fields,
@@ -168,6 +172,7 @@ class HistoryService:
         self,
         stock_code: Optional[str] = None,
         report_type: Optional[str] = None,
+        model_used: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         page: int = 1,
@@ -214,6 +219,7 @@ class HistoryService:
             records, total = self.db.get_analysis_history_paginated(
                 code=stock_code,
                 report_type=report_type,
+                model_used=model_used,
                 start_date=start_dt,
                 end_date=end_dt,
                 offset=offset,
@@ -254,6 +260,69 @@ class HistoryService:
             if value is not None and value != "":
                 return value
         return None
+
+    @staticmethod
+    def _analysis_attempt_status(
+        raw_result: Any,
+        *,
+        report_type: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
+        raw = raw_result if isinstance(raw_result, dict) else {}
+        success = raw.get("success")
+        if success is False:
+            error = raw.get("error_message")
+            return "failed", sanitize_diagnostic_text(error, max_length=300) if error else None
+        if success is True and report_type != "market_review":
+            legacy_error = HistoryService._legacy_schema_validation_error(raw)
+            if legacy_error:
+                return "degraded", legacy_error
+        return "success", None
+
+    @staticmethod
+    def _legacy_schema_validation_error(raw_result: Dict[str, Any]) -> Optional[str]:
+        raw_response = raw_result.get("raw_response")
+        if not isinstance(raw_response, str) or not raw_response.strip():
+            return None
+        candidate = HistoryService._extract_single_json_candidate(raw_response)
+        if candidate is None:
+            return "legacy_schema_validation_failed"
+        try:
+            AnalysisReportSchema.model_validate(candidate)
+            required = {
+                "sentiment_score",
+                "trend_prediction",
+                "operation_advice",
+                "analysis_summary",
+                "dashboard",
+            }
+            if any(key not in candidate for key in required):
+                return "legacy_schema_validation_failed"
+            if not isinstance(candidate.get("dashboard"), dict):
+                return "legacy_schema_validation_failed"
+            int(candidate.get("sentiment_score"))
+        except Exception:
+            return "legacy_schema_validation_failed"
+        return None
+
+    @staticmethod
+    def _extract_single_json_candidate(text: str) -> Optional[Dict[str, Any]]:
+        stripped = text.strip()
+        candidates: List[str] = []
+        if stripped.startswith("{") and stripped.endswith("}"):
+            candidates.append(stripped)
+        fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, flags=re.IGNORECASE | re.DOTALL)
+        candidates.extend(fenced)
+        unique_candidates = []
+        for candidate in candidates:
+            if candidate not in unique_candidates:
+                unique_candidates.append(candidate)
+        if len(unique_candidates) != 1:
+            return None
+        try:
+            parsed = json.loads(unique_candidates[0])
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     def _extract_history_market_fields(self, context_snapshot: Any) -> Dict[str, Optional[float]]:
         snapshot_obj = parse_json_field(context_snapshot)
@@ -303,7 +372,9 @@ class HistoryService:
 
     def _record_to_list_item_dict(self, record) -> Dict[str, Any]:
         raw_result = parse_json_field(getattr(record, "raw_result", None))
-        model_used = raw_result.get("model_used") if isinstance(raw_result, dict) else None
+        model_used = getattr(record, "model_used", None)
+        if not model_used and isinstance(raw_result, dict):
+            model_used = raw_result.get("model_used")
         display_code = self._display_stock_code(record.code)
         market_fields = self._extract_history_market_fields(
             getattr(record, "context_snapshot", None)
@@ -312,7 +383,15 @@ class HistoryService:
             record.code,
             getattr(record, "context_snapshot", None),
         )
-        action_fields = self._decision_action_fields_for_record(record, raw_result)
+        analysis_status, error_message = self._analysis_attempt_status(
+            raw_result,
+            report_type=record.report_type,
+        )
+        action_fields = (
+            {"action": None, "action_label": None, "holding_state": "unknown"}
+            if analysis_status in {"failed", "degraded"}
+            else self._decision_action_fields_for_record(record, raw_result)
+        )
 
         return {
             "id": record.id,
@@ -323,9 +402,18 @@ class HistoryService:
             "trend_prediction": record.trend_prediction,
             "analysis_summary": record.analysis_summary,
             "sentiment_score": record.sentiment_score,
-            "operation_advice": record.operation_advice,
+            "operation_advice": (
+                "分析失败"
+                if analysis_status in {"failed", "degraded"}
+                else
+                action_fields["action_label"]
+                if action_fields["holding_state"] != "unknown"
+                else record.operation_advice
+            ),
             "action": action_fields["action"],
             "action_label": action_fields["action_label"],
+            "analysis_status": analysis_status,
+            "error_message": error_message,
             "model_used": normalize_model_used(model_used),
             "created_at": self._serialize_created_at(record.created_at),
             "market_phase_summary": market_phase_summary,
@@ -552,7 +640,9 @@ class HistoryService:
         """
         raw_result = parse_json_field(record.raw_result)
 
-        model_used = (raw_result or {}).get("model_used") if isinstance(raw_result, dict) else None
+        model_used = getattr(record, "model_used", None)
+        if not model_used and isinstance(raw_result, dict):
+            model_used = raw_result.get("model_used")
         model_used = normalize_model_used(model_used)
         sniper_points = self._get_display_sniper_points(record, raw_result)
 
@@ -567,7 +657,15 @@ class HistoryService:
         if getattr(record, "report_type", None) == "market_review":
             market_review_content = self._extract_market_review_content(record, raw_result)
 
-        action_fields = self._decision_action_fields_for_record(record, raw_result)
+        analysis_status, error_message = self._analysis_attempt_status(
+            raw_result,
+            report_type=record.report_type,
+        )
+        action_fields = (
+            {"action": None, "action_label": None, "holding_state": "unknown"}
+            if analysis_status in {"failed", "degraded"}
+            else self._decision_action_fields_for_record(record, raw_result)
+        )
         display_code = self._display_stock_code(record.code)
         market_phase_summary = self._display_market_phase_summary(record.code, context_snapshot)
         return {
@@ -580,9 +678,18 @@ class HistoryService:
             "created_at": self._serialize_created_at(record.created_at),
             "model_used": model_used,
             "analysis_summary": market_review_content or record.analysis_summary,
-            "operation_advice": record.operation_advice,
+            "operation_advice": (
+                "分析失败"
+                if analysis_status in {"failed", "degraded"}
+                else
+                action_fields["action_label"]
+                if action_fields["holding_state"] != "unknown"
+                else record.operation_advice
+            ),
             "action": action_fields["action"],
             "action_label": action_fields["action_label"],
+            "analysis_status": analysis_status,
+            "error_message": error_message,
             "trend_prediction": record.trend_prediction,
             "sentiment_score": record.sentiment_score,
             "sentiment_label": self._get_sentiment_label(record.sentiment_score or 50),
@@ -598,7 +705,7 @@ class HistoryService:
 
     def _decision_action_fields_for_record(self, record, raw_result: Any) -> Dict[str, Any]:
         raw = raw_result if isinstance(raw_result, dict) else {}
-        return display_action_fields(
+        fields = display_action_fields(
             operation_advice=raw.get("operation_advice") or getattr(record, "operation_advice", None),
             explicit_action=raw.get("action"),
             action_label=raw.get("action_label"),
@@ -606,7 +713,13 @@ class HistoryService:
             report_language=normalize_report_language(raw.get("report_language")),
             sentiment_score=getattr(record, "sentiment_score", None),
             guardrail_reason=extract_decision_guardrail_reason(raw),
+            holding_state=raw.get("holding_state"),
+            position_actions=raw.get("position_actions"),
         )
+        return {
+            **fields,
+            "holding_state": normalize_holding_state(raw.get("holding_state")),
+        }
 
     def delete_history_records(self, record_ids: List[int]) -> int:
         """

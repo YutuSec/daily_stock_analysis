@@ -37,6 +37,10 @@ export const StockBarItemComponent: React.FC<StockBarItemProps> = ({
     t('history.sentiment'),
     actionLabels,
   );
+  const analysisStatus = item.analysisStatus ?? 'completed';
+  const isAttemptFailed = analysisStatus === 'failed' || analysisStatus === 'degraded';
+  const attemptLabel = analysisStatus === 'degraded' ? '降级' : '失败';
+  const attemptError = item.latestAttemptError?.trim();
   const phaseLabel = getMarketPhaseSummaryLabel(item.marketPhaseSummary, language)
     ?.replace('市场阶段: ', '')
     .replace('市场阶段：', '')
@@ -85,6 +89,15 @@ export const StockBarItemComponent: React.FC<StockBarItemProps> = ({
                   }}
                 >
                   {t('stockBar.market')}
+                </Badge>
+              ) : isAttemptFailed ? (
+                <Badge
+                  variant="default"
+                  size="sm"
+                  className="shrink-0 border-danger/30 bg-danger/10 text-[11px] font-semibold leading-none text-danger shadow-none"
+                  title={attemptError || undefined}
+                >
+                  分析{attemptLabel}
                 </Badge>
               ) : sentimentColor ? (
                 <Badge
@@ -148,6 +161,13 @@ export const StockBarItemComponent: React.FC<StockBarItemProps> = ({
               </>
             ) : null}
           </div>
+          {isAttemptFailed ? (
+            <div className="mt-1 text-[10px] leading-4 text-danger">
+              最近{attemptLabel}
+              {attemptError ? `：${attemptError}` : ''}
+              {item.lastSuccessTime ? `；最近成功 ${formatDateTime(item.lastSuccessTime)}` : ''}
+            </div>
+          ) : null}
         </div>
       </div>
     </button>

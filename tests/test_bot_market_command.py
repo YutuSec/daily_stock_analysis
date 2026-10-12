@@ -33,6 +33,16 @@ def _make_message() -> BotMessage:
 
 
 class MarketCommandRegionFilterTestCase(unittest.TestCase):
+    def test_cn_review_checks_only_cn_and_calendar_error_never_falls_back(self):
+        config = SimpleNamespace(trading_day_check_enabled=True, market_review_region="cn")
+        command = MarketCommand()
+        with patch("src.core.trading_calendar.is_market_open", side_effect=
+                   lambda market, *args, **kwargs: True if market == "cn" else (_ for _ in ()).throw(ValueError("unrelated"))):
+            self.assertEqual(command._compute_market_review_override_region(config), "cn")
+        with patch("src.core.trading_calendar._XCALS_AVAILABLE", False):
+            with self.assertRaisesRegex(RuntimeError, "calendar_unavailable"):
+                command._compute_market_review_override_region(config)
+
     def _patch_dependencies(
         self,
         *,
@@ -71,8 +81,9 @@ class MarketCommandRegionFilterTestCase(unittest.TestCase):
         trading_calendar_module = MagicMock()
         trading_calendar_module.get_open_markets_today.return_value = open_markets
         # Re-export the real compute_effective_region semantics
-        from src.core.trading_calendar import compute_effective_region
+        from src.core.trading_calendar import compute_effective_region, MARKET_TIMEZONE
         trading_calendar_module.compute_effective_region.side_effect = compute_effective_region
+        trading_calendar_module.MARKET_TIMEZONE = MARKET_TIMEZONE
 
         patches = [
             patch.dict(

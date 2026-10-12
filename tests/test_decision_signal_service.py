@@ -17,8 +17,9 @@ import pytest
 from src.config import Config
 from src.repositories.decision_signal_repo import DecisionSignalCreateResult
 from src.services.decision_signal_service import DecisionSignalService, DecisionSignalStorageError
-from src.storage import AnalysisHistory, DatabaseManager, DecisionSignalRecord, utc_naive_now
+from src.storage import AnalysisHistory, DatabaseManager, DecisionSignalRecord, PaperExecutionPlan, utc_naive_now
 from src.utils.sanitize import sanitize_decision_signal_text, sanitize_diagnostic_text
+from tests.report_intent_helpers import add_report_execution_intent
 
 
 def test_service_imports_without_api_bootstrap() -> None:
@@ -107,6 +108,97 @@ def _history_result(**overrides):
     return result
 
 
+def _native_buy_history_raw(**overrides):
+    from src.analyzer import ANALYSIS_REPORT_TOOL_SCHEMA_VERSION
+
+    raw = {
+        "stock_name": "贵州茅台",
+        "report_schema_version": ANALYSIS_REPORT_TOOL_SCHEMA_VERSION,
+        "raw_score": 72,
+        "adjusted_score": 72,
+        "sentiment_score": 72,
+        "action": "buy",
+        "decision_type": "buy",
+        "operation_advice": "买入",
+        "confidence_level": "中",
+        "report_language": "zh",
+        "analysis_summary": "支撑确认后可分批买入。",
+        "risk_warning": "跌破止损退出。",
+        "position_actions": {
+            "empty": {"action": "buy", "advice": "按计划买入"},
+            "holding": {"action": "hold", "advice": "已有仓位持有"},
+        },
+        "dashboard": {
+            "battle_plan": {
+                "sniper_points": {
+                    "ideal_buy": 1680,
+                    "secondary_buy": 1700,
+                    "stop_loss": 1600,
+                    "take_profit": 1850,
+                    "final_target": 1850,
+                    "entry_leg_schema_version": "entry-legs-v1",
+                    "entry_legs": [
+                        {
+                            "leg_id": "leg1",
+                            "role": "initial",
+                            "sequence": 1,
+                            "allocation_fraction": 1.0,
+                            "max_executions": 1,
+                            "price_rules": [{"type": "close_between", "low": 1680, "high": 1700}],
+                            "prerequisites": ["支撑确认"],
+                        }
+                    ],
+                    "exit_leg_schema_version": "exit-legs-v1",
+                    "exit_legs": [
+                        {
+                            "leg_id": "tp1",
+                            "role": "final_take_profit",
+                            "sequence": 1,
+                            "allocation_fraction": 1.0,
+                            "target_price": 1850,
+                        }
+                    ],
+                }
+            },
+            "phase_decision": {
+                "action_window": "下个交易日盘中",
+                "immediate_action": "等待支撑确认后买入",
+                "watch_conditions": ["价格守住支撑", "量能配合"],
+                "next_check_time": "下个交易日 09:35",
+                "confidence_reason": "价格与风控条件完整",
+                "data_limitations": [],
+            },
+        },
+        "model_used": "unit-test-model",
+    }
+    raw.update(overrides)
+    return raw
+
+
+def _save_analysis_history(db: DatabaseManager, raw: dict) -> int:
+    with db.session_scope() as session:
+        row = AnalysisHistory(
+            query_id=f"history-confidence-{raw.get('confidence_level', 'missing')}",
+            code="600519",
+            name="贵州茅台",
+            report_type="full",
+            sentiment_score=raw.get("sentiment_score"),
+            operation_advice=raw.get("operation_advice"),
+            trend_prediction="震荡上行",
+            analysis_summary=raw.get("analysis_summary"),
+            raw_result=json.dumps(raw, ensure_ascii=False),
+            ideal_buy=1680,
+            secondary_buy=1700,
+            stop_loss=1600,
+            take_profit=1850,
+            model_used=raw.get("model_used"),
+        )
+        session.add(row)
+        session.flush()
+        add_report_execution_intent(session, row.id)
+        return int(row.id)
+
+
 def test_service_normalizes_fields_and_partial_plan_quality(isolated_db) -> None:
     service = DecisionSignalService(db_manager=isolated_db)
 
@@ -130,6 +222,47 @@ def test_service_normalizes_fields_and_partial_plan_quality(isolated_db) -> None
     assert item["plan_quality"] == "partial"
     assert item["decision_profile"] == "balanced"
     assert item["metadata"]["decision_profile"] == "balanced"
+
+
+@pytest.mark.parametrize("confidence_level", [None, "中等偏低：证据不足"])
+def test_history_backfill_does_not_default_missing_or_ambiguous_confidence_to_medium(
+    isolated_db,
+    confidence_level,
+) -> None:
+    raw = _native_buy_history_raw()
+    if confidence_level is None:
+        raw.pop("confidence_level")
+    else:
+        raw["confidence_level"] = confidence_level
+    report_id = _save_analysis_history(isolated_db, raw)
+    service = DecisionSignalService(db_manager=isolated_db)
+
+    result = service.list_signals(source_type="analysis", source_report_id=report_id)
+
+    assert result["items"] == []
+    with isolated_db.session_scope() as session:
+        assert session.query(DecisionSignalRecord).count() == 0
+
+
+def test_history_backfill_missing_confidence_cannot_bootstrap_paper_plan(isolated_db) -> None:
+    raw = _native_buy_history_raw()
+    raw.pop("confidence_level")
+    report_id = _save_analysis_history(isolated_db, raw)
+
+    from src.repositories.paper_trading_repo import PaperTradingRepository
+    from src.services.paper_trading_service import PaperTradingService
+
+    result = PaperTradingService(
+        repo=PaperTradingRepository(isolated_db)
+    ).reconcile_report_execution_plan(report_id)
+
+    assert result["status"] == "retry_wait"
+    assert result["classification"] == "missing_decision_signal"
+    assert result["signal_id"] is None
+    assert result["plan_id"] is None
+    with isolated_db.session_scope() as session:
+        assert session.query(DecisionSignalRecord).count() == 0
+        assert session.query(PaperExecutionPlan).count() == 0
 
 
 def test_service_canonicalizes_decision_profile_and_rejects_non_object_metadata(isolated_db) -> None:
@@ -352,8 +485,8 @@ def test_list_signals_lazily_backfills_analysis_history_signal(isolated_db) -> N
     assert item["source_type"] == "analysis"
     assert item["trace_id"] == "query-lazy-signal"
     assert item["trigger_source"] == "history"
-    assert item["action"] == "hold"
-    assert item["action_label"] == "持有"
+    assert item["action"] == "buy"
+    assert item["action_label"] == "买入"
     assert item["reason"] == "趋势仍在，但等待量能确认。"
     assert item["watch_conditions"] == '["回踩不破支撑"]'
     assert item["status"] == "expired"
@@ -489,6 +622,47 @@ def test_list_signals_backfill_uses_saved_intraday_ttl_metadata(
     assert item["horizon"] == "intraday"
     assert item["status"] == "expired"
     assert datetime.fromisoformat(item["expires_at"]) == expected_report_created_at + expected_ttl
+
+
+def test_lazy_history_backfill_preserves_frozen_empty_branch_as_effective_watch(isolated_db) -> None:
+    position_actions = {
+        "empty": {"action": "watch", "advice": "空仓观望"},
+        "holding": {"action": "reduce", "advice": "持仓减仓"},
+    }
+    record_id = isolated_db.save_analysis_history(
+        result=_history_result(
+            code="002173.SZ",
+            name="创新医疗",
+            sentiment_score=37,
+            operation_advice="减仓",
+            decision_type="sell",
+            action="reduce",
+            action_label="减仓",
+            holding_state="empty",
+            position_actions=position_actions,
+        ),
+        query_id="query-lazy-empty-watch-002173",
+        report_type="full",
+        news_content="新闻摘要",
+        context_snapshot={"market_phase_summary": {"phase": "postmarket"}},
+        save_snapshot=True,
+    )
+    service = DecisionSignalService(db_manager=isolated_db)
+
+    listed = service.list_signals(source_type="analysis", source_report_id=record_id)
+
+    assert listed["total"] == 1
+    item = listed["items"][0]
+    assert item["action"] == "watch"
+    assert item["action_label"] == "观望"
+    metadata = item["metadata"]
+    assert metadata["holding_state"] == "empty"
+    assert metadata["base_action"] == "reduce"
+    assert metadata["effective_action_source"] == "position_actions.empty"
+    assert metadata["position_actions"] == {
+        "empty": {"action": "watch"},
+        "holding": {"action": "reduce"},
+    }
 
 
 def test_list_signals_backfill_converts_naive_history_created_at_for_invalidation_ordering(
@@ -1447,7 +1621,11 @@ def test_service_replaces_corrupt_metadata_during_invalidation(
 
     old_after = service.get_signal(old_buy["id"])
     assert old_after["status"] == "invalidated"
-    assert old_after["metadata"]["metadata_replaced_due_to_invalid_json"] is True
+    replacement_markers = {
+        "metadata_replaced_due_to_invalid_json",
+        "metadata_replaced_due_to_non_object",
+    }
+    assert any(old_after["metadata"].get(key) is True for key in replacement_markers)
     assert old_after["metadata"]["decision_profile"] == "balanced"
     assert old_after["metadata"]["invalidated_by_signal_id"] == new_sell["id"]
 
@@ -1573,3 +1751,32 @@ def test_service_propagates_unexpected_invalidation_failures(isolated_db) -> Non
 
     with pytest.raises(RuntimeError, match="invalidation write failed"):
         service.create_signal(_payload(source_report_id=392, trace_id="trace-invalidation-failure"))
+
+
+def test_research_only_report_never_enters_signal_layer_but_legacy_report_still_backfills(isolated_db) -> None:
+    research_id = isolated_db.save_analysis_history(
+        result=_history_result(),
+        query_id="query-research-signal",
+        report_type="simple",
+        news_content=None,
+        execution_intent={"execution_intent": "research_only", "intent_source": "unit_test"},
+    )
+    legacy_id = isolated_db.save_analysis_history(
+        result=_history_result(),
+        query_id="query-legacy-signal",
+        report_type="simple",
+        news_content=None,
+    )
+    assert research_id > 0 and legacy_id > 0
+    service = DecisionSignalService(db_manager=isolated_db)
+
+    with pytest.raises(ValueError, match="research-only"):
+        service.create_signal(_payload(source_report_id=research_id, trace_id="trace-research"))
+    research_listed = service.list_signals(source_type="analysis", source_report_id=research_id)
+    legacy_listed = service.list_signals(source_type="analysis", source_report_id=legacy_id)
+
+    assert research_listed["total"] == 0
+    assert legacy_listed["total"] == 1
+    with isolated_db.get_session() as session:
+        rows = session.query(DecisionSignalRecord).all()
+        assert [row.source_report_id for row in rows] == [legacy_id]

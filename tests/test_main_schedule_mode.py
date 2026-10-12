@@ -6,6 +6,7 @@ import logging
 import os
 import socket
 import tempfile
+import threading
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -19,6 +20,10 @@ ensure_litellm_stub()
 _ENV_BEFORE_MAIN_IMPORT = dict(os.environ)
 import main
 from src.config import Config
+
+# Real per-session lease helpers, captured before setUp patches them.
+_REAL_EVENING_CLAIM = main._claim_market_opportunity_evening_session
+_REAL_EVENING_FINISH = main._finish_market_opportunity_evening_session
 
 _MAIN_IMPORT_ENV_ADDITIONS = frozenset(set(os.environ) - set(_ENV_BEFORE_MAIN_IMPORT))
 _MAIN_IMPORT_ENV_OVERRIDES = {
@@ -60,6 +65,17 @@ class MainScheduleModeTestCase(unittest.TestCase):
         self.env_patch = patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=False)
         self.env_patch.start()
         Config.reset_instance()
+        # Evening-run tests default to an uncontended per-session lease; the
+        # cross-instance tests patch these back to a real temp-DB lease.
+        claim_patch = patch(
+            "main._claim_market_opportunity_evening_session",
+            side_effect=lambda session: {"claimed": True, "lease_key": f"evening:{session}"},
+        )
+        finish_patch = patch("main._finish_market_opportunity_evening_session")
+        self.evening_claim = claim_patch.start()
+        self.evening_finish = finish_patch.start()
+        self.addCleanup(claim_patch.stop)
+        self.addCleanup(finish_patch.stop)
         root_logger = logging.getLogger()
         self._original_root_handlers = list(root_logger.handlers)
         self._original_root_level = root_logger.level
@@ -120,6 +136,8 @@ class MainScheduleModeTestCase(unittest.TestCase):
             "feishu_stream_enabled": False,
             "schedule_enabled": False,
             "schedule_time": "18:00",
+            "schedule_multi_model_enabled": False,
+            "paper_trading_enabled": False,
             "schedule_run_immediately": True,
             "run_immediately": True,
             "agent_event_monitor_enabled": False,
@@ -129,6 +147,571 @@ class MainScheduleModeTestCase(unittest.TestCase):
         }
         defaults.update(overrides)
         return _DummyConfig(**defaults)
+
+    def test_scheduled_multi_model_runs_every_configured_model_without_fallback(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            schedule_multi_model_enabled=True,
+            stock_list=["002714.SZ", "512480.SH"],
+        )
+        config.refresh_stock_list = MagicMock()
+        deepseek_config = SimpleNamespace()
+        claude_config = SimpleNamespace()
+
+        with patch(
+            "src.services.analysis_model_service.list_analysis_models",
+            return_value=["deepseek/deepseek-v4-pro", "anthropic/claude-sonnet-5"],
+        ), patch(
+            "src.services.analysis_model_service.build_model_scoped_config",
+            side_effect=[deepseek_config, claude_config],
+        ) as build_scoped, patch("main.run_full_analysis", return_value=True) as run_full:
+            result = main.run_scheduled_analysis(config, args)
+
+        self.assertTrue(result)
+        config.refresh_stock_list.assert_called_once_with()
+        self.assertEqual(build_scoped.call_count, 2)
+        self.assertEqual(
+            deepseek_config.report_filename_suffix,
+            "deepseek/deepseek-v4-pro",
+        )
+        self.assertEqual(
+            claude_config.report_filename_suffix,
+            "anthropic/claude-sonnet-5",
+        )
+        self.assertEqual(run_full.call_count, 2)
+        for call in run_full.call_args_list:
+            self.assertEqual(call.args[2], ["002714.SZ", "512480.SH"])
+            self.assertTrue(call.kwargs["raise_errors"])
+
+    def test_scheduled_single_model_mode_keeps_legacy_execution(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(schedule_multi_model_enabled=False)
+
+        with patch("main.run_full_analysis", return_value=True) as run_full:
+            result = main.run_scheduled_analysis(config, args, ["002714.SZ"])
+
+        self.assertTrue(result)
+        run_full.assert_called_once_with(
+            config,
+            args,
+            ["002714.SZ"],
+            raise_errors=True,
+        )
+
+    def test_paper_monitor_runs_once_after_complete_multi_model_batch(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            schedule_multi_model_enabled=True,
+            paper_trading_enabled=True,
+            stock_list=["002714.SZ"],
+        )
+        config.refresh_stock_list = MagicMock()
+
+        with patch(
+            "src.services.analysis_model_service.list_analysis_models",
+            return_value=["model-a", "model-b"],
+        ), patch(
+            "src.services.analysis_model_service.build_model_scoped_config",
+            side_effect=[SimpleNamespace(), SimpleNamespace()],
+        ), patch("main.run_full_analysis", return_value=True) as run_full, patch(
+            "main._run_paper_trading_monitor_if_enabled"
+        ) as monitor:
+            result = main.run_scheduled_analysis(config, args)
+
+        self.assertTrue(result)
+        self.assertEqual(run_full.call_count, 2)
+        monitor.assert_called_once_with(config)
+
+    def test_market_opportunity_runs_after_success_before_paper_monitor(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            market_opportunity_mode="paper",
+            paper_trading_enabled=True,
+        )
+        calls = []
+
+        def opportunity(_config):
+            calls.append("opportunity")
+
+        def monitor(_config):
+            calls.append("paper")
+
+        with patch("main.run_full_analysis", return_value=True), patch(
+            "main._run_market_opportunity_pool_if_enabled",
+            side_effect=opportunity,
+        ) as opportunity_mock, patch(
+            "main._run_paper_trading_monitor_if_enabled",
+            side_effect=monitor,
+        ) as monitor_mock:
+            result = main.run_scheduled_analysis(config, args, ["002714.SZ"])
+
+        self.assertTrue(result)
+        opportunity_mock.assert_called_once_with(config)
+        monitor_mock.assert_called_once_with(config)
+        self.assertEqual(calls, ["opportunity", "paper"])
+
+    def test_auxiliary_ledgers_run_before_partial_multi_model_failure_is_raised(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            schedule_multi_model_enabled=True,
+            paper_trading_enabled=True,
+            market_opportunity_mode="paper",
+            stock_list=["002714.SZ"],
+        )
+        config.refresh_stock_list = MagicMock()
+        calls = []
+
+        with patch(
+            "src.services.analysis_model_service.list_analysis_models",
+            return_value=["model-a", "model-b"],
+        ), patch(
+            "src.services.analysis_model_service.build_model_scoped_config",
+            side_effect=[SimpleNamespace(), SimpleNamespace()],
+        ), patch(
+            "main.run_full_analysis",
+            side_effect=[True, RuntimeError("provider failed")],
+        ), patch(
+            "main._run_market_opportunity_pool_if_enabled",
+            side_effect=lambda _config: calls.append("opportunity"),
+        ), patch(
+            "main._run_paper_trading_monitor_if_enabled",
+            side_effect=lambda _config: calls.append("paper"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "model-b"):
+                main.run_scheduled_analysis(config, args)
+
+        self.assertEqual(calls, ["opportunity", "paper"])
+
+    def test_schedule_mode_reaches_scheduled_analysis_when_only_opportunity_observe_enabled(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(market_opportunity_mode="observe")
+
+        def fake_run_with_schedule(
+            task,
+            schedule_time,
+            run_immediately,
+            background_tasks=None,
+            schedule_time_provider=None,
+            shared_lease_enabled=None,
+        ):
+            task()
+
+        with patch("main.parse_arguments", return_value=args), patch(
+            "main.get_config", return_value=config
+        ), patch("main._reload_runtime_config", return_value=config), patch(
+            "main._build_schedule_time_provider", return_value=lambda: "18:00"
+        ), patch("main.prepare_webui_frontend_assets", return_value=True), patch(
+            "src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule
+        ), patch(
+            "main.run_scheduled_analysis"
+        ) as scheduled, patch(
+            "main.run_full_analysis"
+        ) as legacy:
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        scheduled.assert_called_once_with(config, args, None)
+        legacy.assert_not_called()
+
+    def test_market_opportunity_region_only_runs_cn_for_mixed_market_review_region(self) -> None:
+        config = self._make_config(market_opportunity_mode="observe", market_review_region="cn,us")
+        service = MagicMock()
+        service.run_after_market_review.return_value = {
+            "status": "ok",
+            "discovery": {"run_id": 1, "selected_candidate_count": 0, "job_count": 0},
+            "jobs": {"processed": 0, "failed": 0},
+        }
+
+        with patch("src.services.market_opportunity_service.MarketOpportunityService", return_value=service):
+            main._run_market_opportunity_pool_if_enabled(config)
+
+        service.run_after_market_review.assert_called_once()
+        self.assertEqual(service.run_after_market_review.call_args.kwargs["market"], "cn")
+
+    def test_market_opportunity_log_separates_research_block_and_outcomes(self) -> None:
+        config = self._make_config(market_opportunity_mode="paper", market_review_region="cn")
+        service = MagicMock()
+        outcomes = {"bullish": 1, "non_bullish": 2, "analysis_failed": 1, "budget_exhausted": 0}
+        service.run_after_market_review.return_value = {
+            "status": "ok",
+            "discovery": {
+                "run_id": 7, "selected_candidate_count": 4, "job_count": 4, "reason": None,
+                "research": {"block_reason": "research_budget_exhausted"},
+            },
+            "jobs": {"processed": 3, "failed": 1},
+            "research_outcomes": outcomes,
+        }
+
+        with patch("main._market_opportunity_pool_enabled", return_value=True), patch(
+            "src.services.market_opportunity_service.MarketOpportunityService", return_value=service
+        ), self.assertLogs("main", level="INFO") as captured:
+            main._run_market_opportunity_pool_if_enabled(config)
+
+        line = next(item for item in captured.output if "大盘风口机会池完成" in item)
+        self.assertIn("research_block=research_budget_exhausted", line)
+        self.assertIn(f"research_outcomes={outcomes}", line)
+
+    def test_market_opportunity_region_skips_non_cn_market_review_region(self) -> None:
+        config = self._make_config(market_opportunity_mode="paper", market_review_region="jp,kr")
+
+        with patch("src.services.market_opportunity_service.MarketOpportunityService") as service_cls:
+            main._run_market_opportunity_pool_if_enabled(config)
+
+        service_cls.assert_not_called()
+
+    def test_market_opportunity_off_does_not_build_service(self) -> None:
+        config = self._make_config(market_opportunity_mode="off", market_review_region="cn")
+
+        with patch("src.services.market_opportunity_service.MarketOpportunityService") as service_cls:
+            main._run_market_opportunity_pool_if_enabled(config)
+
+        service_cls.assert_not_called()
+
+    def test_auxiliary_ledgers_run_when_single_model_returns_failure(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(paper_trading_enabled=True)
+
+        with patch("main.run_full_analysis", return_value=False), patch(
+            "main._run_market_opportunity_pool_if_enabled"
+        ) as opportunity, patch(
+            "main._run_paper_trading_monitor_if_enabled"
+        ) as monitor:
+            with self.assertRaisesRegex(RuntimeError, "analysis_unsuccessful"):
+                main.run_scheduled_analysis(config, args, ["002714.SZ"])
+
+        opportunity.assert_called_once_with(config)
+        monitor.assert_called_once_with(config)
+
+    def test_single_model_and_both_auxiliary_errors_are_aggregated(self) -> None:
+        config = self._make_config(paper_trading_enabled=True)
+        with patch("main.run_full_analysis", side_effect=RuntimeError("provider_down")), patch(
+            "main._run_market_opportunity_pool_if_enabled", side_effect=RuntimeError("discovery_down")
+        ) as opportunity, patch(
+            "main._run_paper_trading_monitor_if_enabled", side_effect=RuntimeError("ledger_down")
+        ) as monitor:
+            with self.assertRaises(RuntimeError) as caught:
+                main.run_scheduled_analysis(config, self._make_args(schedule=True))
+        for reason in ("provider_down", "discovery_down", "ledger_down"):
+            self.assertIn(reason, str(caught.exception))
+        opportunity.assert_called_once_with(config)
+        monitor.assert_called_once_with(config)
+
+    def test_multi_model_setup_failure_still_runs_auxiliaries(self) -> None:
+        config = self._make_config(schedule_multi_model_enabled=True, stock_list=[])
+        config.refresh_stock_list = MagicMock()
+        with patch("src.services.analysis_model_service.list_analysis_models", return_value=[]), patch(
+            "main._run_market_opportunity_pool_if_enabled", side_effect=RuntimeError("pool_down")
+        ), patch("main._run_paper_trading_monitor_if_enabled") as monitor:
+            with self.assertRaisesRegex(RuntimeError, "analysis_setup"):
+                main.run_scheduled_analysis(config, self._make_args(schedule=True))
+        monitor.assert_called_once_with(config)
+
+    def test_auxiliary_service_exceptions_are_not_swallowed(self) -> None:
+        config = self._make_config(paper_trading_enabled=True, market_opportunity_mode="paper")
+        with patch("main._build_paper_trading_service") as build:
+            build.return_value.run_monitor.side_effect = RuntimeError("ledger_down")
+            with self.assertRaisesRegex(RuntimeError, "ledger_down"):
+                main._run_paper_trading_monitor_if_enabled(config)
+        with patch("main._market_opportunity_pool_enabled", return_value=True), patch(
+            "src.services.market_opportunity_service.MarketOpportunityService"
+        ) as service:
+            service.return_value.run_after_market_review.side_effect = RuntimeError("pool_down")
+            with self.assertRaisesRegex(RuntimeError, "pool_down"):
+                main._run_market_opportunity_pool_if_enabled(config)
+
+    def test_evening_run_time_moves_pool_out_of_scheduled_batch(self) -> None:
+        config = self._make_config(
+            paper_trading_enabled=True,
+            market_opportunity_mode="paper",
+            market_opportunity_run_time="20:00",
+        )
+
+        with patch("main.run_full_analysis", return_value=True), patch(
+            "main._run_market_opportunity_pool_if_enabled"
+        ) as opportunity, patch("main._run_paper_trading_monitor_if_enabled") as monitor:
+            result = main.run_scheduled_analysis(config, self._make_args(schedule=True), ["002714.SZ"])
+
+        self.assertTrue(result)
+        opportunity.assert_not_called()
+        monitor.assert_called_once_with(config)
+
+    @staticmethod
+    def _china_clock(value):
+        class FakeDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return value.replace(tzinfo=tz) if tz is not None else value
+
+        return FakeDateTime
+
+    def test_evening_pool_waits_for_run_time_and_runs_once_per_session(self) -> None:
+        config = self._make_config(market_opportunity_mode="paper", market_opportunity_run_time="20:00")
+
+        with patch("main._market_opportunity_evening_last_session", None), \
+             patch("main._market_opportunity_pool_enabled", return_value=True), \
+             patch("src.core.trading_calendar.is_market_open", return_value=True), \
+             patch("src.services.market_opportunity_service.MarketOpportunityService") as service_cls, \
+             patch("main._run_market_opportunity_pool_if_enabled") as pool:
+            service_cls.return_value.market_review_readiness.return_value = {
+                "ready": True,
+                "session": "2026-10-09",
+                "report_id": 7,
+            }
+            with patch("main.datetime", self._china_clock(datetime(2026, 10, 9, 19, 55))):
+                early = main._run_market_opportunity_pool_evening_if_due(config)
+            with patch("main.datetime", self._china_clock(datetime(2026, 10, 9, 20, 0))):
+                first = main._run_market_opportunity_pool_evening_if_due(config)
+                repeat = main._run_market_opportunity_pool_evening_if_due(config)
+            with patch("main.datetime", self._china_clock(datetime(2026, 10, 12, 20, 5))):
+                next_session = main._run_market_opportunity_pool_evening_if_due(config)
+
+        self.assertEqual(early, {"status": "skipped", "reason": "before_run_time"})
+        self.assertIsNone(first)
+        self.assertEqual(repeat, {"status": "skipped", "reason": "already_ran_today"})
+        self.assertIsNone(next_session)
+        self.assertEqual(pool.call_count, 2)
+        pool.assert_called_with(config)
+        self.assertEqual(service_cls.return_value.market_review_readiness.call_args.kwargs["market"], "cn")
+
+    def test_evening_pool_waits_for_current_market_review_without_consuming_session(self) -> None:
+        config = self._make_config(market_opportunity_mode="paper", market_opportunity_run_time="20:00")
+
+        with patch("main._market_opportunity_evening_last_session", None), \
+             patch("main._market_opportunity_pool_enabled", return_value=True), \
+             patch("src.core.trading_calendar.is_market_open", return_value=True), \
+             patch("src.services.market_opportunity_service.MarketOpportunityService") as service_cls, \
+             patch("main._run_market_opportunity_pool_if_enabled") as pool, \
+             patch("main.datetime", self._china_clock(datetime(2026, 10, 9, 20, 30))):
+            service_cls.return_value.market_review_readiness.side_effect = [
+                {"ready": False, "reason": "market_review_not_ready", "session": "2026-10-09"},
+                {"ready": True, "session": "2026-10-09", "report_id": 8},
+            ]
+            waiting = main._run_market_opportunity_pool_evening_if_due(config)
+            ran = main._run_market_opportunity_pool_evening_if_due(config)
+
+        self.assertEqual(waiting, {"status": "skipped", "reason": "market_review_not_ready"})
+        self.assertIsNone(ran)
+        pool.assert_called_once_with(config)
+
+    def test_evening_pool_skips_while_analysis_batch_holds_shared_lock(self) -> None:
+        from src.services.runtime_scheduler import run_with_global_analysis_lock
+
+        config = self._make_config(market_opportunity_mode="paper", market_opportunity_run_time="20:00")
+        observed = {}
+
+        def batch(_config, _args, _stock_codes):
+            observed["during_batch"] = main._run_market_opportunity_pool_evening_if_due(config)
+            return True
+
+        with patch("main._market_opportunity_evening_last_session", None), \
+             patch("main._market_opportunity_pool_enabled", return_value=True), \
+             patch("src.core.trading_calendar.is_market_open", return_value=True), \
+             patch("src.services.market_opportunity_service.MarketOpportunityService") as service_cls, \
+             patch("main._run_market_opportunity_pool_if_enabled") as pool, \
+             patch("main.datetime", self._china_clock(datetime(2026, 10, 9, 20, 30))):
+            service_cls.return_value.market_review_readiness.return_value = {"ready": True, "session": "2026-10-09"}
+            self.assertTrue(run_with_global_analysis_lock(batch, config, None, None))
+            after_batch = main._run_market_opportunity_pool_evening_if_due(config)
+
+        self.assertEqual(observed["during_batch"], {"status": "skipped", "reason": "analysis_busy"})
+        self.assertIsNone(after_batch)
+        pool.assert_called_once_with(config)
+
+    def test_evening_pool_gates_skip_before_building_service(self) -> None:
+        calendar_down = RuntimeError("exchange-calendars unavailable")
+        cases = (
+            ("evening_run_disabled", {"market_opportunity_run_time": ""}, True, True),
+            ("market_closed", {}, False, True),
+            ("trading_calendar_unavailable", {}, calendar_down, True),
+            ("pool_disabled", {}, True, False),
+            ("market_review_region_not_cn", {"market_review_region": "us"}, True, True),
+        )
+        for reason, overrides, calendar, pool_enabled in cases:
+            with self.subTest(reason=reason):
+                config = self._make_config(**{
+                    "market_opportunity_mode": "paper",
+                    "market_opportunity_run_time": "20:00",
+                    **overrides,
+                })
+                calendar_patch = (
+                    {"side_effect": calendar} if isinstance(calendar, Exception) else {"return_value": calendar}
+                )
+                with patch("main._market_opportunity_evening_last_session", None), \
+                     patch("main._market_opportunity_pool_enabled", return_value=pool_enabled), \
+                     patch("src.core.trading_calendar.is_market_open", **calendar_patch) as market_open, \
+                     patch("src.services.market_opportunity_service.MarketOpportunityService") as service_cls, \
+                     patch("main._run_market_opportunity_pool_if_enabled") as pool, \
+                     patch("main.datetime", self._china_clock(datetime(2026, 10, 9, 20, 30))):
+                    result = main._run_market_opportunity_pool_evening_if_due(config)
+                    # A gate skip never consumes the session's single attempt.
+                    self.assertIsNone(main._market_opportunity_evening_last_session)
+
+                self.assertEqual(result, {"status": "skipped", "reason": reason})
+                if reason != "evening_run_disabled":
+                    market_open.assert_called_once_with("cn", date(2026, 10, 9), strict=True)
+                service_cls.assert_not_called()
+                pool.assert_not_called()
+
+    def test_evening_pool_failure_surfaces_without_same_session_retry(self) -> None:
+        config = self._make_config(market_opportunity_mode="paper", market_opportunity_run_time="20:00")
+
+        with patch("main._market_opportunity_evening_last_session", None), \
+             patch("main._market_opportunity_pool_enabled", return_value=True), \
+             patch("src.core.trading_calendar.is_market_open", return_value=True), \
+             patch("src.services.market_opportunity_service.MarketOpportunityService") as service_cls, \
+             patch("main._run_market_opportunity_pool_if_enabled", side_effect=RuntimeError("pool_down")) as pool, \
+             patch("main.datetime", self._china_clock(datetime(2026, 10, 9, 20, 30))):
+            service_cls.return_value.market_review_readiness.return_value = {"ready": True, "session": "2026-10-09"}
+            with self.assertRaisesRegex(RuntimeError, "pool_down"):
+                main._run_market_opportunity_pool_evening_if_due(config)
+            again = main._run_market_opportunity_pool_evening_if_due(config)
+
+        self.assertEqual(again, {"status": "skipped", "reason": "already_ran_today"})
+        pool.assert_called_once_with(config)
+
+    def _run_evening_as_owner(self, config, owner_id, clock, pool_side_effect=None):
+        """Run one evening tick as a separate scheduler instance against the real lease."""
+        with patch.dict(os.environ, {"DSA_SCHEDULER_OWNER_ID": owner_id}, clear=False), \
+             patch("main._claim_market_opportunity_evening_session", _REAL_EVENING_CLAIM), \
+             patch("main._finish_market_opportunity_evening_session", _REAL_EVENING_FINISH), \
+             patch("main._market_opportunity_evening_last_session", None), \
+             patch("main._market_opportunity_pool_enabled", return_value=True), \
+             patch("src.core.trading_calendar.is_market_open", return_value=True), \
+             patch("src.services.market_opportunity_service.MarketOpportunityService") as service_cls, \
+             patch("main._run_market_opportunity_pool_if_enabled", side_effect=pool_side_effect) as pool, \
+             patch("main.datetime", self._china_clock(clock)):
+            service_cls.return_value.market_review_readiness.return_value = {"ready": True, "session": "2026-10-09"}
+            try:
+                result = main._run_market_opportunity_pool_evening_if_due(config)
+            except Exception as exc:  # surfaced like the scheduler would see it
+                result = exc
+            return result, pool.call_count
+
+    def _with_temp_lease_db(self):
+        from src.storage import DatabaseManager
+
+        db_patch = patch.dict(os.environ, {"DATABASE_PATH": str(Path(self.temp_dir.name) / "lease.db")}, clear=False)
+        db_patch.start()
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+
+        def cleanup():
+            DatabaseManager.reset_instance()
+            db_patch.stop()
+
+        self.addCleanup(cleanup)
+
+    def test_evening_pool_runs_once_per_session_across_scheduler_instances(self) -> None:
+        # Server runtime scheduler + analyzer CLI scheduler: different processes,
+        # different 5-minute buckets (20:00 vs 20:05), one shared DB.
+        self._with_temp_lease_db()
+        config = self._make_config(market_opportunity_mode="paper", market_opportunity_run_time="20:00")
+
+        first, first_calls = self._run_evening_as_owner(config, "analyzer:1", datetime(2026, 10, 9, 20, 0))
+        second, second_calls = self._run_evening_as_owner(config, "server:1", datetime(2026, 10, 9, 20, 5))
+        next_session, next_calls = self._run_evening_as_owner(config, "server:1", datetime(2026, 10, 12, 20, 5))
+
+        self.assertIsNone(first)
+        self.assertEqual(first_calls, 1)
+        self.assertEqual(second, {"status": "skipped", "reason": "session_claimed_by_other_instance"})
+        self.assertEqual(second_calls, 0)
+        self.assertIsNone(next_session)
+        self.assertEqual(next_calls, 1)
+
+        from src.services.scheduler_heartbeat import scheduler_task_states
+
+        lease = scheduler_task_states()["tasks"]["market_opportunity_evening_session"]["lease"]
+        self.assertEqual(lease["status"], "succeeded")
+
+    def test_evening_pool_running_or_failed_session_is_not_rerun_by_other_instance(self) -> None:
+        self._with_temp_lease_db()
+        config = self._make_config(market_opportunity_mode="paper", market_opportunity_run_time="20:00")
+        observed = {}
+
+        def pool_while_running(_config):
+            # The other instance ticks while this run is still in progress.
+            observed["during"] = self._run_evening_as_owner(config, "server:1", datetime(2026, 10, 9, 20, 5))
+            raise RuntimeError("pool_down")
+
+        failed, _ = self._run_evening_as_owner(
+            config, "analyzer:1", datetime(2026, 10, 9, 20, 0), pool_side_effect=pool_while_running
+        )
+        after_failure, after_calls = self._run_evening_as_owner(config, "server:1", datetime(2026, 10, 9, 20, 30))
+
+        self.assertIsInstance(failed, RuntimeError)
+        self.assertEqual(observed["during"], ({"status": "skipped", "reason": "session_claimed_by_other_instance"}, 0))
+        self.assertEqual(after_failure, {"status": "skipped", "reason": "session_claimed_by_other_instance"})
+        self.assertEqual(after_calls, 0)
+
+    def test_evening_pool_unavailable_session_claim_skips_without_consuming_session(self) -> None:
+        config = self._make_config(market_opportunity_mode="paper", market_opportunity_run_time="20:00")
+        self.evening_claim.side_effect = [RuntimeError("db_down"), {"claimed": True, "lease_key": "k"}]
+
+        with patch("main._market_opportunity_evening_last_session", None), \
+             patch("main._market_opportunity_pool_enabled", return_value=True), \
+             patch("src.core.trading_calendar.is_market_open", return_value=True), \
+             patch("src.services.market_opportunity_service.MarketOpportunityService") as service_cls, \
+             patch("main._run_market_opportunity_pool_if_enabled") as pool, \
+             patch("main.datetime", self._china_clock(datetime(2026, 10, 9, 20, 30))):
+            service_cls.return_value.market_review_readiness.return_value = {"ready": True, "session": "2026-10-09"}
+            unavailable = main._run_market_opportunity_pool_evening_if_due(config)
+            self.assertIsNone(main._market_opportunity_evening_last_session)
+            ran = main._run_market_opportunity_pool_evening_if_due(config)
+
+        self.assertEqual(unavailable, {"status": "skipped", "reason": "session_claim_unavailable"})
+        self.assertIsNone(ran)
+        pool.assert_called_once_with(config)
+        self.evening_finish.assert_called_once_with("k")
+
+    def test_schedule_mode_batch_holds_shared_lock_and_registers_evening_runner(self) -> None:
+        from src.services.runtime_scheduler import global_analysis_running
+
+        args = self._make_args(schedule=True)
+        config = self._make_config(market_opportunity_mode="paper", market_opportunity_run_time="20:00")
+        scheduled_call = {}
+        lock_held_during_batch = []
+
+        def fake_run_with_schedule(
+            task,
+            schedule_time,
+            run_immediately,
+            background_tasks=None,
+            schedule_time_provider=None,
+            shared_lease_enabled=None,
+        ):
+            scheduled_call["background_tasks"] = background_tasks or []
+            scheduled_call["result"] = task()
+
+        def scheduled(_config, _args, _stock_codes):
+            lock_held_during_batch.append(global_analysis_running())
+            return True
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main._reload_runtime_config", return_value=config), \
+             patch("main._build_schedule_time_provider", return_value=lambda: "18:00"), \
+             patch("main.setup_logging"), \
+             patch("main._market_opportunity_pool_enabled", return_value=True), \
+             patch("main.run_scheduled_analysis", side_effect=scheduled) as scheduled_mock, \
+             patch(
+                 "main._run_market_opportunity_pool_evening_if_due",
+                 return_value={"status": "skipped", "reason": "before_run_time"},
+             ) as evening_runner, \
+             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertIs(scheduled_call["result"], True)
+        self.assertEqual(lock_held_during_batch, [True])
+        self.assertFalse(global_analysis_running())
+        scheduled_mock.assert_called_once_with(config, args, None)
+        evening_tasks = [
+            task for task in scheduled_call["background_tasks"]
+            if task["name"] == "market_opportunity_evening_run"
+        ]
+        self.assertEqual(len(evening_tasks), 1)
+        self.assertEqual(evening_tasks[0]["task"](), {"status": "skipped", "reason": "before_run_time"})
+        evening_runner.assert_called_once_with(config)
 
     def test_daily_market_context_target_date_routes_jp_kr_calendars(self) -> None:
         current_time = datetime(2026, 5, 7, 0, 30, tzinfo=timezone.utc)
@@ -173,7 +756,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
             database_path=str(Path(self.temp_dir.name) / "stock_analysis.db"),
         )
 
-        stock_codes = ["cn-stock", "jp-stock", "kr-stock", "us-stock", "none-stock"]
+        stock_codes = ["cn-stock", "jp-stock", "kr-stock", "us-stock"]
 
         with patch(
             "src.core.trading_calendar.get_market_for_stock",
@@ -185,9 +768,80 @@ class MainScheduleModeTestCase(unittest.TestCase):
                 stock_codes,
             )
 
-        self.assertEqual(filtered_codes, ["jp-stock", "kr-stock", "none-stock"])
+        self.assertEqual(filtered_codes, ["jp-stock", "kr-stock"])
         self.assertEqual(effective_region, "jp,kr")
         self.assertFalse(should_skip_all)
+
+    def test_cn_exchange_symbols_follow_real_calendar_and_keep_identity(self) -> None:
+        config = self._make_config(trading_day_check_enabled=True,
+                                   market_review_enabled=True, market_review_region="cn")
+        codes = ["513980.SH", "512480.SS", "513120.SH", "002714.SZ",
+                 "SZ159915", "SH.601606", "920748.BJ", "600879"]
+        from src.core.trading_calendar import is_market_open
+        for session, expected_open in ((date(2026, 9, 12), False),
+                                       (date(2026, 10, 1), False),
+                                       (date(2026, 9, 14), True)):
+            with self.subTest(session=session):
+                self.assertEqual(is_market_open("cn", session), expected_open)
+                with patch("src.core.trading_calendar.get_open_markets_today",
+                           return_value={"cn"} if expected_open else set()):
+                    result = main._compute_trading_day_filter(config, self._make_args(), codes)
+                self.assertEqual(result, (codes, "cn", False) if expected_open else ([], "", True))
+        with patch("src.core.trading_calendar.get_open_markets_today", return_value={"us"}):
+            self.assertEqual(main._compute_trading_day_filter(
+                config, self._make_args(), codes + ["AAPL"]), (["AAPL"], "", False))
+        with patch("src.core.trading_calendar.get_open_markets_today", return_value=set()):
+            self.assertEqual(main._compute_trading_day_filter(
+                config, self._make_args(force_run=True), codes), (codes, None, False))
+            config.trading_day_check_enabled = False
+            self.assertEqual(main._compute_trading_day_filter(
+                config, self._make_args(), codes), (codes, None, False))
+
+    def test_closed_cn_batch_does_not_start_pipeline_or_notify(self) -> None:
+        config = self._make_config(trading_day_check_enabled=True,
+                                   market_review_enabled=True, market_review_region="cn")
+        with patch("src.core.trading_calendar.get_open_markets_today", return_value=set()), \
+             patch("main._refresh_stock_index_cache_for_analysis"), \
+             patch("src.core.pipeline.StockAnalysisPipeline") as pipeline, \
+             patch("src.core.market_review.run_market_review") as review, \
+             patch("src.notification.NotificationService") as notifier:
+            self.assertTrue(main.run_full_analysis(
+                config, self._make_args(), ["513980.SH", "002714.SZ", "SZ159915"],
+                raise_errors=True))
+        pipeline.assert_not_called()
+        review.assert_not_called()
+        notifier.assert_not_called()
+
+    def test_calendar_unavailable_blocks_pipeline_but_force_remains_explicit(self) -> None:
+        config = self._make_config(trading_day_check_enabled=True,
+                                   market_review_enabled=True, market_review_region="cn")
+        with patch("src.core.trading_calendar._XCALS_AVAILABLE", False), \
+             patch("main._refresh_stock_index_cache_for_analysis"), \
+             patch("src.core.pipeline.StockAnalysisPipeline") as pipeline, \
+             patch("src.core.market_review.run_market_review") as review:
+            with self.assertRaisesRegex(RuntimeError, "calendar_unavailable"):
+                main.run_full_analysis(config, self._make_args(), ["513980.SH"], raise_errors=True)
+            self.assertEqual(main._compute_trading_day_filter(
+                config, self._make_args(force_run=True), ["513980.SH"]), (["513980.SH"], None, False))
+        pipeline.assert_not_called()
+        review.assert_not_called()
+
+    def test_unknown_market_is_not_automatic_permission(self) -> None:
+        config = self._make_config(trading_day_check_enabled=True, market_review_enabled=False)
+        with self.assertRaisesRegex(ValueError, "无法确定股票所属市场"):
+            main._compute_trading_day_filter(config, self._make_args(), ["unrecognized.symbol"])
+
+    def test_partial_analysis_is_reported_after_successful_results_are_preserved(self) -> None:
+        config = self._make_config(trading_day_check_enabled=False, market_review_enabled=False)
+        result = SimpleNamespace(code="002714", name="fixture", success=True,
+                                 sentiment_score=50, operation_advice="观望", trend_prediction="震荡",
+                                 get_emoji=lambda: "")
+        with patch("main._refresh_stock_index_cache_for_analysis"), \
+             patch("src.core.pipeline.StockAnalysisPipeline") as pipeline:
+            pipeline.return_value.run.return_value = [result]
+            with self.assertRaisesRegex(RuntimeError, "analysis_partial_failure: succeeded=1 expected=2"):
+                main.run_full_analysis(config, self._make_args(), ["002714", "513980"], raise_errors=True)
+            self.assertEqual(pipeline.return_value.run.return_value, [result])
 
     def test_public_webui_bind_warns_when_auth_is_disabled(self) -> None:
         with patch("src.auth.is_auth_enabled", return_value=False), \
@@ -375,10 +1029,12 @@ class MainScheduleModeTestCase(unittest.TestCase):
             run_immediately,
             background_tasks=None,
             schedule_time_provider=None,
+            shared_lease_enabled=None,
         ):
             scheduled_call["schedule_time"] = schedule_time
             scheduled_call["run_immediately"] = run_immediately
             scheduled_call["background_tasks"] = background_tasks or []
+            scheduled_call["shared_lease_enabled"] = shared_lease_enabled
             scheduled_call["resolved_schedule_time"] = (
                 schedule_time_provider() if schedule_time_provider is not None else None
             )
@@ -395,16 +1051,47 @@ class MainScheduleModeTestCase(unittest.TestCase):
             exit_code = main.main()
 
         self.assertEqual(exit_code, 0)
+        self.assertEqual(scheduled_call["schedule_time"], "18:00")
+        self.assertEqual(scheduled_call["run_immediately"], True)
+        self.assertEqual(scheduled_call["shared_lease_enabled"], True)
+        self.assertEqual(scheduled_call["resolved_schedule_time"], "18:00")
         self.assertEqual(
-            scheduled_call,
-            {
-                "schedule_time": "18:00",
-                "run_immediately": True,
-                "background_tasks": [],
-                "resolved_schedule_time": "18:00",
-            },
+            [
+                {
+                    "name": task["name"],
+                    "interval_seconds": task["interval_seconds"],
+                    "run_immediately": task["run_immediately"],
+                }
+                for task in scheduled_call["background_tasks"]
+            ],
+            [
+                {
+                    "name": "paper_trading_opening_confirmation_0930",
+                    "interval_seconds": 30,
+                    "run_immediately": False,
+                },
+                {
+                    "name": "paper_trading_intraday_monitor",
+                    "interval_seconds": 5 * 60,
+                    "run_immediately": False,
+                },
+                {
+                    "name": "market_opportunity_evening_run",
+                    "interval_seconds": 5 * 60,
+                    "run_immediately": False,
+                },
+            ],
         )
-        run_full_analysis.assert_called_once_with(config, args, None)
+        opening_task = scheduled_call["background_tasks"][0]
+        self.assertEqual(opening_task["active_time_start"], "09:30:00")
+        self.assertEqual(opening_task["active_time_end"], "09:35:00")
+        self.assertEqual(opening_task["active_timezone"], "Asia/Shanghai")
+        evening_task = scheduled_call["background_tasks"][-1]
+        self.assertEqual(evening_task["active_time_start"], "15:00:00")
+        self.assertEqual(evening_task["active_time_end"], "23:59:59")
+        self.assertEqual(evening_task["active_timezone"], "Asia/Shanghai")
+        self.assertEqual(evening_task["lease_task_name"], "market_opportunity_evening_run")
+        run_full_analysis.assert_called_once_with(config, args, None, raise_errors=True)
         warning_log.assert_any_call(
             "定时模式下检测到 --stocks 参数；计划执行将忽略启动时股票快照，并在每次运行前重新读取最新的 STOCK_LIST。"
         )
@@ -436,8 +1123,10 @@ class MainScheduleModeTestCase(unittest.TestCase):
             run_immediately,
             background_tasks=None,
             schedule_time_provider=None,
+            shared_lease_enabled=None,
         ):
             scheduled_call["schedule_time"] = schedule_time
+            scheduled_call["shared_lease_enabled"] = shared_lease_enabled
             scheduled_call["resolved_schedule_time"] = (
                 schedule_time_provider() if schedule_time_provider is not None else None
             )
@@ -455,9 +1144,9 @@ class MainScheduleModeTestCase(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(
             scheduled_call,
-            {"schedule_time": "18:00", "resolved_schedule_time": "09:30"},
+            {"schedule_time": "18:00", "shared_lease_enabled": True, "resolved_schedule_time": "09:30"},
         )
-        run_full_analysis.assert_called_once_with(runtime_config, args, None)
+        run_full_analysis.assert_called_once_with(runtime_config, args, None, raise_errors=True)
 
     def test_schedule_mode_registers_event_monitor_background_task(self) -> None:
         args = self._make_args(schedule=True)
@@ -476,10 +1165,12 @@ class MainScheduleModeTestCase(unittest.TestCase):
             run_immediately,
             background_tasks=None,
             schedule_time_provider=None,
+            shared_lease_enabled=None,
         ):
             scheduled_call["schedule_time"] = schedule_time
             scheduled_call["run_immediately"] = run_immediately
             scheduled_call["background_tasks"] = background_tasks or []
+            scheduled_call["shared_lease_enabled"] = shared_lease_enabled
             scheduled_call["resolved_schedule_time"] = (
                 schedule_time_provider() if schedule_time_provider is not None else None
             )
@@ -500,9 +1191,14 @@ class MainScheduleModeTestCase(unittest.TestCase):
         run_full_analysis.assert_not_called()
         self.assertEqual(scheduled_call["schedule_time"], "18:00")
         self.assertEqual(scheduled_call["run_immediately"], True)
+        self.assertEqual(scheduled_call["shared_lease_enabled"], True)
         self.assertEqual(scheduled_call["resolved_schedule_time"], "18:00")
-        self.assertEqual(len(scheduled_call["background_tasks"]), 1)
-        background_task = scheduled_call["background_tasks"][0]
+        background_tasks = scheduled_call["background_tasks"]
+        event_tasks = [task for task in background_tasks if task["name"] == "agent_event_monitor"]
+        paper_tasks = [task for task in background_tasks if task["name"] == "paper_trading_intraday_monitor"]
+        self.assertEqual(len(event_tasks), 1)
+        self.assertEqual(len(paper_tasks), 1)
+        background_task = event_tasks[0]
         self.assertEqual(background_task["name"], "agent_event_monitor")
         self.assertEqual(background_task["interval_seconds"], 7 * 60)
         self.assertEqual(background_task["run_immediately"], True)
@@ -530,8 +1226,10 @@ class MainScheduleModeTestCase(unittest.TestCase):
             run_immediately,
             background_tasks=None,
             schedule_time_provider=None,
+            shared_lease_enabled=None,
         ):
             scheduled_call["background_tasks"] = background_tasks or []
+            scheduled_call["shared_lease_enabled"] = shared_lease_enabled
 
         with patch("main.parse_arguments", return_value=args), \
              patch("main.get_config", return_value=config), \
@@ -546,8 +1244,17 @@ class MainScheduleModeTestCase(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         worker_cls.assert_called_once()
         run_full_analysis.assert_not_called()
-        self.assertEqual(len(scheduled_call["background_tasks"]), 1)
-        self.assertEqual(scheduled_call["background_tasks"][0]["name"], "agent_event_monitor")
+        self.assertEqual(scheduled_call["shared_lease_enabled"], True)
+        background_tasks = scheduled_call["background_tasks"]
+        self.assertEqual(
+            [task["name"] for task in background_tasks],
+            [
+                "agent_event_monitor",
+                "paper_trading_opening_confirmation_0930",
+                "paper_trading_intraday_monitor",
+                "market_opportunity_evening_run",
+            ],
+        )
 
     def test_check_notify_returns_before_other_modes(self) -> None:
         args = self._make_args(check_notify=True, serve=True, schedule=True, market_review=True)
@@ -644,10 +1351,12 @@ class MainScheduleModeTestCase(unittest.TestCase):
             run_immediately,
             background_tasks=None,
             schedule_time_provider=None,
+            shared_lease_enabled=None,
         ):
             scheduled_call["schedule_time"] = schedule_time
             scheduled_call["run_immediately"] = run_immediately
             scheduled_call["background_tasks"] = background_tasks or []
+            scheduled_call["shared_lease_enabled"] = shared_lease_enabled
             task()
 
         with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}, clear=False), \
@@ -665,11 +1374,229 @@ class MainScheduleModeTestCase(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         start_bots.assert_not_called()
-        run_full_analysis.assert_called_once_with(config, args, None)
+        run_full_analysis.assert_called_once_with(config, args, None, raise_errors=True)
         self.assertEqual(scheduled_call["schedule_time"], "18:00")
         self.assertEqual(scheduled_call["run_immediately"], True)
-        self.assertEqual(scheduled_call["background_tasks"], [])
+        self.assertEqual(scheduled_call["shared_lease_enabled"], True)
+        self.assertEqual(
+            [
+                {
+                    "name": task["name"],
+                    "interval_seconds": task["interval_seconds"],
+                    "run_immediately": task["run_immediately"],
+                }
+                for task in scheduled_call["background_tasks"]
+            ],
+            [
+                {
+                    "name": "paper_trading_opening_confirmation_0930",
+                    "interval_seconds": 30,
+                    "run_immediately": False,
+                },
+                {
+                    "name": "paper_trading_intraday_monitor",
+                    "interval_seconds": 5 * 60,
+                    "run_immediately": False,
+                },
+                {
+                    "name": "market_opportunity_evening_run",
+                    "interval_seconds": 5 * 60,
+                    "run_immediately": False,
+                },
+            ],
+        )
         error_log.assert_called_once()
+
+    def test_paper_trading_intraday_monitor_is_dormant_until_enabled(self) -> None:
+        config = self._make_config(
+            paper_trading_enabled=True,
+            paper_trading_intraday_enabled=False,
+            paper_trading_intraday_interval_minutes=5,
+        )
+
+        with patch("main._build_paper_trading_service") as build_service:
+            main._run_paper_trading_intraday_monitor_if_enabled(config)
+
+        build_service.assert_not_called()
+
+    def test_monitor_failure_reaches_scheduler_and_shared_lease_status(self) -> None:
+        from src.scheduler import Scheduler
+
+        config = self._make_config(paper_trading_enabled=True, paper_trading_intraday_enabled=True,
+                                   paper_trading_intraday_interval_minutes=5)
+
+        class OpeningClock:
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 9, 7, 9, 31).replace(tzinfo=tz)
+
+        for helper, method in (
+            (main._run_paper_trading_intraday_monitor_if_enabled, "run_intraday_monitor"),
+            (main._run_paper_trading_opening_confirmation_if_enabled, "run_opening_confirmation_check"),
+        ):
+            with self.subTest(helper=helper.__name__):
+                scheduler = Scheduler(register_signals=False, shared_lease_enabled=False)
+                scheduler.add_background_task(lambda: helper(config), interval_seconds=300, name="monitor-regression")
+                entry = scheduler._background_tasks[0]
+                service = MagicMock()
+                getattr(service, method).side_effect = RuntimeError("monitor_database_unavailable")
+                done = threading.Event()
+                with patch("main._build_paper_trading_service", return_value=service), patch(
+                    "main._paper_trading_intraday_last_attempt_monotonic", None
+                ), patch("main._paper_trading_opening_confirmation_last_attempt_monotonic", None), patch(
+                    "main.datetime", OpeningClock
+                ), patch("src.core.trading_calendar.is_market_open", return_value=True), patch.object(
+                    scheduler, "_claim_shared_lease", return_value={"claimed": True, "lease_key": "isolated"}
+                ), patch.object(scheduler, "_finish_shared_lease", side_effect=lambda *a, **k: done.set()) as finish:
+                    self.assertTrue(scheduler._start_background_task(entry))
+                    self.assertTrue(done.wait(5))
+                    worker = entry.get("thread")
+                    if worker is not None:
+                        worker.join(5)
+                    self.assertIsNone(entry["last_success_at"])
+                    self.assertEqual(entry["last_error"], "monitor_database_unavailable")
+                    self.assertEqual(finish.call_args.kwargs["status"], "failed")
+
+                    # The immediate retry is throttled, not a recovery.  It
+                    # must preserve the prior error in both task and lease UI.
+                    done.clear()
+                    self.assertTrue(scheduler._start_background_task(entry))
+                    self.assertTrue(done.wait(5))
+                    worker = entry.get("thread")
+                    if worker is not None:
+                        worker.join(5)
+                    self.assertEqual(entry["last_error"], "monitor_database_unavailable")
+                    self.assertIsNone(entry["last_success_at"])
+                    self.assertEqual(finish.call_args.kwargs["status"], "skipped")
+                    self.assertEqual(finish.call_args.kwargs["error_message"], "monitor_database_unavailable")
+                    self.assertEqual(entry["last_skip_reason"], "monitor_throttled")
+                    getattr(service, method).assert_called_once()
+
+    def test_opening_confirmation_helper_does_not_build_service_outside_window(self) -> None:
+        config = self._make_config(
+            paper_trading_enabled=True,
+            paper_trading_intraday_enabled=True,
+        )
+
+        class FakeDateTime:
+            @classmethod
+            def now(cls, tz=None):
+                value = datetime(2026, 8, 27, 10, 15, 0)
+                return value.replace(tzinfo=tz) if tz is not None else value
+
+        with patch("main.datetime", FakeDateTime), \
+             patch("main._build_paper_trading_service") as build_service:
+            main._run_paper_trading_opening_confirmation_if_enabled(config)
+
+        build_service.assert_not_called()
+
+    def test_opening_confirmation_helper_runs_inside_window(self) -> None:
+        config = self._make_config(
+            paper_trading_enabled=True,
+            paper_trading_intraday_enabled=True,
+        )
+        service = MagicMock()
+        service.run_opening_confirmation_check.return_value = {
+            "observations": 1,
+            "confirmed": 1,
+            "reanalysis_requested": 0,
+            "failed_closed": 0,
+        }
+
+        class FakeDateTime:
+            @classmethod
+            def now(cls, tz=None):
+                value = datetime(2026, 8, 27, 9, 31, 0)
+                return value.replace(tzinfo=tz) if tz is not None else value
+
+        previous_attempt = main._paper_trading_opening_confirmation_last_attempt_monotonic
+        main._paper_trading_opening_confirmation_last_attempt_monotonic = None
+        try:
+            with patch("main.datetime", FakeDateTime), \
+                 patch("main._build_paper_trading_service", return_value=service):
+                main._run_paper_trading_opening_confirmation_if_enabled(config)
+        finally:
+            main._paper_trading_opening_confirmation_last_attempt_monotonic = previous_attempt
+
+        service.run_opening_confirmation_check.assert_called_once_with()
+
+    def test_opening_confirmation_helper_skips_non_trading_day(self) -> None:
+        config = self._make_config(
+            paper_trading_enabled=True,
+            paper_trading_intraday_enabled=True,
+        )
+
+        class FakeDateTime:
+            @classmethod
+            def now(cls, tz=None):
+                value = datetime(2026, 8, 29, 9, 31, 0)
+                return value.replace(tzinfo=tz) if tz is not None else value
+
+        with patch("main.datetime", FakeDateTime), \
+             patch("src.core.trading_calendar.is_market_open", return_value=False), \
+             patch("main._build_paper_trading_service") as build_service:
+            main._run_paper_trading_opening_confirmation_if_enabled(config)
+
+        build_service.assert_not_called()
+
+    def test_paper_trading_intraday_monitor_throttles_by_latest_interval(self) -> None:
+        config = self._make_config(
+            paper_trading_enabled=True,
+            paper_trading_intraday_enabled=True,
+            paper_trading_intraday_interval_minutes=5,
+        )
+        service = MagicMock()
+        service.run_intraday_monitor.return_value = {
+            "observations": 0,
+            "positions_opened": 0,
+            "positions_closed": 0,
+        }
+        previous_attempt = main._paper_trading_intraday_last_attempt_monotonic
+        main._paper_trading_intraday_last_attempt_monotonic = None
+        try:
+            with patch("main._build_paper_trading_service", return_value=service), \
+                 patch("main.time.monotonic", side_effect=[100.0, 160.0, 401.0]):
+                first = main._run_paper_trading_intraday_monitor_if_enabled(config)
+                throttled = main._run_paper_trading_intraday_monitor_if_enabled(config)
+                second = main._run_paper_trading_intraday_monitor_if_enabled(config)
+        finally:
+            main._paper_trading_intraday_last_attempt_monotonic = previous_attempt
+
+        self.assertEqual(first["observations"], 0)
+        self.assertEqual(throttled, {"status": "skipped", "reason": "monitor_throttled"})
+        self.assertEqual(second["observations"], 0)
+        self.assertEqual(service.run_intraday_monitor.call_count, 2)
+        for call in service.run_intraday_monitor.call_args_list:
+            self.assertEqual(call.kwargs["interval_seconds"], 5 * 60)
+
+    def test_paper_trading_intraday_monitor_uses_reduced_interval_without_restart(self) -> None:
+        config = self._make_config(
+            paper_trading_enabled=True,
+            paper_trading_intraday_enabled=True,
+            paper_trading_intraday_interval_minutes=10,
+        )
+        service = MagicMock()
+        service.run_intraday_monitor.return_value = {
+            "observations": 0,
+            "positions_opened": 0,
+            "positions_closed": 0,
+        }
+        previous_attempt = main._paper_trading_intraday_last_attempt_monotonic
+        main._paper_trading_intraday_last_attempt_monotonic = None
+        try:
+            with patch("main._build_paper_trading_service", return_value=service), \
+                 patch("main.time.monotonic", side_effect=[100.0, 160.0]):
+                main._run_paper_trading_intraday_monitor_if_enabled(config)
+                config.paper_trading_intraday_interval_minutes = 1
+                main._run_paper_trading_intraday_monitor_if_enabled(config)
+        finally:
+            main._paper_trading_intraday_last_attempt_monotonic = previous_attempt
+
+        self.assertEqual(service.run_intraday_monitor.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["interval_seconds"] for call in service.run_intraday_monitor.call_args_list],
+            [10 * 60, 60],
+        )
 
     def test_serve_with_enabled_schedule_uses_api_runtime_scheduler(self) -> None:
         from src.services.runtime_scheduler import (

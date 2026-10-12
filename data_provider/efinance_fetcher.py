@@ -27,10 +27,11 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
+from .volume_units import lots_to_shares
 import requests  # 引入 requests 以捕获异常
 from tenacity import (
     retry,
@@ -66,6 +67,7 @@ from .base import (
     _is_etf_code as _is_a_share_etf_code,
 )
 from .realtime_types import (
+    UnifiedAuctionSnapshot,
     UnifiedRealtimeQuote, RealtimeSource,
     get_realtime_circuit_breaker,
     safe_float, safe_int  # 使用统一的类型转换函数
@@ -118,6 +120,7 @@ class EfinanceRealtimeQuote:
 logger = logging.getLogger(__name__)
 
 EASTMONEY_HISTORY_ENDPOINT = "push2his.eastmoney.com/api/qt/stock/kline/get"
+EASTMONEY_AUCTION_ENDPOINT = "push2.eastmoney.com/api/qt/stock/get"
 
 
 # User-Agent 池，用于随机轮换
@@ -176,6 +179,19 @@ def _build_eastmoney_etf_secid(stock_code: str) -> str:
     if code.startswith(_ETF_SZ_PREFIXES):
         return f"0.{code}"
     raise DataFetchError(f"无法确定 ETF {stock_code} 的 Eastmoney 市场前缀")
+
+
+def _build_eastmoney_cn_secid(stock_code: str) -> Optional[str]:
+    """Build Eastmoney secid for A-share/ETF point-in-time quote endpoints."""
+
+    code = normalize_stock_code(stock_code)
+    if not (code.isdigit() and len(code) == 6):
+        return None
+    if code.startswith(("5", "6", "9")):
+        return f"1.{code}"
+    if code.startswith(("0", "1", "2", "3")):
+        return f"0.{code}"
+    return None
 
 
 def _is_us_code(stock_code: str) -> bool:
@@ -593,6 +609,11 @@ class EfinanceFetcher(BaseFetcher):
             '股票名称': 'name',
         }
         
+        # Eastmoney A-share/ETF K lines use lots; storage/quotes use shares.
+        from .volume_units import lots_to_shares
+        if '成交量' in df.columns:
+            df['成交量'] = df['成交量'].map(lots_to_shares)
+        df.attrs['volume_unit'] = 'shares'
         # 重命名列
         df = df.rename(columns=column_mapping)
         
@@ -713,7 +734,7 @@ class EfinanceFetcher(BaseFetcher):
                 price=safe_float(row.get(price_col)),
                 change_pct=safe_float(row.get(pct_col)),
                 change_amount=safe_float(row.get(chg_col)),
-                volume=safe_int(row.get(vol_col)),
+                volume=lots_to_shares(row.get(vol_col)),
                 amount=safe_float(row.get(amt_col)),
                 turnover_rate=safe_float(row.get(turn_col)),
                 amplitude=safe_float(row.get(amp_col)),
@@ -738,6 +759,26 @@ class EfinanceFetcher(BaseFetcher):
             logger.info(f"[API错误] 获取 {stock_code} 实时行情(efinance)失败: {e}")
             circuit_breaker.record_failure(source_key, str(e))
             return None
+
+    def get_auction_snapshot(self, stock_code: str, *, market: str = "cn") -> Optional[UnifiedAuctionSnapshot]:
+        """Efinance has no attributable opening-auction capability here.
+
+        Do not map Eastmoney ordinary quote fields (f43/f47/f49) into auction
+        price/volume.  The paper trading service will keep the auction evidence
+        unavailable/fail-closed unless another provider (for example Tushare
+        ``stk_auction``) supplies a dedicated snapshot.
+        """
+
+        return None
+
+    def get_auction_capability_diagnostics(self, stock_code: str, *, market: str = "cn") -> Dict[str, Any]:
+        return {
+            "provider": self.name,
+            "supported": False,
+            "reason": "ordinary_eastmoney_quote_fields_are_not_attributable_auction_data",
+            "forbidden_fields": ["f43", "f47", "f49"],
+            "ordinary_realtime_quote_alias": False,
+        }
 
     def _get_etf_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
@@ -814,7 +855,7 @@ class EfinanceFetcher(BaseFetcher):
                 price=safe_float(row.get(price_col)),
                 change_pct=safe_float(row.get(pct_col)),
                 change_amount=safe_float(row.get(chg_col)),
-                volume=safe_int(row.get(vol_col)),
+                volume=lots_to_shares(row.get(vol_col)),
                 amount=safe_float(row.get(amt_col)),
                 turnover_rate=safe_float(row.get(turn_col)),
                 amplitude=safe_float(row.get(amp_col)),

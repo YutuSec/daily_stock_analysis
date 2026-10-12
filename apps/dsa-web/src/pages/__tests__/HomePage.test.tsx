@@ -46,6 +46,7 @@ vi.mock('../../api/analysis', async () => {
       getStatus: vi.fn(),
       getTasks: vi.fn(),
       getTaskFlow: vi.fn(),
+      getModels: vi.fn(),
     },
   };
 });
@@ -74,6 +75,7 @@ const historyItem = {
   stockName: '贵州茅台',
   sentimentScore: 82,
   operationAdvice: '买入',
+  modelUsed: 'deepseek',
   createdAt: '2026-03-18T08:00:00Z',
 };
 
@@ -86,6 +88,7 @@ const historyReport = {
     reportType: 'detailed' as const,
     reportLanguage: 'zh' as const,
     createdAt: '2026-03-18T08:00:00Z',
+    modelUsed: 'deepseek',
   },
   summary: {
     analysisSummary: '趋势维持强势',
@@ -126,6 +129,7 @@ const marketReviewHistoryItem = {
   stockCode: 'MARKET',
   stockName: '大盘复盘',
   reportType: 'market_review' as const,
+  modelUsed: 'deepseek',
   createdAt: '2026-03-18T08:00:00Z',
 };
 
@@ -137,6 +141,7 @@ const marketReviewHistoryReport = {
     stockName: '大盘复盘',
     reportType: 'market_review' as const,
     reportLanguage: 'zh' as const,
+    modelUsed: 'deepseek',
     createdAt: '2026-03-18T08:00:00Z',
   },
   summary: {
@@ -215,6 +220,14 @@ describe('HomePage', () => {
       processing: 0,
       tasks: [],
     });
+    vi.mocked(analysisApi.getModels).mockResolvedValue({
+      models: [
+        { model: 'deepseek', isDefault: true },
+        { model: 'claude', isDefault: false },
+      ],
+      defaultModel: 'deepseek',
+      comparisonAvailable: true,
+    });
     vi.mocked(systemConfigApi.getWatchlist).mockResolvedValue([]);
     vi.mocked(agentApi.getSkills).mockResolvedValue({ skills: [], default_skill_id: '' });
     vi.mocked(historyApi.getDiagnostics).mockResolvedValue({
@@ -269,6 +282,136 @@ describe('HomePage', () => {
       }),
     ).toBeInTheDocument();
     expect(historyApi.getMarkdown).not.toHaveBeenCalled();
+  });
+
+  it('prioritizes the resolved structured action over contradictory legacy advice', async () => {
+    vi.mocked(historyApi.getStockBarList).mockResolvedValue({
+      total: 1,
+      items: [{
+        id: 126,
+        stockCode: '002173.SZ',
+        stockName: '创新医疗',
+        reportType: 'detailed',
+        sentimentScore: 37,
+        operationAdvice: '减仓',
+        action: 'watch',
+        actionLabel: '观望',
+        analysisCount: 1,
+        lastAnalysisTime: '2026-08-27T15:20:42+08:00',
+        modelUsed: 'deepseek',
+      }],
+    });
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 1,
+      page: 1,
+      limit: 20,
+      items: [{
+        ...historyItem,
+        id: 126,
+        stockCode: '002173.SZ',
+        stockName: '创新医疗',
+        sentimentScore: 37,
+        operationAdvice: '观望',
+        action: 'watch',
+        actionLabel: '观望',
+      }],
+    });
+    vi.mocked(historyApi.getDetail).mockResolvedValue({
+      ...historyReport,
+      meta: {
+        ...historyReport.meta,
+        id: 126,
+        stockCode: '002173.SZ',
+        stockName: '创新医疗',
+      },
+      summary: {
+        ...historyReport.summary,
+        operationAdvice: '观望',
+        action: 'watch',
+        actionLabel: '观望',
+        sentimentScore: 37,
+      },
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('观望 37')).toBeInTheDocument();
+    expect(screen.queryByText('减仓 37')).not.toBeInTheDocument();
+  });
+
+  it('selects one model or submits every configured model', async () => {
+    vi.mocked(analysisApi.getModels).mockResolvedValue({
+      models: [
+        { model: 'deepseek', isDefault: true },
+        { model: 'claude', isDefault: false },
+        { model: 'gemini', isDefault: false },
+      ],
+      defaultModel: 'deepseek',
+      comparisonAvailable: true,
+    });
+    vi.mocked(historyApi.getList).mockResolvedValue({ total: 0, page: 1, limit: 20, items: [] });
+    vi.mocked(historyApi.getStockBarList).mockResolvedValue({ total: 0, items: [] });
+    vi.mocked(analysisApi.analyzeAsync).mockResolvedValue({
+      accepted: [],
+      duplicates: [],
+      message: 'accepted',
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    const input = await screen.findByPlaceholderText('输入股票代码或名称，如 600519、贵州茅台、AAPL');
+    const modelSelect = await screen.findByLabelText('分析模型');
+    expect(modelSelect).toHaveValue('deepseek');
+
+    fireEvent.change(modelSelect, { target: { value: 'claude' } });
+    fireEvent.change(input, { target: { value: '600519' } });
+    fireEvent.click(screen.getByRole('button', { name: '分析' }));
+    await waitFor(() => expect(analysisApi.analyzeAsync).toHaveBeenLastCalledWith(
+      expect.objectContaining({ model: 'claude' }),
+    ));
+
+    fireEvent.change(input, { target: { value: '600519' } });
+    fireEvent.click(screen.getByRole('button', { name: '多模型运行' }));
+    await waitFor(() => expect(analysisApi.analyzeAsync).toHaveBeenLastCalledWith(
+      expect.objectContaining({ models: ['deepseek', 'claude', 'gemini'] }),
+    ));
+  });
+
+  it('loads model-filtered history and can fill the search box from the watchlist', async () => {
+    vi.mocked(systemConfigApi.getWatchlist).mockResolvedValue(['600519']);
+    vi.mocked(historyApi.getList).mockResolvedValue({ total: 0, page: 1, limit: 20, items: [] });
+    vi.mocked(historyApi.getStockBarList).mockResolvedValue({
+      total: 1,
+      items: [{
+        id: 1,
+        stockCode: '600519',
+        stockName: '贵州茅台',
+        analysisCount: 1,
+        lastAnalysisTime: '2026-03-18T08:00:00Z',
+        modelUsed: 'deepseek',
+      }],
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(historyApi.getStockBarList).toHaveBeenCalledWith(
+      expect.objectContaining({ modelUsed: 'deepseek' }),
+    ));
+    const picker = await screen.findByLabelText('从自选股选择股票');
+    fireEvent.change(picker, { target: { value: '600519' } });
+    expect(screen.getByPlaceholderText('输入股票代码或名称，如 600519、贵州茅台、AAPL')).toHaveValue('600519');
   });
 
   it('loads markdown only after opening the full report drawer', async () => {
@@ -660,7 +803,11 @@ describe('HomePage', () => {
     fireEvent.click(await screen.findByRole('button', { name: '自选' }));
 
     await waitFor(() => {
-      expect(historyApi.getList).toHaveBeenCalledWith({ stockCode: 'AAPL', limit: 1 });
+      expect(historyApi.getList).toHaveBeenCalledWith({
+        stockCode: 'AAPL',
+        modelUsed: 'deepseek',
+        limit: 1,
+      });
     });
     expect(await screen.findByLabelText('确认今日状态中')).toBeInTheDocument();
 
@@ -727,7 +874,11 @@ describe('HomePage', () => {
     });
 
     await waitFor(() => {
-      expect(historyApi.getList).toHaveBeenCalledWith({ stockCode: 'AAPL', limit: 1 });
+      expect(historyApi.getList).toHaveBeenCalledWith({
+        stockCode: 'AAPL',
+        modelUsed: 'deepseek',
+        limit: 1,
+      });
     });
   });
 
@@ -858,6 +1009,7 @@ describe('HomePage', () => {
       expect(historyApi.getList).toHaveBeenCalledWith({
         startDate,
         endDate,
+        modelUsed: 'deepseek',
         page: 2,
         limit: 100,
       });
@@ -1127,6 +1279,74 @@ describe('HomePage', () => {
     expect(vi.mocked(analysisApi.analyzeAsync).mock.calls[0]?.[0].stockCodes).toHaveLength(50);
     expect(vi.mocked(analysisApi.analyzeAsync).mock.calls[1]?.[0].stockCodes).toHaveLength(1);
     expect(vi.mocked(analysisApi.getTasks).mock.calls.length).toBeGreaterThan(taskRefreshCallsBeforeSubmit);
+  });
+
+  it('analyzes all selected history stocks while excluding the market review row', async () => {
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 0,
+      page: 1,
+      limit: 20,
+      items: [],
+    });
+    vi.mocked(historyApi.getStockBarList).mockResolvedValue({
+      total: 3,
+      items: [
+        {
+          id: 701,
+          stockCode: '600519',
+          stockName: '贵州茅台',
+          reportType: 'detailed',
+          sentimentScore: 70,
+          operationAdvice: '观望',
+          analysisCount: 1,
+          lastAnalysisTime: '2026-08-28T15:10:00+08:00',
+        },
+        {
+          id: 702,
+          stockCode: '000001.SZ',
+          stockName: '平安银行',
+          reportType: 'detailed',
+          sentimentScore: 65,
+          operationAdvice: '观望',
+          analysisCount: 1,
+          lastAnalysisTime: '2026-08-28T15:10:00+08:00',
+        },
+        {
+          id: 703,
+          stockCode: 'MARKET',
+          stockName: '大盘复盘',
+          reportType: 'market_review',
+          sentimentScore: 50,
+          operationAdvice: '查看复盘',
+          analysisCount: 1,
+          lastAnalysisTime: '2026-08-28T15:10:00+08:00',
+        },
+      ],
+    });
+    vi.mocked(analysisApi.analyzeAsync).mockResolvedValue({
+      accepted: [
+        { taskId: 'task-600519', stockCode: '600519', status: 'pending' },
+        { taskId: 'task-000001', stockCode: '000001.SZ', status: 'pending' },
+      ],
+      duplicates: [],
+      message: 'accepted',
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByLabelText('全选当前个股'));
+    fireEvent.click(screen.getByRole('button', { name: '分析所选' }));
+
+    await waitFor(() => expect(analysisApi.analyzeAsync).toHaveBeenCalledWith(expect.objectContaining({
+      stockCodes: ['600519', '000001.SZ'],
+      model: 'deepseek',
+      reportType: 'detailed',
+    })));
+    expect(await screen.findByText('已提交 2 个任务，0 个正在运行')).toBeInTheDocument();
   });
 
   it('reports partial watchlist submission and refreshes accepted tasks after a later chunk fails', async () => {

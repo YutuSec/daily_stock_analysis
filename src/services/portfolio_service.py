@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -38,6 +40,9 @@ VALID_CASH_DIRECTIONS = {"in", "out"}
 VALID_CORPORATE_ACTIONS = {"cash_dividend", "split_adjustment"}
 PORTFOLIO_FX_REFRESH_DISABLED_REASON = "portfolio_fx_update_disabled"
 PORTFOLIO_REALTIME_QUOTE_MAX_WORKERS = 4
+PORTFOLIO_DAILY_BACKFILL_RETRY_SECONDS = 300.0
+_PORTFOLIO_DAILY_BACKFILL_ATTEMPTS: Dict[Tuple[str, str, date], float] = {}
+_PORTFOLIO_DAILY_BACKFILL_ATTEMPTS_LOCK = threading.Lock()
 
 
 def _portfolio_limitations_for_market(market: str) -> List[str]:
@@ -525,6 +530,18 @@ class PortfolioService:
                 lots=account_snapshot["lots_cache"],
                 valuation_currency=account.base_currency,
             )
+            position_id_map = self.repo.cached_position_id_map(
+                account_id=account.id,
+                cost_method=method,
+            )
+            for position in account_snapshot["public"].get("positions", []):
+                key = (
+                    str(position.get("symbol") or ""),
+                    str(position.get("market") or "").lower(),
+                    str(position.get("currency") or "").upper(),
+                )
+                if key in position_id_map:
+                    position["position_id"] = position_id_map[key]
 
             accounts_payload.append(account_snapshot["public"])
             aggregate["limitations"] = _merge_portfolio_limitations(
@@ -1164,6 +1181,9 @@ class PortfolioService:
                 )
 
         close = self.repo.get_latest_close_with_date(symbol=symbol, as_of=as_of_date)
+        if as_of_date == today and (close is None or close[1] < as_of_date):
+            self._backfill_position_daily_close(symbol=symbol, as_of_date=as_of_date)
+            close = self.repo.get_latest_close_with_date(symbol=symbol, as_of=as_of_date)
         if close is not None:
             close_price, close_date = close
             if close_price > 0:
@@ -1182,6 +1202,56 @@ class PortfolioService:
             is_stale=True,
             is_available=False,
         )
+
+    def _backfill_position_daily_close(self, *, symbol: str, as_of_date: date) -> bool:
+        """Fetch and persist daily bars when today's local close is missing."""
+
+        storage_symbol = self._daily_storage_symbol(symbol)
+        database_key = str(getattr(self.repo.db, "_db_url", ""))
+        attempt_key = (database_key, storage_symbol, as_of_date)
+        now = time.monotonic()
+        with _PORTFOLIO_DAILY_BACKFILL_ATTEMPTS_LOCK:
+            expired_attempts = [
+                key
+                for key, attempted_at in _PORTFOLIO_DAILY_BACKFILL_ATTEMPTS.items()
+                if now - attempted_at >= PORTFOLIO_DAILY_BACKFILL_RETRY_SECONDS
+            ]
+            for key in expired_attempts:
+                _PORTFOLIO_DAILY_BACKFILL_ATTEMPTS.pop(key, None)
+            previous_attempt = _PORTFOLIO_DAILY_BACKFILL_ATTEMPTS.get(attempt_key)
+            if (
+                previous_attempt is not None
+                and now - previous_attempt < PORTFOLIO_DAILY_BACKFILL_RETRY_SECONDS
+            ):
+                return False
+            _PORTFOLIO_DAILY_BACKFILL_ATTEMPTS[attempt_key] = now
+
+        try:
+            from data_provider.base import DataFetcherManager
+
+            daily_data, source_name = DataFetcherManager().get_daily_data(
+                symbol,
+                end_date=as_of_date.isoformat(),
+                days=30,
+            )
+            if daily_data is None or daily_data.empty:
+                return False
+
+            self.repo.db.save_daily_data(
+                daily_data,
+                code=storage_symbol,
+                data_source=source_name,
+            )
+            logger.info(
+                "Backfilled portfolio daily close for %s as %s via %s",
+                symbol,
+                storage_symbol,
+                source_name,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Failed to backfill portfolio daily close for %s: %s", symbol, exc)
+            return False
 
     def _prefetch_realtime_position_prices(
         self,
@@ -1261,8 +1331,14 @@ class PortfolioService:
             return ""
 
         raw = canonical_stock_code(symbol)
-        if len(raw) >= 8 and raw[:2] in {"SH", "SZ", "BJ"} and raw[2:].isdigit():
-            return raw
+        for prefix in ("SH.", "SS.", "SZ.", "BJ."):
+            if raw.startswith(prefix) and raw[len(prefix) :].isdigit():
+                exchange = "SH" if prefix[:2] == "SS" else prefix[:2]
+                return f"{exchange}{raw[len(prefix):]}"
+
+        if len(raw) >= 8 and raw[:2] in {"SH", "SS", "SZ", "BJ"} and raw[2:].isdigit():
+            exchange = "SH" if raw[:2] == "SS" else raw[:2]
+            return f"{exchange}{raw[2:]}"
 
         if "." in raw:
             base, suffix = raw.rsplit(".", 1)
@@ -1271,6 +1347,28 @@ class PortfolioService:
                 return f"{exchange}{base}"
 
         return canonical_stock_code(normalize_stock_code(symbol))
+
+    @staticmethod
+    def _daily_storage_symbol(symbol: str) -> str:
+        """Choose one exchange-qualified key for fetched daily bars when available."""
+
+        raw = canonical_stock_code(symbol)
+        for prefix in ("SH.", "SS.", "SZ.", "BJ."):
+            if raw.startswith(prefix) and raw[len(prefix) :].isdigit():
+                exchange = "SH" if prefix[:2] == "SS" else prefix[:2]
+                return f"{raw[len(prefix):]}.{exchange}"
+
+        if len(raw) >= 8 and raw[:2] in {"SH", "SS", "SZ", "BJ"} and raw[2:].isdigit():
+            exchange = "SH" if raw[:2] == "SS" else raw[:2]
+            return f"{raw[2:]}.{exchange}"
+
+        if "." in raw:
+            base, suffix = raw.rsplit(".", 1)
+            if base.isdigit() and suffix in {"SH", "SS", "SZ", "BJ"}:
+                exchange = "SH" if suffix == "SS" else suffix
+                return f"{base}.{exchange}"
+
+        return raw
 
     @staticmethod
     def _normalize_symbol(symbol: str) -> str:
@@ -1339,15 +1437,8 @@ class PortfolioService:
             explicit_code = None
 
         if normalized.isdigit():
-            if len(normalized) == 6:
-                exchanges = [explicit_exchange] if explicit_exchange else ["SH", "SZ", "BJ"]
-                for exchange in exchanges:
-                    if exchange is None:
-                        continue
-                    _add(f"{exchange}{normalized}")
-                    _add(f"{normalized}.{'SS' if exchange == 'SH' else exchange}")
-                    if exchange == "SH":
-                        _add(f"{normalized}.SH")
+            # A bare numeric code is exact-only. Inferring SH/SZ/BJ here can join
+            # records from different exchanges that happen to share the same code.
             return values
 
         if explicit_exchange is not None and explicit_code is not None and explicit_code.isdigit():

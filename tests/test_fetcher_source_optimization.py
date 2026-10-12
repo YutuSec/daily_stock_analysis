@@ -66,7 +66,7 @@ def _make_daily_df() -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
-                "date": "2026-05-01",
+                "date": "2026-05-08",
                 "open": 100.0,
                 "high": 102.0,
                 "low": 99.0,

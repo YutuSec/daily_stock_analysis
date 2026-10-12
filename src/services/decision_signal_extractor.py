@@ -9,13 +9,20 @@ from typing import Any, Dict, Literal, Mapping, Optional
 
 from data_provider.base import normalize_stock_code
 
-from src.analyzer import AnalysisResult
+from src.analyzer import (
+    ANALYSIS_REPORT_TOOL_SCHEMA_VERSION,
+    AnalysisResult,
+    buy_contract_missing_fields,
+)
 from src.core.trading_calendar import get_market_for_stock
-from src.schemas.decision_action import build_action_fields, normalize_decision_action
+from src.schemas.decision_action import (
+    build_action_fields,
+    normalize_decision_action,
+    normalize_holding_state,
+    resolve_position_aware_action_fields,
+)
 from src.schemas.decision_scale import (
     CANONICAL_DECISION_SCALE_VERSION,
-    action_for_score,
-    score_action_conflicts_without_guardrail,
     score_band_metadata,
 )
 from src.services.decision_signal_service import DecisionSignalService
@@ -38,6 +45,14 @@ _CONFIDENCE_MAP = {
     "低": 0.4,
     "low": 0.4,
 }
+
+_STYLE_DEFAULT_HORIZONS = {
+    "short_swing": "10d",
+    "position": "swing",
+    "trend": "long",
+}
+_VALID_HORIZONS = frozenset({"intraday", "1d", "3d", "5d", "10d", "swing", "long"})
+_VALID_ENTRY_MODES = frozenset({"none", "conditional", "immediate"})
 
 
 def build_decision_signal_payload_from_report(
@@ -66,7 +81,7 @@ def build_decision_signal_payload_from_report(
     )
     raw_action = _raw_action_from_report(result)
     guardrail_reason = _extract_guardrail_reason(result, dashboard, score=score, raw_action=raw_action)
-    action_fields = build_action_fields(
+    base_action_fields = build_action_fields(
         operation_advice=getattr(result, "operation_advice", None),
         explicit_action=getattr(result, "action", None),
         report_type=report_type,
@@ -75,9 +90,94 @@ def build_decision_signal_payload_from_report(
         guardrail_reason=guardrail_reason,
         align_with_score=True,
     )
+    holding_state = _extract_holding_state(portfolio_context)
+    if holding_state == "unknown":
+        holding_state = normalize_holding_state(getattr(result, "holding_state", None))
+    action_fields = resolve_position_aware_action_fields(
+        holding_state=holding_state,
+        position_actions=getattr(result, "position_actions", None),
+        fallback_action=base_action_fields.get("action"),
+        report_language=getattr(result, "report_language", None),
+    )
     action = action_fields.get("action")
     if not action:
         return None
+
+    entry_mode = _extract_entry_mode(dashboard)
+    native_tool_report = (
+        getattr(result, "report_schema_version", None) == ANALYSIS_REPORT_TOOL_SCHEMA_VERSION
+    )
+    raw_report_action = normalize_decision_action(getattr(result, "action", None))
+    if native_tool_report:
+        if entry_mode in {"conditional", "immediate"} and raw_report_action not in {"buy", "add"}:
+            logger.warning(
+                "Skip contradictory entry-mode signal stock_code=%s raw_action=%s entry_mode=%s",
+                getattr(result, "code", ""),
+                raw_report_action,
+                entry_mode,
+            )
+            return None
+        if entry_mode == "none":
+            if raw_report_action in {"buy", "add"}:
+                logger.warning(
+                    "Skip contradictory entry-mode signal stock_code=%s raw_action=%s entry_mode=none",
+                    getattr(result, "code", ""),
+                    raw_report_action,
+                )
+                return None
+        if action in {"buy", "add"} and raw_report_action not in {"buy", "add"}:
+            if raw_report_action:
+                logger.warning(
+                    "Preserve native report action instead of score-manufactured buy/add stock_code=%s raw_action=%s final_action=%s entry_mode=%s",
+                    getattr(result, "code", ""),
+                    raw_report_action,
+                    action,
+                    entry_mode,
+                )
+                native_action_fields = build_action_fields(
+                    operation_advice=getattr(result, "operation_advice", None),
+                    explicit_action=raw_report_action,
+                    report_type=report_type,
+                    report_language=getattr(result, "report_language", None),
+                    sentiment_score=score,
+                    guardrail_reason=guardrail_reason,
+                    align_with_score=False,
+                )
+                action_fields = {**action_fields, **native_action_fields}
+                action_fields.setdefault("resolution_source", "explicit_action")
+                action = action_fields.get("action")
+                if not action:
+                    return None
+            else:
+                logger.warning(
+                    "Skip manufactured buy/add signal stock_code=%s raw_action=%s final_action=%s entry_mode=%s",
+                    getattr(result, "code", ""),
+                    raw_report_action,
+                    action,
+                    entry_mode,
+                )
+                return None
+
+        # A score band or holding-state resolver may refine a neutral report,
+        # but it must never manufacture an executable buy/add signal. New
+        # native-tool reports therefore need the same bounded entry, exit, stop
+        # and phase contract enforced by the analyzer before they can reach
+        # paper trading.
+        if action in {"buy", "add"}:
+            if entry_mode == "none":
+                logger.warning(
+                    "Skip contradictory buy/add signal stock_code=%s entry_mode=none",
+                    getattr(result, "code", ""),
+                )
+                return None
+            missing_buy_fields = buy_contract_missing_fields(result)
+            if missing_buy_fields:
+                logger.warning(
+                    "Skip non-executable buy/add signal stock_code=%s missing=%s",
+                    getattr(result, "code", ""),
+                    missing_buy_fields,
+                )
+                return None
 
     raw_code = str(getattr(result, "code", "") or "").strip()
     market = get_market_for_stock(normalize_stock_code(raw_code))
@@ -114,6 +214,8 @@ def build_decision_signal_payload_from_report(
         "decision_signal_metadata_version": "decision-signal-metadata-v1",
         "canonical_decision_scale_version": CANONICAL_DECISION_SCALE_VERSION,
     }
+    if entry_mode:
+        metadata["entry_mode"] = entry_mode
     score_metadata = score_band_metadata(score)
     if score_metadata:
         metadata["score_scale"] = score_metadata
@@ -130,7 +232,13 @@ def build_decision_signal_payload_from_report(
         metadata["final_action"] = action
         if raw_action:
             metadata["raw_action"] = raw_action
-        if raw_action and raw_action != action:
+        base_action = action_fields.get("base_action")
+        if base_action:
+            metadata["base_action"] = base_action
+        metadata["effective_action_source"] = action_fields["resolution_source"]
+        if base_action and base_action != action:
+            metadata["action_adjustment_reason"] = "holding_state_resolution"
+        elif raw_action and raw_action != action:
             metadata["action_adjustment_reason"] = "canonical_score_alignment"
     if guardrail_reason:
         metadata["guardrail_reason"] = guardrail_reason
@@ -140,7 +248,18 @@ def build_decision_signal_payload_from_report(
     market_structure_summary = _extract_market_structure_summary(context_snapshot, result)
     if market_structure_summary:
         metadata.update(market_structure_summary)
-    metadata["holding_state"] = _extract_holding_state(portfolio_context)
+    paper_style_metadata = _extract_paper_trading_style_metadata(context_snapshot)
+    if paper_style_metadata:
+        metadata.update(paper_style_metadata)
+    metadata["holding_state"] = holding_state
+    position_actions = _position_actions_snapshot(getattr(result, "position_actions", None))
+    if position_actions:
+        metadata["position_actions"] = position_actions
+
+    horizon, horizon_source = _extract_strategy_horizon(result, paper_style_metadata)
+    if horizon_source:
+        metadata["horizon_source"] = horizon_source
+        metadata["paper_trading_horizon_source"] = horizon_source
 
     payload: Dict[str, Any] = {
         "stock_code": raw_code,
@@ -151,6 +270,11 @@ def build_decision_signal_payload_from_report(
         "trace_id": trace_id,
         "decision_profile": "balanced",
         "market_phase": _extract_market_phase(context_snapshot, result),
+        # Market phase describes when the report was produced; it is not the
+        # intended holding period.  When a paper-trading style is frozen into
+        # the report context, use its strategy horizon instead of allowing the
+        # signal service to default every intraday report to an intraday trade.
+        "horizon": horizon,
         "trigger_source": str(query_source or "").strip() or "system",
         "action": action,
         "action_label": action_fields.get("action_label"),
@@ -204,7 +328,8 @@ def extract_and_persist_from_analysis_result(
         if payload is None:
             return None
         writer = service or DecisionSignalService()
-        return writer.create_signal(payload)
+        persisted = writer.create_signal(payload)
+        return persisted
     except Exception as exc:
         logger.warning(
             "Decision signal extraction failed: query_id=%s stock_code=%s error=%s",
@@ -260,38 +385,38 @@ def _score_from_result(value: Any) -> Optional[int]:
     return score if 0 <= score <= 100 else None
 
 
+def _position_actions_snapshot(value: Any) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return {}
+    snapshot: Dict[str, Dict[str, Any]] = {}
+    for key in ("empty", "holding"):
+        raw = value.get(key)
+        if not isinstance(raw, Mapping):
+            continue
+        action = normalize_decision_action(raw.get("action"))
+        if not action:
+            continue
+        item: Dict[str, Any] = {"action": action}
+        for field in ("reason", "summary", "conditions", "confidence"):
+            if raw.get(field) not in (None, "", [], {}):
+                item[field] = raw.get(field)
+        if key == "holding":
+            for field in ("stop_loss", "target_price"):
+                try:
+                    price = float(raw.get(field))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(price) and price > 0:
+                    item[field] = price
+        snapshot[key] = item
+    return snapshot
+
+
 def _raw_action_from_report(result: AnalysisResult) -> Optional[str]:
     explicit_action = normalize_decision_action(getattr(result, "action", None))
     if explicit_action:
         return explicit_action
     return normalize_decision_action(getattr(result, "operation_advice", None))
-
-
-_NEUTRAL_GUARDRAIL_HINTS = (
-    "等待",
-    "待",
-    "需要确认",
-    "回踩",
-    "支撑",
-    "压力",
-    "风险",
-    "资金",
-    "突破",
-    "不追",
-    "不宜",
-    "缺少",
-    "缺少确认",
-    "未确认",
-    "wait",
-    "waiting",
-    "pending confirmation",
-    "lack confirmation",
-    "pullback",
-    "support",
-    "resistance",
-    "risk",
-    "flow",
-)
 
 
 def _extract_guardrail_reason(
@@ -301,33 +426,14 @@ def _extract_guardrail_reason(
     score: Optional[int],
     raw_action: Optional[str],
 ) -> Optional[str]:
-    score_calibration = _as_mapping(dashboard.get("decision_score_calibration"))
-    reason = _first_text(
-        score_calibration.get("guardrail_reason"),
-        _as_mapping(dashboard.get("decision_stability")).get("reason"),
-        getattr(result, "guardrail_reason", None),
-    )
-    if reason:
-        return reason
-
-    if score_action_conflicts_without_guardrail(score=score, action=raw_action):
-        candidates = [getattr(result, "operation_advice", None)]
-        if action_for_score(score) == "buy":
-            candidates.extend(
-                [
-                    getattr(result, "analysis_summary", None),
-                    getattr(result, "buy_reason", None),
-                    _watch_conditions(dashboard),
-                ]
-            )
-        for candidate in candidates:
-            text = _first_text(candidate)
-            if not text:
-                continue
-            normalized = text.lower()
-            if any(hint in normalized for hint in _NEUTRAL_GUARDRAIL_HINTS):
-                return text
-    return None
+    guardrail = _as_mapping(getattr(result, "guardrail", None))
+    if not guardrail:
+        guardrail = _as_mapping(dashboard.get("decision_guardrail"))
+    if guardrail.get("applied") is not True:
+        return None
+    if not str(guardrail.get("reason_code") or "").strip():
+        return None
+    return _first_text(guardrail.get("reason"))
 
 
 def _confidence_from_level(value: Any) -> Optional[float]:
@@ -416,6 +522,74 @@ def _extract_data_quality(context_snapshot: Optional[Mapping[str, Any]], result:
     return _as_mapping(getattr(result, "analysis_context_pack_overview", None)).get("data_quality")
 
 
+def _extract_paper_trading_style_metadata(
+    context_snapshot: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    snapshot = _as_mapping(context_snapshot)
+    enhanced = _as_mapping(snapshot.get("enhanced_context"))
+    style_context = _as_mapping(snapshot.get("paper_trading_style_context")) or _as_mapping(
+        enhanced.get("paper_trading_style_context")
+    )
+    indicators = _as_mapping(snapshot.get("paper_trading_style_indicators")) or _as_mapping(
+        enhanced.get("paper_trading_style_indicators")
+    )
+    if not style_context:
+        return {}
+    settings = _as_mapping(style_context.get("settings"))
+    evidence = {
+        "source": "analysis_context_snapshot",
+        "style_context": style_context,
+        "indicator_snapshot": indicators,
+        "trading_style": style_context.get("trading_style"),
+        "policy_version": style_context.get("policy_version"),
+        "settings": settings,
+        "bars_observed": indicators.get("bars_observed"),
+        "analysis_window_sessions": settings.get("analysis_window_sessions"),
+        "history_sufficient": bool(indicators.get("history_sufficient")),
+        "frozen_at_source_report_save": True,
+    }
+    return {
+        "paper_trading_style_context": style_context,
+        "paper_trading_style_indicators": indicators,
+        "paper_trading_style": style_context.get("trading_style"),
+        "paper_trading_style_policy_version": style_context.get("policy_version"),
+        "paper_trading_style_settings": settings,
+        "paper_trading_style_evidence": evidence,
+    }
+
+
+def _extract_strategy_horizon(
+    result: AnalysisResult,
+    paper_style_metadata: Mapping[str, Any],
+) -> tuple[Optional[str], Optional[str]]:
+    """Return an explicit report horizon or the frozen style's default plus provenance.
+
+    The fallback intentionally returns ``None`` when no style context exists,
+    preserving the legacy market-phase default in ``DecisionSignalService``.
+    """
+
+    dashboard = _as_mapping(getattr(result, "dashboard", None))
+    phase_decision = _as_mapping(dashboard.get("phase_decision"))
+    battle_plan = _as_mapping(dashboard.get("battle_plan"))
+    for candidate in (
+        getattr(result, "horizon", None),
+        getattr(result, "holding_period", None),
+        phase_decision.get("horizon"),
+        battle_plan.get("horizon"),
+    ):
+        normalized = str(candidate or "").strip().lower()
+        if normalized in _VALID_HORIZONS:
+            return normalized, "explicit_report_horizon"
+
+    settings = _as_mapping(paper_style_metadata.get("paper_trading_style_settings"))
+    configured = str(settings.get("default_signal_horizon") or "").strip().lower()
+    if configured in _VALID_HORIZONS:
+        return configured, "paper_trading_style_default"
+    style = str(paper_style_metadata.get("paper_trading_style") or "").strip().lower()
+    fallback = _STYLE_DEFAULT_HORIZONS.get(style)
+    return (fallback, "paper_trading_style_default") if fallback else (None, None)
+
+
 def _extract_holding_state(portfolio_context: Optional[Mapping[str, Any]]) -> str:
     context = _as_mapping(portfolio_context)
     quantity = context.get("quantity")
@@ -461,6 +635,12 @@ def _watch_conditions(dashboard: Mapping[str, Any]) -> Optional[Any]:
     if isinstance(checklist, list) and checklist:
         return [str(item) for item in checklist if str(item or "").strip()] or None
     return None
+
+
+def _extract_entry_mode(dashboard: Mapping[str, Any]) -> Optional[str]:
+    phase_decision = _as_mapping(dashboard.get("phase_decision"))
+    mode = str(phase_decision.get("entry_mode") or "").strip().lower()
+    return mode if mode in _VALID_ENTRY_MODES else None
 
 
 def _evidence(result: AnalysisResult, sniper_points: Mapping[str, Any]) -> Dict[str, Any]:

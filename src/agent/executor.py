@@ -129,7 +129,7 @@ LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mar
             "sentiment_summary": ""
         }},
         "battle_plan": {{
-            "sniper_points": {{"ideal_buy": "", "secondary_buy": "", "stop_loss": "", "take_profit": ""}},
+            "sniper_points": {{"ideal_buy": "", "secondary_buy": "", "stop_loss": "", "take_profit": "", "first_take_profit": "", "final_target": "", "entry_leg_schema_version": "entry-legs-v1（可选，仅明确分批时填写）", "entry_legs": [], "exit_leg_schema_version": "exit-legs-v1（可选，仅明确分批止盈时填写）", "exit_legs": [{{"leg_id": "tp1", "role": "partial_take_profit", "sequence": 1, "allocation_fraction": 0.5, "target_price": 0}}, {{"leg_id": "tp2", "role": "final_take_profit", "sequence": 2, "allocation_fraction": 0.5, "target_price": 0}}]}},
             "position_strategy": {{"suggested_position": "", "entry_plan": "", "risk_control": ""}},
             "action_checklist": []
         }},
@@ -212,6 +212,9 @@ LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mar
 - 股价位于支撑与压力之间、资金流不明确时，优先输出“持有/震荡/观望/洗盘观察”等可执行的中性建议；`decision_type` 仍保持 `hold`。
 - 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
 - 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
+- 入场价、止损价、`take_profit` 和可选 `exit_legs` 必须属于同一交易周期；`take_profit` 必须表示最终目标，不得把第一止盈位写成完整目标。
+- 若第一目标只是短线触达位而最终目标更远，必须填写 `first_take_profit`、`final_target` 和 `exit_legs`；`exit_legs.allocation_fraction` 合计必须等于 1.0，目标价必须严格递增。
+- 若按入场中位价计算，完整止盈或分批止盈加权后的收益相对止损风险无法达到系统最低盈亏比，必须输出 `watch/avoid` 或明确等待更优入场/更远目标确认，不得为了通过校验编造价格。
 - 必须输出 `dashboard.phase_decision` 七字段；盘中/午休/临近收盘要给出当前动作、观察条件和下一次检查点。
 - 建议输出可选展示字段 `dashboard.signal_attribution` 六字段；解释推荐理由的构成，包括技术指标、新闻舆情、基本面、市场环境的贡献度，以及最强看多/看空信号。
 - 盘前、非交易日或未知阶段不得伪造今日盘中走势；quote/daily_bars/technical 存在 stale、fallback、missing、fetch_failed、partial 或 estimated 时，`confidence_level` 不得为高。
@@ -288,7 +291,7 @@ AGENT_SYSTEM_PROMPT = """你是一位{market_role}投资分析 Agent，拥有数
             "sentiment_summary": ""
         }},
         "battle_plan": {{
-            "sniper_points": {{"ideal_buy": "", "secondary_buy": "", "stop_loss": "", "take_profit": ""}},
+            "sniper_points": {{"ideal_buy": "", "secondary_buy": "", "stop_loss": "", "take_profit": "", "first_take_profit": "", "final_target": "", "entry_leg_schema_version": "entry-legs-v1（可选，仅明确分批时填写）", "entry_legs": [], "exit_leg_schema_version": "exit-legs-v1（可选，仅明确分批止盈时填写）", "exit_legs": [{{"leg_id": "tp1", "role": "partial_take_profit", "sequence": 1, "allocation_fraction": 0.5, "target_price": 0}}, {{"leg_id": "tp2", "role": "final_take_profit", "sequence": 2, "allocation_fraction": 0.5, "target_price": 0}}]}},
             "position_strategy": {{"suggested_position": "", "entry_plan": "", "risk_control": ""}},
             "action_checklist": []
         }},
@@ -368,6 +371,9 @@ AGENT_SYSTEM_PROMPT = """你是一位{market_role}投资分析 Agent，拥有数
 - 股价位于支撑与压力之间、资金流不明确时，优先输出“持有/震荡/观望/洗盘观察”等可执行的中性建议；`decision_type` 仍保持 `hold`。
 - 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
 - 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
+- 入场价、止损价、`take_profit` 和可选 `exit_legs` 必须属于同一交易周期；`take_profit` 必须表示最终目标，不得把第一止盈位写成完整目标。
+- 若第一目标只是短线触达位而最终目标更远，必须填写 `first_take_profit`、`final_target` 和 `exit_legs`；`exit_legs.allocation_fraction` 合计必须等于 1.0，目标价必须严格递增。
+- 若按入场中位价计算，完整止盈或分批止盈加权后的收益相对止损风险无法达到系统最低盈亏比，必须输出 `watch/avoid` 或明确等待更优入场/更远目标确认，不得为了通过校验编造价格。
 - 必须输出 `dashboard.phase_decision` 七字段；盘中/午休/临近收盘要给出当前动作、观察条件和下一次检查点。
 - 建议输出可选展示字段 `dashboard.signal_attribution` 六字段；解释推荐理由的构成，包括技术指标、新闻舆情、基本面、市场环境的贡献度，以及最强看多/看空信号。
 - 盘前、非交易日或未知阶段不得伪造今日盘中走势；quote/daily_bars/technical 存在 stale、fallback、missing、fetch_failed、partial 或 estimated 时，`confidence_level` 不得为高。
@@ -485,6 +491,43 @@ def _build_language_section(report_language: str, *, chat_mode: bool = False) ->
 - `decision_type` 必须保持为 `buy|hold|sell`。
 - 所有面向用户的人类可读文本值必须使用中文。
 """
+
+
+def _format_strategy_continuity_context(
+    portfolio_context: Any,
+    *,
+    report_language: str,
+) -> str:
+    """Render model-scoped paper strategy state as explicit read-only evidence."""
+
+    if not isinstance(portfolio_context, dict):
+        return ""
+    thesis = portfolio_context.get("strategy_thesis")
+    pending = portfolio_context.get("strategy_pending_transition")
+    if not isinstance(thesis, dict) and not isinstance(pending, dict):
+        return ""
+    payload = {
+        "source_model": portfolio_context.get("source_model"),
+        "market": portfolio_context.get("market"),
+        "stock_code": portfolio_context.get("stock_code"),
+        "holding_state": portfolio_context.get("holding_state"),
+        "quantity": portfolio_context.get("quantity"),
+        "strategy_thesis": thesis if isinstance(thesis, dict) else None,
+        "strategy_pending_transition": pending if isinstance(pending, dict) else None,
+    }
+    body = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if normalize_report_language(report_language) == "en":
+        return (
+            "\n[Read-only paper strategy continuity context]\n"
+            f"{body}\n"
+            "Treat the latest report as new evidence, not automatic execution authority. "
+            "Judge current evidence independently; do not repeat a conclusion merely to satisfy confirmation counts."
+        )
+    return (
+        "\n[只读模拟策略连续性上下文]\n"
+        f"{body}\n"
+        "最新报告只是新证据，不自动取得执行权。请独立判断当前证据，不要为了凑足确认次数而重复结论。"
+    )
 
 
 # ============================================================
@@ -649,6 +692,12 @@ class AgentExecutor:
             )
             if market_structure_section:
                 context_parts.append(market_structure_section.strip())
+            strategy_continuity_section = _format_strategy_continuity_context(
+                context.get("portfolio_context"),
+                report_language=report_language,
+            )
+            if strategy_continuity_section:
+                context_parts.append(strategy_continuity_section.strip())
             if context_parts:
                 context_msg = "[系统提供的历史分析上下文，可供参考对比]\n" + "\n".join(context_parts)
                 messages.append({"role": "user", "content": context_msg})
@@ -854,6 +903,22 @@ class AgentExecutor:
             analysis_context_pack_summary = context.get("analysis_context_pack_summary")
             if isinstance(analysis_context_pack_summary, str) and analysis_context_pack_summary:
                 parts.append(analysis_context_pack_summary)
+
+            strategy_continuity_section = _format_strategy_continuity_context(
+                context.get("portfolio_context"),
+                report_language=report_language,
+            )
+            if strategy_continuity_section:
+                parts.append(strategy_continuity_section)
+
+            selection_context = context.get("selection_context")
+            if isinstance(selection_context, dict):
+                parts.append(
+                    "\n[机会池入选证据：只读，不代表买入指令]\n"
+                    + json.dumps(selection_context, ensure_ascii=False, sort_keys=True, default=str)
+                    + "\n请独立验证候选理由；若个股、市场或风险收益不支持，必须输出 watch/avoid，"
+                    "不得为了迎合机会池而输出 buy/add。"
+                )
 
             # Inject pre-fetched context data to avoid redundant fetches
             if context.get("realtime_quote"):

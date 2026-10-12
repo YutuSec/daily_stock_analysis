@@ -68,6 +68,7 @@ def run_backtest(
             analysis_date_from=request.analysis_date_from,
             analysis_date_to=request.analysis_date_to,
             limit=request.limit,
+            model_used=request.model_used,
         )
         return BacktestRunResponse(**stats)
     except ValueError as exc:
@@ -98,6 +99,7 @@ def run_backtest(
 )
 def get_backtest_results(
     code: Optional[str] = Query(None, description="股票代码筛选"),
+    model_used: Optional[str] = Query(None, max_length=255, description="LLM 模型筛选（精确匹配）"),
     eval_window_days: Optional[int] = Query(None, ge=1, le=120, description="评估窗口过滤"),
     analysis_date_from: Optional[date] = Query(None, description="分析日期起始（含）"),
     analysis_date_to: Optional[date] = Query(None, description="分析日期结束（含）"),
@@ -117,6 +119,7 @@ def get_backtest_results(
             analysis_date_from=analysis_date_from,
             analysis_date_to=analysis_date_to,
             analysis_phase=analysis_phase,
+            model_used=model_used,
         )
         items = [BacktestResultItem(**item) for item in data.get("items", [])]
         return BacktestResultsResponse(
@@ -153,6 +156,7 @@ def get_backtest_results(
 )
 def get_overall_performance(
     eval_window_days: Optional[int] = Query(None, ge=1, le=120, description="评估窗口过滤"),
+    model_used: Optional[str] = Query(None, max_length=255, description="LLM 模型筛选（精确匹配）"),
     analysis_date_from: Optional[date] = Query(None, description="分析日期起始（含）"),
     analysis_date_to: Optional[date] = Query(None, description="分析日期结束（含）"),
     analysis_phase: Optional[BacktestAnalysisPhaseQuery] = Query(None, description="分析阶段过滤：premarket/intraday/postmarket/unknown"),
@@ -168,6 +172,7 @@ def get_overall_performance(
             analysis_date_from=analysis_date_from,
             analysis_date_to=analysis_date_to,
             analysis_phase=analysis_phase,
+            model_used=model_used,
         )
         if summary is None:
             raise HTTPException(
@@ -204,6 +209,7 @@ def get_overall_performance(
 def get_stock_performance(
     code: str,
     eval_window_days: Optional[int] = Query(None, ge=1, le=120, description="评估窗口过滤"),
+    model_used: Optional[str] = Query(None, max_length=255, description="LLM 模型筛选（精确匹配）"),
     analysis_date_from: Optional[date] = Query(None, description="分析日期起始（含）"),
     analysis_date_to: Optional[date] = Query(None, description="分析日期结束（含）"),
     analysis_phase: Optional[BacktestAnalysisPhaseQuery] = Query(None, description="分析阶段过滤：premarket/intraday/postmarket/unknown"),
@@ -219,6 +225,7 @@ def get_stock_performance(
             analysis_date_from=analysis_date_from,
             analysis_date_to=analysis_date_to,
             analysis_phase=analysis_phase,
+            model_used=model_used,
         )
         if summary is None:
             raise HTTPException(

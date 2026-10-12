@@ -40,6 +40,11 @@ class BacktestResultLike(Protocol):
     first_hit: Optional[str]
     first_hit_trading_days: Optional[int]
     operation_advice: Optional[str]
+    holding_action_applicable: bool
+    holding_action_evaluable: bool
+    holding_decision_correct: Optional[bool]
+    holding_outcome: Optional[str]
+    holding_decision_return_pct: Optional[float]
 
 
 @dataclass(frozen=True)
@@ -87,6 +92,9 @@ class BacktestEngine:
         "等待",
         "wait",
     )
+    _LONG_ACTIONS = {"buy", "add", "hold"}
+    _CASH_ACTIONS = {"reduce", "sell", "avoid"}
+    _WAIT_ACTIONS = {"watch", "alert"}
 
     # Negation prefixes (trailing spaces stripped for suffix-matching against prefix text).
     # English patterns include trailing space in their canonical form; rstrip is
@@ -155,6 +163,30 @@ class BacktestEngine:
         return "cash"
 
     @classmethod
+    def direction_for_action(cls, action: Optional[str]) -> Optional[str]:
+        """Map the persisted final action to the direction metric contract."""
+
+        normalized = cls._normalize_text(action)
+        if normalized in {"buy", "add"}:
+            return "up"
+        if normalized == "hold":
+            return "not_down"
+        if normalized in cls._CASH_ACTIONS:
+            return "down"
+        if normalized in cls._WAIT_ACTIONS:
+            return "flat"
+        return None
+
+    @classmethod
+    def position_for_action(cls, action: Optional[str]) -> Optional[str]:
+        normalized = cls._normalize_text(action)
+        if normalized in cls._LONG_ACTIONS:
+            return "long"
+        if normalized in cls._CASH_ACTIONS or normalized in cls._WAIT_ACTIONS:
+            return "cash"
+        return None
+
+    @classmethod
     def evaluate_single(
         cls,
         *,
@@ -165,6 +197,7 @@ class BacktestEngine:
         stop_loss: Optional[float],
         take_profit: Optional[float],
         config: EvaluationConfig,
+        action: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Evaluate one historical analysis against forward daily bars.
 
@@ -174,12 +207,15 @@ class BacktestEngine:
           first_hit="ambiguous" and assume stop-loss first for simulated exit.
         """
 
+        resolved_position = cls.position_for_action(action) or cls.infer_position_recommendation(operation_advice)
+        resolved_direction = cls.direction_for_action(action) or cls.infer_direction_expected(operation_advice)
+
         if start_price is None or start_price <= 0:
             return {
                 "analysis_date": analysis_date,
                 "operation_advice": operation_advice,
-                "position_recommendation": cls.infer_position_recommendation(operation_advice),
-                "direction_expected": cls.infer_direction_expected(operation_advice),
+                "position_recommendation": resolved_position,
+                "direction_expected": resolved_direction,
                 "eval_status": "error",
             }
 
@@ -191,8 +227,8 @@ class BacktestEngine:
             return {
                 "analysis_date": analysis_date,
                 "operation_advice": operation_advice,
-                "position_recommendation": cls.infer_position_recommendation(operation_advice),
-                "direction_expected": cls.infer_direction_expected(operation_advice),
+                "position_recommendation": resolved_position,
+                "direction_expected": resolved_direction,
                 "eval_status": "insufficient_data",
                 "eval_window_days": eval_days,
             }
@@ -210,8 +246,8 @@ class BacktestEngine:
         else:
             stock_return_pct = (end_close - start_price) / start_price * 100
 
-        direction_expected = cls.infer_direction_expected(operation_advice)
-        position = cls.infer_position_recommendation(operation_advice)
+        direction_expected = resolved_direction
+        position = resolved_position
 
         outcome, direction_correct = cls._classify_outcome(
             stock_return_pct=stock_return_pct,
@@ -271,6 +307,77 @@ class BacktestEngine:
             "simulated_exit_reason": simulated_exit_reason,
             "simulated_return_pct": simulated_return_pct,
         }
+
+    @classmethod
+    def evaluate_holding_decision(
+        cls,
+        *,
+        holding_state: Optional[str],
+        holding_action: Optional[str],
+        stock_return_pct: Optional[float],
+        eval_status: str,
+        neutral_band_pct: float,
+    ) -> Dict[str, Any]:
+        """Evaluate an action frozen when a holding report was generated.
+
+        ``watch`` and ``alert`` do not specify whether an existing exposure
+        should be kept or reduced, so they are deliberately unavailable.
+        """
+
+        state = cls._normalize_text(holding_state) or "unknown"
+        action = cls._normalize_text(holding_action)
+        direction = (
+            "up"
+            if action in {"buy", "add"}
+            else "not_down"
+            if action == "hold"
+            else "down"
+            if action in cls._CASH_ACTIONS
+            else None
+        )
+        applicable = state == "holding" and direction is not None
+        base = {
+            "holding_state": state,
+            "holding_action": action or None,
+            "holding_action_applicable": applicable,
+            "holding_action_evaluable": False,
+            "holding_eval_status": "unavailable",
+            "holding_direction_expected": direction if applicable else None,
+            "holding_decision_correct": None,
+            "holding_outcome": None,
+            "holding_decision_return_pct": None,
+        }
+        if not applicable:
+            return base
+        if eval_status != "completed":
+            base["holding_eval_status"] = (
+                "insufficient_data" if eval_status == "insufficient_data" else "error"
+            )
+            return base
+        finite_return = cls._finite_optional_float(stock_return_pct)
+        if finite_return is None:
+            base["holding_eval_status"] = "unavailable"
+            return base
+
+        outcome, correct = cls._classify_outcome(
+            stock_return_pct=finite_return,
+            direction_expected=direction,
+            neutral_band_pct=neutral_band_pct,
+        )
+        base.update(
+            {
+                "holding_action_evaluable": True,
+                "holding_eval_status": "completed",
+                "holding_decision_correct": correct,
+                "holding_outcome": outcome,
+                # Returns are measured from the analysis-day close. Keeping
+                # exposure follows the stock; reducing/exiting stays in cash.
+                "holding_decision_return_pct": (
+                    finite_return if action in cls._LONG_ACTIONS else 0.0
+                ),
+            }
+        )
+        return base
 
     @classmethod
     def evaluate_decision_signal(
@@ -393,6 +500,31 @@ class BacktestEngine:
             round(direction_numerator / direction_denominator * 100, 2) if direction_denominator else None
         )
 
+        holding_applicable = [
+            r for r in results_list if bool(getattr(r, "holding_action_applicable", False))
+        ]
+        holding_evaluable = [
+            r for r in results_list if bool(getattr(r, "holding_action_evaluable", False))
+        ]
+        holding_correct_count = sum(
+            1 for r in holding_evaluable if getattr(r, "holding_decision_correct", None) is True
+        )
+        holding_incorrect_count = sum(
+            1 for r in holding_evaluable if getattr(r, "holding_decision_correct", None) is False
+        )
+        holding_neutral_count = sum(
+            1 for r in holding_evaluable if (getattr(r, "holding_outcome", None) or "") == "neutral"
+        )
+        holding_accuracy_denominator = holding_correct_count + holding_incorrect_count
+        holding_decision_accuracy_pct = (
+            round(holding_correct_count / holding_accuracy_denominator * 100, 2)
+            if holding_accuracy_denominator
+            else None
+        )
+        avg_holding_decision_return_pct = cls._average(
+            [getattr(r, "holding_decision_return_pct", None) for r in holding_evaluable]
+        )
+
         win_loss_denominator = win_count + loss_count
         win_rate_pct = round(win_count / win_loss_denominator * 100, 2) if win_loss_denominator else None
         neutral_rate_pct = round(neutral_count / len(completed) * 100, 2) if completed else None
@@ -466,6 +598,15 @@ class BacktestEngine:
             "loss_count": loss_count,
             "neutral_count": neutral_count,
             "direction_accuracy_pct": direction_accuracy_pct,
+            "direction_evaluable_count": direction_denominator,
+            "holding_applicable_count": len(holding_applicable),
+            "holding_evaluable_count": len(holding_evaluable),
+            "holding_unavailable_count": total - len(holding_applicable),
+            "holding_correct_count": holding_correct_count,
+            "holding_incorrect_count": holding_incorrect_count,
+            "holding_neutral_count": holding_neutral_count,
+            "holding_decision_accuracy_pct": holding_decision_accuracy_pct,
+            "avg_holding_decision_return_pct": avg_holding_decision_return_pct,
             "win_rate_pct": win_rate_pct,
             "neutral_rate_pct": neutral_rate_pct,
             "avg_stock_return_pct": avg_stock_return_pct,

@@ -6,7 +6,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class PortfolioAccountCreateRequest(BaseModel):
@@ -174,6 +174,27 @@ class PortfolioPositionAnalysisRequest(BaseModel):
     account_id: Optional[int] = Field(None, description="Optional account id; required when a symbol is held in multiple accounts")
     analysis_phase: Literal["auto", "premarket", "intraday", "postmarket"] = "auto"
     force: bool = Field(False, description="Force refresh analysis inputs without bypassing duplicate in-flight tasks")
+    model: Optional[str] = Field(
+        None,
+        max_length=255,
+        description="Lock this portfolio analysis to one configured model route",
+    )
+    models: Optional[List[str]] = Field(
+        None,
+        min_length=2,
+        max_length=50,
+        description="Run the same frozen portfolio context through multiple configured model routes",
+    )
+
+    @model_validator(mode="after")
+    def validate_model_selection(self):
+        if self.model and self.models:
+            raise ValueError("model 与 models 不能同时设置")
+        if self.models:
+            normalized = [str(item or "").strip() for item in self.models]
+            if any(not item for item in normalized) or len(set(normalized)) != len(normalized):
+                raise ValueError("models 必须包含至少两个不同的非空模型")
+        return self
 
 
 class PortfolioAccountSnapshot(BaseModel):

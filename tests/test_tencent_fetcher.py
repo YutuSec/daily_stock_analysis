@@ -6,14 +6,22 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 
-from data_provider.tencent_fetcher import TencentFetcher, _to_tencent_symbol
+from data_provider.base import DataFetchError, DataFetcherManager
+from data_provider.tencent_fetcher import TencentFetcher, _to_tencent_index_symbol, _to_tencent_symbol
 
 
 def test_tencent_symbol_conversion_supports_a_share_markets() -> None:
     assert _to_tencent_symbol("600519") == "sh600519"
     assert _to_tencent_symbol("000001") == "sz000001"
     assert _to_tencent_symbol("920748") == "bj920748"
+
+
+def test_tencent_index_symbol_requires_explicit_supported_index() -> None:
+    assert _to_tencent_index_symbol("000300.SH") == "sh000300"
+    assert _to_tencent_index_symbol("sh000300") == "sh000300"
+    assert _to_tencent_index_symbol("000300") == ""
 
 
 def test_tencent_fetcher_parses_qfq_daily_response() -> None:
@@ -67,6 +75,95 @@ def test_tencent_fetcher_parses_qfq_daily_response() -> None:
     assert float(df.iloc[0]["close"]) == 10.5
     assert float(df.iloc[0]["volume"]) == 1234500.0
     assert float(df.iloc[1]["amount"]) == 77890.0
+
+
+def test_tencent_fetcher_index_daily_uses_sh000300_and_filters_future_rows() -> None:
+    payload = {
+        "data": {
+            "sh000300": {
+                "qfqday": [
+                    ["2026-09-12", "3800.00", "3810.00", "3820.00", "3790.00", "1000", "10000"],
+                    ["2026-09-14", "3810.00", "3830.00", "3840.00", "3805.00", "2000", "20000"],
+                    ["2026-09-15", "3830.00", "3850.00", "3860.00", "3820.00", "3000", "30000"],
+                ]
+            }
+        }
+    }
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return payload
+
+    captured = {}
+
+    def fake_get(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return FakeResponse()
+
+    fetcher = TencentFetcher()
+    with patch("data_provider.tencent_fetcher.requests.get", fake_get):
+        df = fetcher.get_index_daily_data(
+            "000300.SH",
+            start_date="2025-09-19",
+            end_date="2026-09-14",
+            days=500,
+        )
+
+    assert captured["url"] == "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    assert captured["params"]["param"].startswith("sh000300,day,2025-09-19,2026-09-14,")
+    assert captured["params"]["param"].endswith(",qfq")
+    assert pd.Timestamp(df["date"].max()).strftime("%Y-%m-%d") == "2026-09-14"
+    assert len(df) == 2
+
+
+def test_data_fetcher_manager_index_daily_uses_dedicated_route() -> None:
+    payload = {
+        "data": {
+            "sh000300": {
+                "qfqday": [
+                    ["2026-09-14", "3810.00", "3830.00", "3840.00", "3805.00", "2000", "20000"],
+                ]
+            }
+        }
+    }
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return payload
+
+    captured = {}
+
+    def fake_get(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return FakeResponse()
+
+    manager = DataFetcherManager(fetchers=[TencentFetcher()])
+    with patch("data_provider.tencent_fetcher.requests.get", fake_get):
+        df, source = manager.get_index_daily_data(
+            "000300.SH",
+            start_date="2025-09-19",
+            end_date="2026-09-14",
+            days=500,
+        )
+
+    assert source == "TencentFetcher"
+    assert captured["params"]["param"].startswith("sh000300,day,2025-09-19,2026-09-14,")
+    assert pd.Timestamp(df["date"].max()).strftime("%Y-%m-%d") == "2026-09-14"
+
+
+def test_data_fetcher_manager_index_daily_rejects_bare_000300() -> None:
+    manager = DataFetcherManager(fetchers=[TencentFetcher()])
+
+    with pytest.raises(DataFetchError, match="unsupported CN index code"):
+        manager.get_index_daily_data("000300", start_date="2025-09-19", end_date="2026-09-14")
 
 
 def test_tencent_fetcher_requests_explicit_historical_date_window() -> None:

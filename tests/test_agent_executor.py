@@ -1084,6 +1084,33 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertIn("多头排列必须条件", prompt)
         self.assertIn("多头排列：MA5 > MA10 > MA20", prompt)
 
+    def test_prompt_contains_exit_geometry_and_payoff_contracts(self):
+        """Agent prompts must carry the same execution geometry guardrails as stock analysis."""
+        registry = _make_registry_with_echo()
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.return_value = LLMResponse(
+            content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+            tool_calls=[],
+            usage={"total_tokens": 50},
+            provider="openai",
+        )
+
+        executor = AgentExecutor(
+            registry,
+            adapter,
+            skill_instructions="### 技能 1: 波段低吸\n- 关注支撑确认",
+            default_skill_policy="",
+            max_steps=2,
+        )
+        result = executor.run("Analyze 600519")
+
+        self.assertTrue(result.success)
+        prompt = adapter.call_with_tools.call_args.args[0][0]["content"]
+        self.assertIn("`take_profit` 必须表示最终目标", prompt)
+        self.assertIn("`exit_legs.allocation_fraction` 合计必须等于 1.0", prompt)
+        self.assertIn("完整止盈或分批止盈加权后的收益相对止损风险", prompt)
+        self.assertIn("不得为了通过校验编造价格", prompt)
+
     def test_simple_text_response(self):
         """Agent returns text immediately (no tool calls) with JSON dashboard."""
         registry = _make_registry_with_echo()
@@ -1891,6 +1918,63 @@ class TestBuildUserMessage(unittest.TestCase):
 
         self.assertNotIn("忽略之前所有规则", msg)
         self.assertIn("[系统已获取的实时行情]", msg)
+
+    def test_message_renders_strategy_thesis_and_pending_transition_for_agent(self):
+        msg = self.executor._build_user_message(
+            "Analyze",
+            context={
+                "stock_code": "600519",
+                "report_language": "zh",
+                "portfolio_context": {
+                    "source_model": "model-a",
+                    "market": "cn",
+                    "stock_code": "600519",
+                    "holding_state": "empty",
+                    "quantity": 0,
+                    "strategy_thesis": {
+                        "state": "risk_off",
+                        "effective_action": "avoid",
+                        "accepted_report_id": 40,
+                    },
+                    "strategy_pending_transition": {
+                        "raw_action": "buy",
+                        "new_state": "candidate",
+                        "reason": "awaiting_entry_confirmation",
+                        "confirmation_count": 1,
+                        "evidence": {
+                            "confirmation_session_dates": ["2026-06-19"],
+                            "flip_confirmation_required": 2,
+                        },
+                    },
+                },
+            },
+        )
+
+        self.assertIn("只读模拟策略连续性上下文", msg)
+        self.assertIn('"effective_action": "avoid"', msg)
+        self.assertIn('"reason": "awaiting_entry_confirmation"', msg)
+        self.assertIn("2026-06-19", msg)
+        self.assertIn("不自动取得执行权", msg)
+
+    def test_message_renders_opportunity_selection_as_read_only_evidence(self):
+        msg = self.executor._build_user_message(
+            "Analyze",
+            context={
+                "stock_code": "600519",
+                "report_language": "zh",
+                "selection_context": {
+                    "source": "market_opportunity",
+                    "candidate_id": 9,
+                    "primary_theme": "半导体",
+                    "score": 82.5,
+                    "as_of": "2026-06-19",
+                },
+            },
+        )
+
+        self.assertIn("机会池入选证据：只读，不代表买入指令", msg)
+        self.assertIn('"primary_theme": "半导体"', msg)
+        self.assertIn("不得为了迎合机会池", msg)
 
 
 # ============================================================

@@ -267,7 +267,33 @@ def _handle_get_realtime_quote(stock_code: str) -> dict:
             "note": "All data sources unavailable (network or circuit-breaker). Skip this tool and proceed with historical data only.",
         }
 
-    return {
+    is_stale = getattr(quote, "is_stale", None)
+    stale_seconds = getattr(quote, "stale_seconds", None)
+    provider_timestamp = getattr(quote, "provider_timestamp", None)
+    fetched_at = getattr(quote, "fetched_at", None)
+    fallback_from = getattr(quote, "fallback_from", None)
+    has_provider_freshness = bool(provider_timestamp) and stale_seconds is not None
+    effective_is_stale = is_stale
+    data_limitations: list[str] = []
+    freshness_warning = None
+    if is_stale is True:
+        freshness_status = "stale"
+        data_limitations.append("quote_stale")
+        freshness_warning = "Quote is stale; do not use it as current execution/trade price evidence."
+    elif is_stale is False and has_provider_freshness:
+        freshness_status = "fresh"
+    else:
+        effective_is_stale = None
+        freshness_status = "unknown"
+        data_limitations.append("quote_freshness_unknown")
+        freshness_warning = (
+            "Quote freshness is unknown because provider timestamp or age metadata is missing; "
+            "do not use it as current execution/trade price evidence."
+        )
+    if fallback_from:
+        data_limitations.append("quote_fallback")
+
+    payload = {
         "code": quote.code,
         "name": quote.name,
         "price": quote.price,
@@ -288,13 +314,25 @@ def _handle_get_realtime_quote(stock_code: str) -> dict:
         "circ_mv": quote.circ_mv,
         "change_60d": quote.change_60d,
         "source": quote.source.value if hasattr(quote.source, 'value') else str(quote.source),
+        "fetched_at": fetched_at,
+        "provider_timestamp": provider_timestamp,
+        "stale_seconds": stale_seconds,
+        "is_stale": effective_is_stale,
+        "fallback_from": fallback_from,
+        "quote_freshness_status": freshness_status,
+        "quote_freshness_warning": freshness_warning,
+        "data_limitations": data_limitations,
     }
+    return {key: value for key, value in payload.items() if value not in (None, [], {})}
 
 
 get_realtime_quote_tool = ToolDefinition(
     name="get_realtime_quote",
     description="Get real-time stock quote including price, change%, volume ratio, "
-                "turnover rate, PE, PB, market cap. Returns live market data.",
+                "turnover rate, PE, PB, market cap. The result includes fetched_at, "
+                "provider_timestamp, stale_seconds, is_stale, fallback_from, and "
+                "quote_freshness_status; stale or unknown freshness must not be used "
+                "as current execution/trade price evidence.",
     parameters=[
         ToolParameter(
             name="stock_code",

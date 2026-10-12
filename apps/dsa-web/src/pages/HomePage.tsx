@@ -29,6 +29,7 @@ import type { SetupStatusResponse } from '../types/systemConfig';
 import { normalizeReportLanguage } from '../utils/reportLanguage';
 import type {
   AnalyzeAsyncResponse,
+  AnalysisModelInfo,
   HistoryItem,
   MarketReviewPayload,
   StockBarItem,
@@ -131,6 +132,15 @@ function toStockBarItemFromHistoryItem(item: HistoryItem): StockBarItem {
     operationAdvice: item.operationAdvice,
     action: item.action ?? null,
     actionLabel: item.actionLabel ?? null,
+    analysisStatus:
+      item.analysisStatus === 'failed'
+        ? 'failed'
+        : item.analysisStatus === 'degraded'
+          ? 'degraded'
+          : 'completed',
+    latestAttemptTime: item.createdAt,
+    latestAttemptError: item.errorMessage ?? null,
+    lastSuccessTime: ['failed', 'degraded'].includes(item.analysisStatus || '') ? null : item.createdAt,
     analysisCount: 0,
     lastAnalysisTime: item.createdAt,
     modelUsed: item.modelUsed,
@@ -138,7 +148,7 @@ function toStockBarItemFromHistoryItem(item: HistoryItem): StockBarItem {
   };
 }
 
-async function getTodayAnalysisItems(dateKey: string): Promise<StockBarItem[]> {
+async function getTodayAnalysisItems(dateKey: string, modelUsed?: string): Promise<StockBarItem[]> {
   const items: StockBarItem[] = [];
   let loadedRecordCount = 0;
   let page = 1;
@@ -149,6 +159,7 @@ async function getTodayAnalysisItems(dateKey: string): Promise<StockBarItem[]> {
       // adjacent dates too, then apply the exact Shanghai-day filter below.
       startDate: shiftDateKey(dateKey, -1),
       endDate: shiftDateKey(dateKey, 1),
+      modelUsed,
       page,
       limit: TODAY_ANALYSIS_PAGE_SIZE,
     });
@@ -186,6 +197,9 @@ const HomePage: React.FC = () => {
   const [marketReviewReport, setMarketReviewReport] = useState<string | null>(null);
   const [marketReviewPayload, setMarketReviewPayload] = useState<MarketReviewPayload | null>(null);
   const [analysisSkills, setAnalysisSkills] = useState<SkillInfo[]>([]);
+  const [analysisModels, setAnalysisModels] = useState<AnalysisModelInfo[]>([]);
+  const [analysisModelsLoaded, setAnalysisModelsLoaded] = useState(false);
+  const [selectedAnalysisModel, setSelectedAnalysisModel] = useState('');
   const [selectedStrategyId, setSelectedStrategyId] = useState('');
   const [strategyMenuOpen, setStrategyMenuOpen] = useState(false);
   const [runFlowDrawer, setRunFlowDrawer] = useState<RunFlowDrawerState>({ open: false });
@@ -207,6 +221,7 @@ const HomePage: React.FC = () => {
   const duplicateBannerTimer = useRef<number | null>(null);
   const marketReviewPollTimer = useRef<number | null>(null);
   const stockBarLoadStartedRef = useRef(false);
+  const selectedAnalysisModelRef = useRef('');
   const dashboardScrollRef = useRef<HTMLElement | null>(null);
   const strategyMenuRef = useRef<HTMLDivElement | null>(null);
   const strategyButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -264,6 +279,7 @@ const HomePage: React.FC = () => {
     loadMarketReviewHistory,
     refreshMarketReviewHistory,
     selectHistoryItem,
+    clearSelectedReport,
     submitAnalysis,
     notify,
     setNotify,
@@ -329,6 +345,36 @@ const HomePage: React.FC = () => {
       .catch(() => {
         if (active) {
           setSetupStatus(null);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    selectedAnalysisModelRef.current = selectedAnalysisModel;
+  }, [selectedAnalysisModel]);
+
+  useEffect(() => {
+    let active = true;
+    analysisApi.getModels()
+      .then((response) => {
+        if (!active) return;
+        setAnalysisModels(response.models);
+        setSelectedAnalysisModel((current) => (
+          current && response.models.some((item) => item.model === current)
+            ? current
+            : response.defaultModel || response.models[0]?.model || ''
+        ));
+        setAnalysisModelsLoaded(true);
+      })
+      .catch(() => {
+        if (active) {
+          setAnalysisModels([]);
+          setSelectedAnalysisModel('');
+          setAnalysisModelsLoaded(true);
         }
       });
 
@@ -515,14 +561,24 @@ const HomePage: React.FC = () => {
     setTodayAnalysisRefreshVersion((version) => version + 1);
   }, []);
 
+  const loadSelectedModelStockBar = useCallback(
+    () => loadStockBar(selectedAnalysisModelRef.current || undefined),
+    [loadStockBar],
+  );
+  const refreshSelectedModelStockBar = useCallback(
+    () => refreshStockBar(selectedAnalysisModelRef.current || undefined),
+    [refreshStockBar],
+  );
+
   useDashboardLifecycle({
+    enabled: analysisModelsLoaded,
     loadInitialHistory,
     refreshHistory,
     refreshHistoryForCompletedTask,
     loadMarketReviewHistory,
     refreshMarketReviewHistory,
-    loadStockBar,
-    refreshStockBar,
+    loadStockBar: loadSelectedModelStockBar,
+    refreshStockBar: refreshSelectedModelStockBar,
     syncTaskCreated,
     syncTaskUpdated,
     syncTaskFailed,
@@ -531,6 +587,12 @@ const HomePage: React.FC = () => {
     onDashboardDataRefresh: handleDashboardDataRefresh,
     onCompletedTaskDataRefreshed: handleCompletedTaskDataRefreshed,
   });
+
+  const handleAnalysisModelChange = useCallback((model: string) => {
+    selectedAnalysisModelRef.current = model;
+    setSelectedAnalysisModel(model);
+    void refreshStockBar(model || undefined);
+  }, [refreshStockBar]);
 
   useEffect(() => {
     if (isLoadingStockBar) {
@@ -609,7 +671,11 @@ const HomePage: React.FC = () => {
         const results = await Promise.all(
           missingCodes.map(async (code) => {
             try {
-              const response = await historyApi.getList({ stockCode: code, limit: 1 });
+              const response = await historyApi.getList({
+                stockCode: code,
+                modelUsed: selectedAnalysisModel || undefined,
+                limit: 1,
+              });
               return { code, item: response.items[0] ?? null, failed: false };
             } catch {
               return { code, item: null, failed: true };
@@ -657,7 +723,12 @@ const HomePage: React.FC = () => {
     return () => {
       isCanceled = true;
     };
-  }, [canLookupWatchlistHistory, watchlistMissingHistoryEntries, watchlistMissingHistorySignature]);
+  }, [
+    canLookupWatchlistHistory,
+    selectedAnalysisModel,
+    watchlistMissingHistoryEntries,
+    watchlistMissingHistorySignature,
+  ]);
 
   const clearMarketReviewState = useCallback(() => {
     stopMarketReviewPolling();
@@ -679,7 +750,7 @@ const HomePage: React.FC = () => {
     setIsDeletingStock(true);
     try {
       await historyApi.deleteByCode(stockCode);
-      await refreshStockBar();
+      await refreshSelectedModelStockBar();
       await refreshHistory(true);
       if (stockCode === 'MARKET') {
         await refreshMarketReviewHistory(false);
@@ -689,7 +760,7 @@ const HomePage: React.FC = () => {
     } finally {
       setIsDeletingStock(false);
     }
-  }, [isDeletingStock, refreshMarketReviewHistory, refreshStockBar, refreshHistory]);
+  }, [isDeletingStock, refreshMarketReviewHistory, refreshSelectedModelStockBar, refreshHistory]);
 
   const handleSubmitAnalysis = useCallback(
     (
@@ -703,10 +774,22 @@ const HomePage: React.FC = () => {
         originalQuery: query,
         selectionSource: selectionSource ?? 'manual',
         skills: selectedAnalysisSkills,
+        model: selectedAnalysisModel || undefined,
       });
     },
-    [query, selectedAnalysisSkills, submitAnalysis],
+    [query, selectedAnalysisModel, selectedAnalysisSkills, submitAnalysis],
   );
+
+  const handleSubmitComparison = useCallback(() => {
+    const models = analysisModels.map((item) => item.model);
+    if (models.length < 2) return;
+    void submitAnalysis({
+      originalQuery: query,
+      selectionSource: 'manual',
+      skills: selectedAnalysisSkills,
+      models,
+    });
+  }, [analysisModels, query, selectedAnalysisSkills, submitAnalysis]);
 
   useEffect(() => {
     const state = location.state as StockAnalysisNavigationState | null;
@@ -745,8 +828,9 @@ const HomePage: React.FC = () => {
       selectionSource: 'manual',
       forceRefresh: true,
       skills: selectedAnalysisSkills,
+      model: selectedAnalysisModel || undefined,
     });
-  }, [selectedAnalysisSkills, selectedReport, submitAnalysis]);
+  }, [selectedAnalysisModel, selectedAnalysisSkills, selectedReport, submitAnalysis]);
 
   const openTaskRunFlow = useCallback((task: TaskInfo) => {
     const stock = task.stockName || task.stockCode || task.taskId;
@@ -926,7 +1010,7 @@ const HomePage: React.FC = () => {
     let active = true;
     setIsLoadingTodayAnalysisItems(true);
     setTodayAnalysisLoadFailed(false);
-    void getTodayAnalysisItems(todayDateKey)
+    void getTodayAnalysisItems(todayDateKey, selectedAnalysisModel || undefined)
       .then((items) => {
         if (active) {
           setTodayHistoryItems(items);
@@ -948,7 +1032,7 @@ const HomePage: React.FC = () => {
     return () => {
       active = false;
     };
-  }, [sidebarWorkspaceTab, todayAnalysisRefreshVersion, todayDateKey]);
+  }, [selectedAnalysisModel, sidebarWorkspaceTab, todayAnalysisRefreshVersion, todayDateKey]);
 
   const activeTaskByCode = useMemo(() => {
     const tasksByCode = new Map<string, TaskInfo>();
@@ -1060,16 +1144,7 @@ const HomePage: React.FC = () => {
       });
   }, [todayDateKey, todayHistoryItems]);
 
-  const handleAnalyzeWatchlist = useCallback(async (mode: WatchlistAnalyzeMode) => {
-    if (mode === 'pending' && watchlistTodayStatusBlocked) {
-      setBatchAnalyzeStatus({
-        variant: 'warning',
-        message: t('watchlist.pendingStatusUnavailable'),
-      });
-      return;
-    }
-
-    const sourceCodes = mode === 'pending' ? pendingWatchlistCodes : watchlistState.watchlistCodes;
+  const submitBatchAnalysis = useCallback(async (sourceCodes: string[], emptyMessage: string) => {
     const seen = new Set<string>();
     const targetCodes = sourceCodes.filter((code) => {
       const key = getStockCodeKey(code);
@@ -1083,7 +1158,7 @@ const HomePage: React.FC = () => {
     if (targetCodes.length === 0) {
       setBatchAnalyzeStatus({
         variant: 'warning',
-        message: mode === 'pending' ? t('watchlist.noPendingAnalyze') : t('watchlist.noStocksAnalyze'),
+        message: emptyMessage,
       });
       return;
     }
@@ -1102,6 +1177,7 @@ const HomePage: React.FC = () => {
             reportType: 'detailed',
             notify,
             skills: selectedAnalysisSkills,
+            model: selectedAnalysisModel || undefined,
           });
           const counts = countBatchAccepted(result);
           acceptedCount += counts.accepted;
@@ -1129,7 +1205,6 @@ const HomePage: React.FC = () => {
       // Reconcile even after a failed request: a timeout or disconnect may occur
       // after the server has accepted tasks, and earlier chunks may be running.
       await refreshActiveTasks();
-      setSidebarWorkspaceTab('watchlist');
 
       if (submissionError) {
         if (acceptedCount > 0 || duplicateCount > 0) {
@@ -1169,16 +1244,42 @@ const HomePage: React.FC = () => {
     }
   }, [
     notify,
-    pendingWatchlistCodes,
     refreshActiveTasks,
     selectedAnalysisSkills,
+    selectedAnalysisModel,
+    t,
+  ]);
+
+  const handleAnalyzeWatchlist = useCallback(async (mode: WatchlistAnalyzeMode) => {
+    if (mode === 'pending' && watchlistTodayStatusBlocked) {
+      setBatchAnalyzeStatus({
+        variant: 'warning',
+        message: t('watchlist.pendingStatusUnavailable'),
+      });
+      return;
+    }
+
+    const sourceCodes = mode === 'pending' ? pendingWatchlistCodes : watchlistState.watchlistCodes;
+    await submitBatchAnalysis(
+      sourceCodes,
+      mode === 'pending' ? t('watchlist.noPendingAnalyze') : t('watchlist.noStocksAnalyze'),
+    );
+  }, [
+    pendingWatchlistCodes,
+    submitBatchAnalysis,
     t,
     watchlistTodayStatusBlocked,
     watchlistState.watchlistCodes,
   ]);
 
+  const handleAnalyzeHistoryStocks = useCallback(async (stockCodes: string[]) => {
+    await submitBatchAnalysis(stockCodes, t('history.noSelectedStocksAnalyze'));
+  }, [submitBatchAnalysis, t]);
+
   const mergedStockBarItems = useMemo<StockBarItem[]>(() => {
-    const latestMarketReview = marketReviewHistoryItems[0];
+    const latestMarketReview = marketReviewHistoryItems.find(
+      (item) => !selectedAnalysisModel || item.modelUsed === selectedAnalysisModel,
+    );
     const stockItems = stockBarItems.filter((item) => item.stockCode !== 'MARKET');
     if (!latestMarketReview) {
       return stockItems;
@@ -1202,7 +1303,31 @@ const HomePage: React.FC = () => {
       const rightTime = right.lastAnalysisTime ? Date.parse(right.lastAnalysisTime) : 0;
       return rightTime - leftTime;
     });
-  }, [marketReviewHistoryItems, stockBarItems, t]);
+  }, [marketReviewHistoryItems, selectedAnalysisModel, stockBarItems, t]);
+
+  useEffect(() => {
+    if (!selectedAnalysisModel || isLoadingStockBar) {
+      return;
+    }
+    if (!selectedReport || selectedReport.meta.modelUsed === selectedAnalysisModel) {
+      return;
+    }
+
+    const nextReport = mergedStockBarItems[0];
+    if (nextReport) {
+      void selectHistoryItem(nextReport.id, false);
+    } else {
+      clearSelectedReport();
+    }
+  }, [
+    clearSelectedReport,
+    isLoadingStockBar,
+    mergedStockBarItems,
+    selectHistoryItem,
+    selectedAnalysisModel,
+    selectedReport,
+    selectedReport?.meta.modelUsed,
+  ]);
 
   const sidebarContent = useMemo(
     () => (
@@ -1231,6 +1356,7 @@ const HomePage: React.FC = () => {
           selectedRecordId={selectedReport?.meta.id}
           onHistoryItemClick={handleHistoryItemClick}
           onDeleteStock={handleDeleteStock}
+          onAnalyzeHistoryStocks={handleAnalyzeHistoryStocks}
           isDeleting={isDeletingStock}
           className="flex-1 overflow-hidden"
         />
@@ -1240,6 +1366,7 @@ const HomePage: React.FC = () => {
       activeTasks,
       batchAnalyzeStatus,
       handleAnalyzeWatchlist,
+      handleAnalyzeHistoryStocks,
       handleDeleteStock,
       handleHistoryItemClick,
       isBatchAnalyzingWatchlist,
@@ -1294,6 +1421,29 @@ const HomePage: React.FC = () => {
                   className={inputError ? 'border-danger/50' : undefined}
                 />
               </div>
+              {watchlistRows.length > 0 ? (
+                <label className="flex h-10 max-w-[8.5rem] flex-shrink-0 items-center rounded-xl border border-subtle bg-surface/60 px-2 text-xs text-secondary-text">
+                  <span className="sr-only">{t('home.watchlistPickerAria')}</span>
+                  <select
+                    aria-label={t('home.watchlistPickerAria')}
+                    value=""
+                    onChange={(event) => {
+                      if (event.target.value) {
+                        setQuery(event.target.value);
+                      }
+                    }}
+                    disabled={isAnalyzing}
+                    className="min-w-0 flex-1 bg-transparent text-foreground outline-none"
+                  >
+                    <option value="">{t('home.watchlistPicker')}</option>
+                    {watchlistRows.map((row) => (
+                      <option key={row.code} value={row.code}>
+                        {row.latestItem?.stockName ? `${row.latestItem.stockName} · ${row.code}` : row.code}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
               {analysisSkills.length > 0 ? (
                 <div ref={strategyMenuRef} className="relative flex-shrink-0">
                   <button
@@ -1346,6 +1496,22 @@ const HomePage: React.FC = () => {
                   ) : null}
                 </div>
               ) : null}
+              {analysisModels.length > 0 ? (
+                <label className="flex h-10 max-w-[12rem] flex-shrink-0 items-center gap-1.5 rounded-xl border border-subtle bg-surface/60 px-2 text-xs text-secondary-text">
+                  <span className="sr-only">{t('home.model')}</span>
+                  <select
+                    aria-label={t('home.model')}
+                    value={selectedAnalysisModel}
+                    onChange={(event) => handleAnalysisModelChange(event.target.value)}
+                    disabled={isAnalyzing}
+                    className="min-w-0 flex-1 bg-transparent text-foreground outline-none"
+                  >
+                    {analysisModels.map((item) => (
+                      <option key={item.model} value={item.model}>{item.model}</option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
             </div>
             <div className="flex min-w-0 flex-shrink-0 items-center gap-2.5">
               <label className="flex h-10 flex-shrink-0 cursor-pointer items-center gap-1.5 rounded-xl border border-subtle bg-surface/60 px-3 text-xs text-secondary-text select-none transition-colors hover:border-subtle-hover hover:text-foreground">
@@ -1369,6 +1535,15 @@ const HomePage: React.FC = () => {
                 <BarChart3 className="h-4 w-4" aria-hidden="true" />
                 {t('home.marketReview')}
               </Button>
+              <button
+                type="button"
+                onClick={handleSubmitComparison}
+                disabled={!query || isAnalyzing || analysisModels.length < 2}
+                className="btn-secondary flex h-10 flex-1 items-center justify-center gap-1.5 whitespace-nowrap md:flex-none"
+                title={t('home.compareModelsHint')}
+              >
+                {t('home.compareModels')}
+              </button>
               <button
                 type="button"
                 onClick={() => handleSubmitAnalysis()}

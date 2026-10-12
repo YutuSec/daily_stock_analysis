@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import pytest
 
 from data_provider.realtime_types import RealtimeSource, UnifiedRealtimeQuote
+from src.analysis_context_pack_prompt import format_analysis_context_pack_prompt_section
 from src.schemas.analysis_context_pack import ContextFieldStatus
 import src.services.analysis_context_builder as builder_module
 from src.services.analysis_context_builder import (
@@ -416,6 +417,45 @@ def test_news_block_treats_blank_as_missing_and_records_pack_metadata() -> None:
     assert available.metadata["news_result_count"] == 5
 
 
+def test_pack_prompt_exposes_paper_trading_style_contract() -> None:
+    pack = AnalysisContextBuilder.build(
+        _artifacts(
+            metadata={
+                "query_id": "q-style",
+                "trigger_source": "api",
+                "paper_trading_style_context": {
+                    "trading_style": "trend",
+                    "policy_version": "trading-style-v1",
+                    "settings": {
+                        "analysis_window_sessions": 500,
+                        "core_ma_windows": [20, 60, 120, 250],
+                        "volatility_windows": [20, 60, 120],
+                        "max_holding_sessions": 180,
+                        "plan_refresh_cadence_sessions": 5,
+                    },
+                },
+                "paper_trading_style_indicators": {
+                    "trading_style": "trend",
+                    "analysis_window_sessions": 500,
+                    "core_ma_windows": [20, 60, 120, 250],
+                    "volatility_windows": [20, 60, 120],
+                    "bars_observed": 260,
+                    "moving_averages": {"ma250": 120.0},
+                    "volatility": {"atr120": 3.0},
+                },
+            }
+        )
+    )
+
+    technical = pack.blocks["technical"]
+    assert "paper_trading_style_indicators" in technical.items
+    summary = format_analysis_context_pack_prompt_section(pack, report_language="zh")
+    assert "纸面交易风格契约" in summary
+    assert "日线窗口=500" in summary
+    assert "均线窗口=[20, 60, 120, 250]" in summary
+    assert "bars_observed=260" in summary
+
+
 def test_data_quality_scores_fixed_blocks_and_limits_auxiliary_missing() -> None:
     pack = AnalysisContextBuilder.build(_artifacts())
 
@@ -467,12 +507,39 @@ def test_portfolio_block_is_auxiliary_and_does_not_change_quality_score() -> Non
                 "market": "cn",
                 "currency": "CNY",
                 "quantity": 100,
+                "total_quantity": 300,
+                "available_quantity": 200,
+                "frozen_quantity": 100,
                 "avg_cost": 100.0,
+                "weighted_average_price": 100.0,
                 "total_cost": 10000.0,
+                "lot_count": 3,
                 "unrealized_pnl_base": 500.0,
                 "unrealized_pnl_pct": 5.0,
+                "unrealized_pnl": 450.0,
+                "unrealized_return_pct": 4.5,
+                "market_value": 10450.0,
+                "mark_source": "stock_daily_close",
+                "mark_stale": True,
+                "valuation_complete": True,
                 "price_available": False,
                 "cost_method": "fifo",
+                "source": "paper_trading",
+                "source_model": "model-a",
+                "sync_origin": "portfolio_import",
+                "sync_status": "synced_from_portfolio",
+                "capital_account_id": 9,
+                "cash": 30000.0,
+                "book_equity": 50000.0,
+                "exposure": 20000.0,
+                "symbol_concentration_pct": 20.0,
+                "total_exposure_pct": 40.0,
+                "opened_on": "2026-08-24",
+                "earliest_opened_on": "2026-08-22",
+                "latest_opened_on": "2026-08-24",
+                "stop_loss": 95.0,
+                "target_price": 130.0,
+                "stop_loss_lots": [{"position_id": 1, "quantity": 100, "stop_loss": 95.0}],
                 "api_key": "must-not-be-exposed",
             }
         )
@@ -483,7 +550,21 @@ def test_portfolio_block_is_auxiliary_and_does_not_change_quality_score() -> Non
     assert portfolio.source == "portfolio_context"
     assert portfolio.metadata == {"auxiliary": True, "quality_weighted": False}
     assert portfolio.items["quantity"].value == 100
+    assert portfolio.items["total_quantity"].value == 300
+    assert portfolio.items["lot_count"].value == 3
     assert portfolio.items["price_available"].value is False
+    assert portfolio.items["source"].value == "paper_trading"
+    assert portfolio.items["source_model"].value == "model-a"
+    assert portfolio.items["sync_status"].value == "synced_from_portfolio"
+    assert portfolio.items["cash"].value == 30000.0
+    assert portfolio.items["book_equity"].value == 50000.0
+    assert portfolio.items["exposure"].value == 20000.0
+    assert portfolio.items["symbol_concentration_pct"].value == 20.0
+    assert portfolio.items["opened_on"].value == "2026-08-24"
+    assert portfolio.items["earliest_opened_on"].value == "2026-08-22"
+    assert portfolio.items["stop_loss"].value == 95.0
+    assert portfolio.items["target_price"].value == 130.0
+    assert portfolio.items["valuation_complete"].value is True
     assert "api_key" not in portfolio.items
     assert pack.data_quality.overall_score == baseline.data_quality.overall_score
     assert pack.data_quality.block_scores == baseline.data_quality.block_scores

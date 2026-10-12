@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from src.storage import DatabaseManager
 from src.report_language import normalize_report_language
-from src.schemas.decision_action import display_action_fields
+from src.schemas.decision_action import display_action_fields, normalize_holding_state
 from src.schemas.decision_scale import extract_decision_guardrail_reason
 from src.utils.data_processing import parse_json_field
 
@@ -46,14 +46,21 @@ def _record_to_signal(
         report_language=resolved_report_language,
         sentiment_score=getattr(record, "sentiment_score", None),
         guardrail_reason=extract_decision_guardrail_reason(raw_result),
+        holding_state=raw_result.get("holding_state"),
+        position_actions=raw_result.get("position_actions"),
     )
+    holding_state = normalize_holding_state(raw_result.get("holding_state"))
 
     try:
         return {
             "created_at": record.created_at.isoformat() if record.created_at else None,
             "query_id": record.query_id,
             "sentiment_score": record.sentiment_score,
-            "operation_advice": record.operation_advice,
+            "operation_advice": (
+                action_fields["action_label"]
+                if holding_state != "unknown"
+                else record.operation_advice
+            ),
             "action": action_fields["action"],
             "action_label": action_fields["action_label"],
             "trend_prediction": record.trend_prediction,

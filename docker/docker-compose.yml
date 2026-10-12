@@ -8,7 +8,6 @@
 #   同时启动: docker-compose -f ./docker/docker-compose.yml up -d analyzer server
 
 name: daily-stock-analysis
-version: '3.8'
 
 x-common: &common
   build:
@@ -20,6 +19,13 @@ x-common: &common
   # 否则 Docker mount point 会阻止配置保存时的 os.replace 原子更新。
   env_file:
     - ../.env
+
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+  secrets:
+    - postgres_pgpass
 
   volumes:
     - ../data:/app/data
@@ -34,6 +40,9 @@ x-common: &common
 
   environment:
     - TZ=Asia/Shanghai
+    # 密码由只读 Docker secret 提供给 libpq，不写入 DATABASE_URL 或日志。
+    - POSTGRES_PGPASS_FILE=/run/secrets/postgres_pgpass
+    - POSTGRES_DEFAULT_URL=postgresql+psycopg://dsa@postgres:5432/daily_stock_analysis
 
     # Web/API service bind address (must be 0.0.0.0 inside container)
     - WEBUI_HOST=0.0.0.0
@@ -57,6 +66,31 @@ x-common: &common
         memory: 512M
 
 services:
+  postgres:
+    image: postgres:15-alpine@sha256:cd17e2ac98240fce1541ad2a803b34009b4eea5aec8a832363cdc7eca62e722e
+    container_name: stock-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=daily_stock_analysis
+      - POSTGRES_USER=dsa
+      - POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password
+      - TZ=Asia/Shanghai
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dsa -d daily_stock_analysis"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   # 定时任务模式
   analyzer:
     <<: *common
@@ -70,3 +104,12 @@ services:
     # 若使用 network_mode: host，则以下 ports 映射无效，端口由 command 中的 --port 指定
     ports:
       - "${API_PORT:-8000}:${API_PORT:-8000}"
+
+volumes:
+  postgres_data:
+
+secrets:
+  postgres_password:
+    file: ../data/postgres-secrets/password
+  postgres_pgpass:
+    file: ../data/postgres-secrets/pgpass

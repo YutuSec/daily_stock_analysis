@@ -50,6 +50,7 @@ export function useHomeDashboardState() {
       refreshMarketReviewHistory: state.refreshMarketReviewHistory,
       loadMoreMarketReviewHistory: state.loadMoreMarketReviewHistory,
       selectHistoryItem: state.selectHistoryItem,
+      clearSelectedReport: state.clearSelectedReport,
       toggleHistorySelection: state.toggleHistorySelection,
       toggleSelectAllVisible: state.toggleSelectAllVisible,
       deleteSelectedHistory: state.deleteSelectedHistory,

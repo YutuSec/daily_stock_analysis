@@ -16,10 +16,12 @@ from contextlib import contextmanager
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone, time as dt_time
 from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar, Union
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from sqlalchemy import (
@@ -40,13 +42,17 @@ from sqlalchemy import (
     and_,
     or_,
     delete,
+    update,
     desc,
     event,
+    exists,
     func,
     inspect,
+    literal,
     MetaData,
     Table,
 )
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import (
     declarative_base,
@@ -54,22 +60,65 @@ from sqlalchemy.orm import (
     Session,
 )
 from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.schema import CreateTable
 
 from src.agent.provider_trace import PROVIDER_TRACE_RETENTION_LIMIT
 from src.config import get_config
 from src.schemas.decision_profile import extract_legacy_decision_profile
 from src.utils.sniper_points import extract_sniper_points, parse_sniper_value
+from src.schemas.decision_action import apply_position_aware_result_contract
+from src.utils.sanitize import sanitize_diagnostic_text
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 CURRENT_SCHEMA_VERSION = "2026-06-05-create-all-baseline"
 INTELLIGENCE_ITEM_NULL_SCOPE_VALUE = "__dsa_null_scope__"
+POSTGRES_SCHEMA_ADVISORY_LOCK_ID = 724019302
 
 # SQLAlchemy ORM 基类
 Base = declarative_base()
 
 if TYPE_CHECKING:
     from src.search_service import SearchResponse
+
+
+def _postgres_identifier(name: str) -> str:
+    """Return a deterministic PostgreSQL-safe identifier (maximum 63 bytes)."""
+    encoded = name.encode("utf-8")
+    if len(encoded) <= 63:
+        return name
+    suffix = hashlib.sha256(encoded).hexdigest()[:8]
+    prefix_budget = 63 - len(suffix) - 1
+    prefix = encoded[:prefix_budget]
+    while True:
+        try:
+            return f"{prefix.decode('utf-8')}_{suffix}"
+        except UnicodeDecodeError:
+            prefix = prefix[:-1]
+
+
+def create_application_schema(bind: Any) -> None:
+    """Create the ORM schema while respecting PostgreSQL identifier limits.
+
+    Some long, legacy SQLite index names exceed PostgreSQL's 63-byte limit.
+    A metadata copy lets PostgreSQL use deterministic shortened physical names
+    without changing SQLite index names or ORM query behavior.
+    """
+    if bind.dialect.name != "postgresql":
+        Base.metadata.create_all(bind=bind)
+        return
+
+    postgres_metadata = MetaData()
+    for table in Base.metadata.sorted_tables:
+        table.to_metadata(postgres_metadata)
+    for table in postgres_metadata.tables.values():
+        for index in table.indexes:
+            if index.name:
+                index.name = _postgres_identifier(index.name)
+        for constraint in table.constraints:
+            if constraint.name:
+                constraint.name = _postgres_identifier(constraint.name)
+    postgres_metadata.create_all(bind=bind)
 
 
 def utc_naive_now() -> datetime:
@@ -96,21 +145,58 @@ class DatabaseSchemaMigration(Base):
     applied_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
 
 
+class RuntimeSetting(Base):
+    """Shared runtime setting override consumed by all running processes."""
+
+    __tablename__ = 'runtime_settings'
+
+    key = Column(String(128), primary_key=True)
+    value = Column(String(255), nullable=False)
+    version = Column(Integer, nullable=False, default=1)
+    provenance_json = Column(Text, nullable=False, default='{}')
+    updated_by = Column(String(128))
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+
+class RuntimeSettingAudit(Base):
+    """Append-only audit trail for shared runtime setting changes."""
+
+    __tablename__ = 'runtime_setting_audit'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key = Column(String(128), nullable=False, index=True)
+    old_value = Column(String(255))
+    new_value = Column(String(255))
+    old_version = Column(Integer)
+    new_version = Column(Integer)
+    action = Column(String(32), nullable=False, default='update', index=True)
+    actor = Column(String(128))
+    reason = Column(String(255))
+    provenance_json = Column(Text, nullable=False, default='{}')
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        Index('ix_runtime_setting_audit_key_time', 'key', 'created_at'),
+        UniqueConstraint('key', 'new_version', name='uix_runtime_setting_audit_key_new_version'),
+    )
+
+
 class StockDaily(Base):
     """
     股票日线数据模型
-    
+
     存储每日行情数据和计算的技术指标
     支持多股票、多日期的唯一约束
     """
     __tablename__ = 'stock_daily'
-    
+
     # 主键
     id = Column(Integer, primary_key=True, autoincrement=True)
-    
+
     # 股票代码（如 600519, 000001）
     code = Column(String(10), nullable=False, index=True)
-    
+
     # 交易日期
     date = Column(Date, nullable=False, index=True)
     
@@ -149,6 +235,7 @@ class StockDaily(Base):
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
+        from data_provider.volume_units import cached_volume_shares, cached_volume_unit_known
         return {
             'code': self.code,
             'date': self.date,
@@ -156,7 +243,8 @@ class StockDaily(Base):
             'high': self.high,
             'low': self.low,
             'close': self.close,
-            'volume': self.volume,
+            'volume': cached_volume_shares(self.volume, self.data_source),
+            'volume_unit': 'shares' if cached_volume_unit_known(self.data_source) else 'unknown',
             'amount': self.amount,
             'pct_chg': self.pct_chg,
             'ma5': self.ma5,
@@ -316,11 +404,17 @@ class AnalysisHistory(Base):
     code = Column(String(10), nullable=False, index=True)
     name = Column(String(50))
     report_type = Column(String(16), index=True)
+    # 实际完成本次分析的模型。独立列用于回测按模型精确筛选；
+    # raw_result.model_used 继续保留，兼容历史详情与导出。
+    model_used = Column(String(255), index=True)
 
     # 核心结论
     sentiment_score = Column(Integer)
     operation_advice = Column(String(20))
-    trend_prediction = Column(String(50))
+    # Historical LLM results may contain an explanatory trend sentence rather
+    # than a short enum. SQLite never enforced VARCHAR(50); Text preserves those
+    # rows during PostgreSQL migration without truncating user reports.
+    trend_prediction = Column(Text)
     analysis_summary = Column(Text)
 
     # 详细数据
@@ -348,6 +442,7 @@ class AnalysisHistory(Base):
             'code': self.code,
             'name': self.name,
             'report_type': self.report_type,
+            'model_used': self.model_used,
             'sentiment_score': self.sentiment_score,
             'operation_advice': self.operation_advice,
             'trend_prediction': self.trend_prediction,
@@ -359,6 +454,198 @@ class AnalysisHistory(Base):
             'secondary_buy': self.secondary_buy,
             'stop_loss': self.stop_loss,
             'take_profit': self.take_profit,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+REPORT_EXECUTION_INTENT_PAPER_CANDIDATE = "paper_candidate"
+REPORT_EXECUTION_INTENT_RESEARCH_ONLY = "research_only"
+REPORT_EXECUTION_INTENTS = frozenset({
+    REPORT_EXECUTION_INTENT_PAPER_CANDIDATE,
+    REPORT_EXECUTION_INTENT_RESEARCH_ONLY,
+})
+REPORT_EXECUTION_SCOPE_PRIMARY = "primary"
+REPORT_EXECUTION_POLICY_VERSION = "report-execution-intent-v1"
+REPORT_EXECUTION_INTENT_BASELINE_VERSION = "2026-09-28-report-execution-intent-baseline"
+_REPORT_EXECUTION_EXPERIMENT_SCOPE = re.compile(r"^experiment:[a-z0-9][a-z0-9_-]{0,63}:[abc]$")
+
+
+class AnalysisReportExecutionIntent(Base):
+    """Trusted execution purpose written in the same transaction as a report.
+
+    Rows are immutable. Model output, API payloads and later provenance never
+    create or change them; paper consumers authorize only from this row.
+    """
+
+    __tablename__ = 'analysis_report_execution_intents'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    analysis_history_id = Column(
+        Integer,
+        ForeignKey('analysis_history.id'),
+        nullable=False,
+        unique=True,
+    )
+    execution_intent = Column(String(32), nullable=False, index=True)
+    execution_scope = Column(String(96), nullable=False, index=True)
+    decision_as_of = Column(Date)
+    execution_policy_version = Column(String(64), nullable=False)
+    intent_source = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
+@event.listens_for(AnalysisReportExecutionIntent, "before_update")
+def _reject_report_execution_intent_update(_mapper, _connection, _target) -> None:
+    raise ValueError("report execution intent is immutable after the first report save")
+
+
+def normalize_report_execution_scope(value: Any) -> str:
+    scope = str(value or "").strip()
+    if scope == REPORT_EXECUTION_SCOPE_PRIMARY or _REPORT_EXECUTION_EXPERIMENT_SCOPE.fullmatch(scope):
+        return scope
+    raise ValueError(f"invalid report execution scope: {scope!r}")
+
+
+def normalize_report_execution_intent(value: Any) -> Dict[str, Any]:
+    """Validate backend-owned execution metadata before the first report save."""
+
+    if not isinstance(value, dict):
+        raise ValueError("report execution intent must be a mapping")
+    intent = str(value.get("execution_intent") or "").strip()
+    if intent not in REPORT_EXECUTION_INTENTS:
+        raise ValueError(f"invalid report execution intent: {intent!r}")
+    source = str(value.get("intent_source") or "").strip()
+    if not source or len(source) > 64:
+        raise ValueError("report execution intent requires intent_source of at most 64 characters")
+    as_of = value.get("decision_as_of")
+    if isinstance(as_of, datetime):
+        as_of = as_of.date()
+    elif isinstance(as_of, str):
+        as_of = date.fromisoformat(as_of.strip()) if as_of.strip() else None
+    elif as_of is not None and not isinstance(as_of, date):
+        raise ValueError("decision_as_of must be a date")
+    policy_version = str(value.get("execution_policy_version") or REPORT_EXECUTION_POLICY_VERSION).strip()
+    if len(policy_version) > 64:
+        raise ValueError("execution_policy_version must be at most 64 characters")
+    return {
+        "execution_intent": intent,
+        "execution_scope": normalize_report_execution_scope(
+            value.get("execution_scope") or REPORT_EXECUTION_SCOPE_PRIMARY
+        ),
+        "decision_as_of": as_of,
+        "execution_policy_version": policy_version,
+        "intent_source": source,
+    }
+
+
+def _report_execution_intent_field(intent: Any, name: str) -> Optional[str]:
+    raw = intent.get(name) if isinstance(intent, dict) else getattr(intent, name, None)
+    return str(raw).strip() if raw is not None else None
+
+
+def evaluate_report_execution_intent(intent: Any, *, execution_scope: str) -> Dict[str, Any]:
+    """The single authorization rule for report-derived paper execution.
+
+    A missing row is never authorized: legacy reports receive an explicit
+    baseline row once, and every later report must declare its purpose at
+    first save.
+    """
+
+    scope = normalize_report_execution_scope(execution_scope)
+    if intent is None:
+        reason = "execution_intent_missing"
+    else:
+        value = _report_execution_intent_field(intent, "execution_intent")
+        if value == REPORT_EXECUTION_INTENT_RESEARCH_ONLY:
+            reason = "research_only"
+        elif value != REPORT_EXECUTION_INTENT_PAPER_CANDIDATE:
+            reason = "execution_intent_unknown"
+        elif _report_execution_intent_field(intent, "execution_scope") != scope:
+            reason = "execution_scope_mismatch"
+        else:
+            reason = None
+    return {
+        "authorized": reason is None,
+        "reason": reason,
+        "execution_scope": scope,
+        "execution_intent": _report_execution_intent_field(intent, "execution_intent") if intent is not None else None,
+        "report_execution_scope": _report_execution_intent_field(intent, "execution_scope") if intent is not None else None,
+        "execution_policy_version": (
+            _report_execution_intent_field(intent, "execution_policy_version") if intent is not None else None
+        ),
+    }
+
+
+def report_execution_intent_clause(
+    report_id_column: Any,
+    *,
+    execution_intent: str,
+    execution_scope: str,
+) -> Any:
+    """SQL filter for reports whose frozen purpose exactly matches."""
+
+    if execution_intent not in REPORT_EXECUTION_INTENTS:
+        raise ValueError(f"invalid report execution intent: {execution_intent!r}")
+    return exists().where(
+        AnalysisReportExecutionIntent.analysis_history_id == report_id_column,
+        AnalysisReportExecutionIntent.execution_intent == execution_intent,
+        AnalysisReportExecutionIntent.execution_scope == normalize_report_execution_scope(execution_scope),
+    )
+
+
+def authorized_report_execution_clause(report_id_column: Any, *, execution_scope: str) -> Any:
+    """SQL form of ``evaluate_report_execution_intent`` for list consumers."""
+
+    return report_execution_intent_clause(
+        report_id_column,
+        execution_intent=REPORT_EXECUTION_INTENT_PAPER_CANDIDATE,
+        execution_scope=execution_scope,
+    )
+
+
+def report_execution_intent_allows_signals(intent: Any) -> bool:
+    """Research-only reports never enter the shared DecisionSignal layer.
+
+    Rows without intent keep legacy signal compatibility only; paper
+    execution still rejects them through ``evaluate_report_execution_intent``.
+    """
+
+    if intent is None:
+        return True
+    return _report_execution_intent_field(intent, "execution_intent") == REPORT_EXECUTION_INTENT_PAPER_CANDIDATE
+
+
+class AnalysisAttempt(Base):
+    """One attempted stock analysis, including failures that do not create a report."""
+
+    __tablename__ = 'analysis_attempts'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    query_id = Column(String(64), index=True)
+    code = Column(String(10), nullable=False, index=True)
+    name = Column(String(50))
+    report_type = Column(String(16), index=True)
+    model_used = Column(String(255), index=True)
+    status = Column(String(16), nullable=False, default="started", index=True)
+    error_message = Column(Text)
+    analysis_history_id = Column(Integer, ForeignKey('analysis_history.id'), index=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_analysis_attempt_code_model_time', 'code', 'model_used', 'created_at'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'query_id': self.query_id,
+            'code': self.code,
+            'name': self.name,
+            'report_type': self.report_type,
+            'model_used': self.model_used,
+            'status': self.status,
+            'error_message': self.error_message,
+            'analysis_history_id': self.analysis_history_id,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -386,7 +673,7 @@ class BacktestResult(Base):
     engine_version = Column(String(16), nullable=False, default='v1')
 
     # 状态
-    eval_status = Column(String(16), nullable=False, default='pending')
+    eval_status = Column(String(32), nullable=False, default='pending')
     evaluated_at = Column(DateTime, default=datetime.now, index=True)
 
     # 建议快照（避免未来分析字段变化导致回测不可解释）
@@ -419,6 +706,19 @@ class BacktestResult(Base):
     simulated_exit_price = Column(Float)
     simulated_exit_reason = Column(String(24))  # stop_loss/take_profit/window_end/cash/ambiguous_stop_loss
     simulated_return_pct = Column(Float)
+
+    # Frozen holding-decision evaluation. These fields are derived only from
+    # the analysis payload saved at report generation time; backtesting never
+    # reads the user's current portfolio.
+    holding_state = Column(String(16))  # holding/empty/unknown
+    holding_action = Column(String(16))  # buy/add/hold/reduce/sell/avoid
+    holding_action_applicable = Column(Boolean, nullable=False, default=False)
+    holding_action_evaluable = Column(Boolean, nullable=False, default=False)
+    holding_eval_status = Column(String(24), nullable=False, default='unavailable')
+    holding_direction_expected = Column(String(16))  # not_down/down
+    holding_decision_correct = Column(Boolean, nullable=True)
+    holding_outcome = Column(String(16))  # win/loss/neutral
+    holding_decision_return_pct = Column(Float)
 
     __table_args__ = (
         UniqueConstraint(
@@ -470,6 +770,18 @@ class BacktestSummary(Base):
     take_profit_trigger_rate = Column(Float)
     ambiguous_rate = Column(Float)
     avg_days_to_first_hit = Column(Float)
+
+    # Holding-decision metric. Legacy reports without a frozen holding action
+    # remain unavailable and are excluded from the accuracy denominator.
+    direction_evaluable_count = Column(Integer, default=0)
+    holding_applicable_count = Column(Integer, default=0)
+    holding_evaluable_count = Column(Integer, default=0)
+    holding_unavailable_count = Column(Integer, default=0)
+    holding_correct_count = Column(Integer, default=0)
+    holding_incorrect_count = Column(Integer, default=0)
+    holding_neutral_count = Column(Integer, default=0)
+    holding_decision_accuracy_pct = Column(Float)
+    avg_holding_decision_return_pct = Column(Float)
 
     # 诊断字段（JSON 字符串）
     advice_breakdown_json = Column(Text)
@@ -1131,6 +1443,950 @@ class DecisionSignalFeedbackRecord(Base):
     updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, index=True)
 
 
+class PaperExecutionPlan(Base):
+    """Versioned, auditable paper-only execution plan derived from a report."""
+
+    __tablename__ = 'paper_execution_plans'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plan_key = Column(String(160), nullable=False, unique=True, index=True)
+    plan_version = Column(String(32), nullable=False, index=True)
+    source_report_id = Column(Integer, ForeignKey('analysis_history.id'), nullable=False, index=True)
+    decision_signal_id = Column(Integer, ForeignKey('decision_signals.id'), index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    stock_name = Column(String(64))
+    report_date = Column(Date, nullable=False, index=True)
+    report_created_at = Column(DateTime, nullable=False)
+    valid_for_date = Column(Date, index=True)
+    action = Column(String(16), nullable=False, index=True)
+    executable = Column(Boolean, nullable=False, default=False, index=True)
+    status = Column(String(24), nullable=False, default='active', index=True)
+    rules_json = Column(Text, nullable=False, default='[]')
+    descriptive_conditions_json = Column(Text, nullable=False, default='[]')
+    stop_loss = Column(Float)
+    target_price = Column(Float)
+    plan_allocation_budget = Column(Float)
+    plan_risk_budget = Column(Float)
+    budget_snapshot_equity = Column(Float)
+    budget_snapshot_at = Column(DateTime)
+    trading_style = Column(String(32), index=True)
+    trading_style_policy_version = Column(String(32))
+    trading_style_settings_json = Column(Text)
+    market_regime_context_id = Column(Integer, ForeignKey('daily_market_regimes.id'), index=True)
+    market_regime = Column(String(32), index=True)
+    market_regime_policy_version = Column(String(32))
+    max_holding_sessions = Column(Integer, nullable=False, default=10)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_paper_plan_identity_status', 'market', 'stock_code', 'status'),
+        Index('ix_paper_plan_source_identity', 'source_report_id', 'decision_signal_id'),
+    )
+
+
+class PaperPlanEvaluation(Base):
+    """One idempotent end-of-day evaluation for a plan and trading date."""
+
+    __tablename__ = 'paper_plan_evaluations'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    evaluation_key = Column(String(220), nullable=False, default='', unique=True, index=True)
+    plan_id = Column(Integer, ForeignKey('paper_execution_plans.id'), nullable=False, index=True)
+    position_id = Column(Integer, ForeignKey('paper_positions.id'), index=True)
+    entry_leg_id = Column(String(64), nullable=False, default='legacy_entry', index=True)
+    evaluation_date = Column(Date, nullable=False, index=True)
+    result = Column(String(24), nullable=False, index=True)
+    reasons_json = Column(Text, nullable=False, default='[]')
+    evidence_json = Column(Text, nullable=False, default='{}')
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        Index('ix_paper_eval_plan_date_identity', 'plan_id', 'evaluation_date', 'position_id', 'entry_leg_id'),
+    )
+
+
+class PaperPlanObservation(Base):
+    """Idempotent intraday paper-monitor observation with quote provenance."""
+
+    __tablename__ = 'paper_plan_observations'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    observation_key = Column(String(220), nullable=False, unique=True, index=True)
+    plan_id = Column(Integer, ForeignKey('paper_execution_plans.id'), nullable=False, index=True)
+    position_id = Column(Integer, ForeignKey('paper_positions.id'), index=True)
+    source_report_id = Column(Integer, ForeignKey('analysis_history.id'), nullable=False, index=True)
+    decision_signal_id = Column(Integer, ForeignKey('decision_signals.id'), index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    stock_name = Column(String(64))
+    mode = Column(String(16), nullable=False, default='intraday', index=True)
+    observed_at = Column(DateTime, nullable=False, index=True)
+    bucket_started_at = Column(DateTime, nullable=False, index=True)
+    quote_price = Column(Float)
+    quote_source = Column(String(64))
+    quote_provider_timestamp = Column(String(64))
+    quote_fetched_at = Column(String(64))
+    resolution_key = Column(String(220), index=True)
+    resolution_bucket_json = Column(Text)
+    logical_order_key = Column(String(220), index=True)
+    result = Column(String(32), nullable=False, index=True)
+    action = Column(String(16), nullable=False, index=True)
+    composite_score = Column(Float)
+    required_passed = Column(Boolean, nullable=False, default=False)
+    factors_passed = Column(Integer, nullable=False, default=0)
+    factors_available = Column(Integer, nullable=False, default=0)
+    evidence_json = Column(Text, nullable=False, default='{}')
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        Index('ix_paper_observation_identity_time', 'market', 'stock_code', 'bucket_started_at'),
+        Index('ix_paper_observation_model_time', 'source_model', 'bucket_started_at'),
+    )
+
+
+class PaperResolution(Base):
+    """Versioned resolver decision ledger shared by intraday and EOD paths."""
+
+    __tablename__ = 'paper_resolutions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    resolution_key = Column(String(220), nullable=False, unique=True, index=True)
+    policy_version = Column(String(32), nullable=False, index=True)
+    mode = Column(String(32), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default='candidate', index=True)
+    capital_account_id = Column(Integer, ForeignKey('paper_capital_accounts.id'), index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    currency = Column(String(8))
+    bucket_started_at = Column(DateTime, index=True)
+    evaluation_date = Column(Date, index=True)
+    source_report_id = Column(Integer, ForeignKey('analysis_history.id'), index=True)
+    decision_signal_id = Column(Integer, ForeignKey('decision_signals.id'), index=True)
+    selected_intent = Column(String(32), index=True)
+    requested_quantity = Column(Float)
+    executed_quantity = Column(Float)
+    unfilled_quantity = Column(Float)
+    candidate_intents_json = Column(Text, nullable=False, default='[]')
+    suppressed_intents_json = Column(Text, nullable=False, default='[]')
+    selected_intent_json = Column(Text, nullable=False, default='{}')
+    source_identities_json = Column(Text, nullable=False, default='[]')
+    evidence_json = Column(Text, nullable=False, default='{}')
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_paper_resolution_scope_time', 'source_model', 'market', 'stock_code', 'mode', 'bucket_started_at', 'evaluation_date'),
+    )
+
+
+class PaperReanalysisRequest(Base):
+    """Durable once-only reanalysis request for paper-only monitor decisions."""
+
+    __tablename__ = 'paper_reanalysis_requests'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    request_key = Column(String(260), nullable=False, unique=True, index=True)
+    trigger_type = Column(String(32), nullable=False, index=True)
+    status = Column(String(24), nullable=False, default='pending', index=True)
+    source_plan_id = Column(Integer, ForeignKey('paper_execution_plans.id'), nullable=False, index=True)
+    source_report_id = Column(Integer, ForeignKey('analysis_history.id'), nullable=False, index=True)
+    decision_signal_id = Column(Integer, ForeignKey('decision_signals.id'), index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    stock_name = Column(String(64))
+    session_date = Column(Date, nullable=False, index=True)
+    due_at = Column(DateTime, index=True)
+    observed_at = Column(DateTime, index=True)
+    claimed_at = Column(DateTime, index=True)
+    submitted_at = Column(DateTime, index=True)
+    completed_at = Column(DateTime, index=True)
+    task_id = Column(String(64), index=True)
+    query_id = Column(String(64), index=True)
+    replacement_report_id = Column(Integer, ForeignKey('analysis_history.id'), index=True)
+    replacement_plan_id = Column(Integer, ForeignKey('paper_execution_plans.id'), index=True)
+    failure_reason = Column(String(128))
+    evidence_json = Column(Text, nullable=False, default='{}')
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_paper_reanalysis_scope_status', 'source_model', 'market', 'stock_code', 'session_date', 'status'),
+        Index('ix_paper_reanalysis_plan_trigger', 'source_plan_id', 'trigger_type', 'session_date'),
+    )
+
+
+class PaperCapitalAccount(Base):
+    """Shared paper-only capital account scoped by model, market, and currency."""
+
+    __tablename__ = 'paper_capital_accounts'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_key = Column(String(360), nullable=False, unique=True, index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    currency = Column(String(8), nullable=False, index=True)
+    initial_capital = Column(Float, nullable=False)
+    cash = Column(Float, nullable=False)
+    external_cash_flow = Column(Float, nullable=False, default=0.0)
+    invested_capital = Column(Float, nullable=False, default=0.0)
+    realized_pnl = Column(Float, nullable=False, default=0.0)
+    exposure = Column(Float, nullable=False, default=0.0)
+    open_position_count = Column(Integer, nullable=False, default=0)
+    risk_per_trade_pct = Column(Float, nullable=False, default=1.0)
+    max_position_pct = Column(Float, nullable=False, default=20.0)
+    max_total_exposure_pct = Column(Float, nullable=False, default=80.0)
+    max_open_positions = Column(Integer, nullable=False, default=5)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_paper_capital_scope', 'source_model', 'market', 'currency'),
+    )
+
+
+class PaperCapitalAdjustment(Base):
+    """Immutable paper-only funding journal for capital accounts."""
+
+    __tablename__ = 'paper_capital_adjustments'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    idempotency_key = Column(String(128), nullable=False, unique=True, index=True)
+    payload_hash = Column(String(64), nullable=False)
+    account_id = Column(Integer, ForeignKey('paper_capital_accounts.id'), nullable=False, index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    currency = Column(String(8), nullable=False, index=True)
+    adjustment_type = Column(String(16), nullable=False, index=True)
+    amount = Column(Float, nullable=False)
+    reason = Column(String(255))
+    before_cash = Column(Float, nullable=False)
+    after_cash = Column(Float, nullable=False)
+    before_book_equity = Column(Float, nullable=False)
+    after_book_equity = Column(Float, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        Index('ix_paper_capital_adjustment_account_time', 'account_id', 'created_at'),
+        Index('ix_paper_capital_adjustment_scope_time', 'source_model', 'market', 'currency', 'created_at'),
+    )
+
+
+class PaperAccountRiskSnapshot(Base):
+    """Persistent model-scoped account risk snapshot for entry gating."""
+
+    __tablename__ = 'paper_account_risk_snapshots'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_key = Column(String(220), nullable=False, unique=True, index=True)
+    policy_version = Column(String(32), nullable=False, index=True)
+    capital_account_id = Column(Integer, ForeignKey('paper_capital_accounts.id'), nullable=False, index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    currency = Column(String(8), nullable=False)
+    session_date = Column(Date, nullable=False, index=True)
+    bucket_started_at = Column(DateTime, nullable=False, index=True)
+    observed_at = Column(DateTime, nullable=False, index=True)
+    session_start_equity = Column(Float)
+    current_equity = Column(Float)
+    peak_equity = Column(Float)
+    cash = Column(Float)
+    exposure = Column(Float)
+    realized_pnl = Column(Float)
+    unrealized_pnl = Column(Float)
+    total_pnl = Column(Float)
+    daily_pnl = Column(Float)
+    daily_loss_pct = Column(Float)
+    drawdown_pct = Column(Float)
+    losing_logical_exit_streak = Column(Integer, nullable=False, default=0)
+    daily_trade_count = Column(Integer, nullable=False, default=0)
+    daily_open_add_count = Column(Integer, nullable=False, default=0)
+    daily_reduce_close_count = Column(Integer, nullable=False, default=0)
+    valuation_complete = Column(Boolean, nullable=False, default=False, index=True)
+    valuation_stale = Column(Boolean, nullable=False, default=True)
+    total_utilization_pct = Column(Float)
+    symbol_utilization_pct = Column(Float)
+    sector_utilization_pct = Column(Float)
+    correlation_utilization_pct = Column(Float)
+    unknown_utilization_pct = Column(Float)
+    active_state = Column(String(32), nullable=False, default='normal', index=True)
+    active_reasons_json = Column(Text, nullable=False, default='[]')
+    permissions_json = Column(Text, nullable=False, default='{}')
+    concentration_json = Column(Text, nullable=False, default='{}')
+    evidence_json = Column(Text, nullable=False, default='{}')
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_paper_risk_snapshot_scope_time', 'source_model', 'market', 'currency', 'session_date', 'bucket_started_at'),
+    )
+
+
+class PaperAccountRiskEvent(Base):
+    """Immutable idempotent account risk transition and manual-control event."""
+
+    __tablename__ = 'paper_account_risk_events'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_key = Column(String(220), nullable=False, unique=True, index=True)
+    idempotency_key = Column(String(128), index=True)
+    payload_hash = Column(String(64))
+    event_type = Column(String(32), nullable=False, index=True)
+    capital_account_id = Column(Integer, ForeignKey('paper_capital_accounts.id'), nullable=False, index=True)
+    snapshot_id = Column(Integer, ForeignKey('paper_account_risk_snapshots.id'), index=True)
+    resolution_key = Column(String(220), index=True)
+    logical_order_key = Column(String(220), index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    currency = Column(String(8), nullable=False)
+    old_state = Column(String(32))
+    new_state = Column(String(32), nullable=False, index=True)
+    active_reasons_json = Column(Text, nullable=False, default='[]')
+    metric = Column(String(64))
+    threshold = Column(Float)
+    source = Column(String(64), nullable=False, default='risk_gate')
+    recovery_condition_json = Column(Text, nullable=False, default='{}')
+    evidence_json = Column(Text, nullable=False, default='{}')
+    notification_status = Column(String(24))
+    notification_error = Column(String(255))
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        Index('ix_paper_risk_event_scope_time', 'source_model', 'market', 'currency', 'created_at'),
+    )
+
+
+class PaperPosition(Base):
+    """Persistent simulated position. This model has no broker/order fields."""
+
+    __tablename__ = 'paper_positions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plan_id = Column(Integer, ForeignKey('paper_execution_plans.id'), nullable=False, index=True)
+    entry_leg_id = Column(String(64), nullable=False, default='legacy_entry', index=True)
+    execution_index = Column(Integer, nullable=False, default=1, index=True)
+    source_report_id = Column(Integer, ForeignKey('analysis_history.id'), nullable=False, index=True)
+    decision_signal_id = Column(Integer, ForeignKey('decision_signals.id'), index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    stock_name = Column(String(64))
+    status = Column(String(16), nullable=False, default='open', index=True)
+    opened_on = Column(Date, nullable=False, index=True)
+    opened_at = Column(DateTime, index=True)
+    opened_price = Column(Float, nullable=False)
+    normalized_notional = Column(Float, nullable=False, default=100000.0)
+    quantity = Column(Float, nullable=False)
+    initial_quantity = Column(Float)
+    capital_account_id = Column(Integer, ForeignKey('paper_capital_accounts.id'), index=True)
+    currency = Column(String(8))
+    allocated_capital = Column(Float)
+    initial_allocated_capital = Column(Float)
+    remaining_cost = Column(Float)
+    realized_quantity = Column(Float, nullable=False, default=0.0)
+    realized_proceeds = Column(Float, nullable=False, default=0.0)
+    realized_fees = Column(Float, nullable=False, default=0.0)
+    realized_pnl = Column(Float, nullable=False, default=0.0)
+    lot_size = Column(Integer)
+    risk_amount = Column(Float)
+    risk_per_share = Column(Float)
+    sizing_reason = Column(String(64))
+    legacy_fixed_notional = Column(Boolean, nullable=False, default=False)
+    trading_style = Column(String(32), index=True)
+    trading_style_policy_version = Column(String(32))
+    trading_style_settings_json = Column(Text)
+    market_regime_context_id = Column(Integer, ForeignKey('daily_market_regimes.id'), index=True)
+    market_regime = Column(String(32), index=True)
+    market_regime_policy_version = Column(String(32))
+    sync_origin = Column(String(32), nullable=False, default='paper_generated', index=True)
+    sync_status = Column(String(32), nullable=False, default='paper_only', index=True)
+    source_portfolio_position_id = Column(Integer, index=True)
+    last_synced_at = Column(DateTime, index=True)
+    available_quantity = Column(Float)
+    frozen_quantity = Column(Float)
+    pending_exit_reason = Column(String(64), index=True)
+    pending_exit_on = Column(Date, index=True)
+    pending_exit_price = Column(Float)
+    pending_exit_event_id = Column(Integer, index=True)
+    sellability_rule = Column(String(32), nullable=False, default='unknown_t1_fail_closed', index=True)
+    stop_loss = Column(Float)
+    target_price = Column(Float)
+    max_holding_sessions = Column(Integer, nullable=False)
+    closed_on = Column(Date, index=True)
+    closed_price = Column(Float)
+    close_reason = Column(String(32), index=True)
+    close_signal_id = Column(Integer, ForeignKey('decision_signals.id'), index=True)
+    simulated_return_pct = Column(Float)
+    simulated_pnl = Column(Float)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_paper_position_identity_status', 'market', 'stock_code', 'status'),
+        Index('uix_paper_position_plan_leg_execution', 'plan_id', 'entry_leg_id', 'execution_index', unique=True),
+    )
+
+
+class PaperTradeEvent(Base):
+    """Immutable paper-ledger event with source attribution snapshots."""
+
+    __tablename__ = 'paper_trade_events'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_key = Column(String(192), nullable=False, unique=True, index=True)
+    plan_id = Column(Integer, ForeignKey('paper_execution_plans.id'), nullable=False, index=True)
+    position_id = Column(Integer, ForeignKey('paper_positions.id'), nullable=False, index=True)
+    source_report_id = Column(Integer, ForeignKey('analysis_history.id'), nullable=False, index=True)
+    decision_signal_id = Column(Integer, ForeignKey('decision_signals.id'), index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    stock_name = Column(String(64))
+    event_type = Column(String(16), nullable=False, index=True)
+    event_date = Column(Date, nullable=False, index=True)
+    price = Column(Float, nullable=False)
+    quantity = Column(Float)
+    requested_quantity = Column(Float)
+    executed_quantity = Column(Float)
+    unfilled_quantity = Column(Float)
+    gross_amount = Column(Float)
+    commission = Column(Float)
+    tax = Column(Float)
+    slippage_amount = Column(Float)
+    fees = Column(Float)
+    net_amount = Column(Float)
+    gross_realized_pnl = Column(Float)
+    net_realized_pnl = Column(Float)
+    fill_price = Column(Float)
+    fill_evidence_grade = Column(String(32))
+    resolution_key = Column(String(220), index=True)
+    logical_order_key = Column(String(220), index=True)
+    instrument_assumption = Column(String(64))
+    quote_provider_timestamp = Column(String(64))
+    quote_fetched_at = Column(String(64))
+    reason = Column(String(64), nullable=False)
+    triggering_signal_id = Column(Integer, ForeignKey('decision_signals.id'), index=True)
+    capital_account_id = Column(Integer, ForeignKey('paper_capital_accounts.id'), index=True)
+    currency = Column(String(8))
+    allocated_capital = Column(Float)
+    cash_after = Column(Float)
+    exposure_after = Column(Float)
+    realized_pnl_after = Column(Float)
+    details_json = Column(Text, nullable=False, default='{}')
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+
+class PaperSignalConsumption(Base):
+    """Once-only consumption guard for aggregate model defensive signals."""
+
+    __tablename__ = 'paper_signal_consumptions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    consumption_key = Column(String(220), nullable=False, unique=True, index=True)
+    signal_id = Column(Integer, ForeignKey('decision_signals.id'), nullable=False, index=True)
+    capital_account_id = Column(Integer, ForeignKey('paper_capital_accounts.id'), index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    currency = Column(String(8), nullable=False)
+    holding_intent_kind = Column(String(32), nullable=False, index=True)
+    resolution_key = Column(String(220), nullable=False, index=True)
+    logical_order_key = Column(String(220), index=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'capital_account_id',
+            'source_model',
+            'market',
+            'stock_code',
+            'currency',
+            'signal_id',
+            'holding_intent_kind',
+            name='uix_paper_signal_consumption_identity',
+        ),
+    )
+
+
+class PaperRiskRevision(Base):
+    """Immutable per-lot stop/target revision ledger."""
+
+    __tablename__ = 'paper_risk_revisions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    revision_key = Column(String(220), nullable=False, unique=True, index=True)
+    policy_version = Column(String(32), nullable=False, index=True)
+    position_id = Column(Integer, ForeignKey('paper_positions.id'), nullable=False, index=True)
+    plan_id = Column(Integer, ForeignKey('paper_execution_plans.id'), nullable=False, index=True)
+    source_report_id = Column(Integer, ForeignKey('analysis_history.id'), index=True)
+    decision_signal_id = Column(Integer, ForeignKey('decision_signals.id'), index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    revision_version = Column(Integer, nullable=False, default=1, index=True)
+    result = Column(String(32), nullable=False, index=True)
+    reason = Column(String(96), nullable=False)
+    old_stop_loss = Column(Float)
+    new_stop_loss = Column(Float)
+    applied_stop_loss = Column(Float)
+    old_target_price = Column(Float)
+    new_target_price = Column(Float)
+    applied_target_price = Column(Float)
+    evaluated_at = Column(DateTime, nullable=False, index=True)
+    evidence_json = Column(Text, nullable=False, default='{}')
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        Index('ix_paper_risk_revision_position_time', 'position_id', 'evaluated_at'),
+    )
+
+
+class PaperStrategyThesis(Base):
+    """Current accepted strategy thesis for one model/symbol/style scope."""
+
+    __tablename__ = 'paper_strategy_theses'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    thesis_key = Column(String(220), nullable=False, unique=True, index=True)
+    policy_version = Column(String(32), nullable=False, index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    stock_name = Column(String(64))
+    trading_style = Column(String(32), nullable=False, index=True)
+    state = Column(String(32), nullable=False, default='watching', index=True)
+    effective_action = Column(String(16), nullable=False, default='watch', index=True)
+    raw_action = Column(String(16), index=True)
+    action_bucket = Column(String(16), nullable=False, default='neutral', index=True)
+    confirmation_count = Column(Integer, nullable=False, default=0)
+    contradiction_count = Column(Integer, nullable=False, default=0)
+    accepted_report_id = Column(Integer, ForeignKey('analysis_history.id'), index=True)
+    accepted_signal_id = Column(Integer, ForeignKey('decision_signals.id'), index=True)
+    last_report_id = Column(Integer, ForeignKey('analysis_history.id'), index=True)
+    last_signal_id = Column(Integer, ForeignKey('decision_signals.id'), index=True)
+    entry_low = Column(Float)
+    entry_high = Column(Float)
+    stop_loss = Column(Float)
+    target_price = Column(Float)
+    thesis_text = Column(Text)
+    invalidation_text = Column(Text)
+    evidence_json = Column(Text, nullable=False, default='{}')
+    accepted_at = Column(DateTime, index=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_paper_strategy_thesis_scope', 'source_model', 'market', 'stock_code', 'trading_style'),
+    )
+
+
+class PaperStrategyTransition(Base):
+    """Append-only audit of report-to-thesis acceptance decisions."""
+
+    __tablename__ = 'paper_strategy_transitions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    transition_key = Column(String(220), nullable=False, unique=True, index=True)
+    thesis_id = Column(Integer, ForeignKey('paper_strategy_theses.id'), index=True)
+    thesis_key = Column(String(220), nullable=False, index=True)
+    policy_version = Column(String(32), nullable=False, index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    trading_style = Column(String(32), nullable=False, index=True)
+    source_report_id = Column(Integer, ForeignKey('analysis_history.id'), nullable=False, index=True)
+    decision_signal_id = Column(Integer, ForeignKey('decision_signals.id'), index=True)
+    raw_action = Column(String(16), index=True)
+    previous_state = Column(String(32))
+    new_state = Column(String(32), nullable=False, index=True)
+    result = Column(String(32), nullable=False, index=True)
+    reason = Column(String(96), nullable=False)
+    plan_authorized = Column(Boolean, nullable=False, default=False, index=True)
+    risk_revision_authorized = Column(Boolean, nullable=False, default=False)
+    freeze_entry_authorized = Column(Boolean, nullable=False, default=False)
+    confirmation_count = Column(Integer, nullable=False, default=0)
+    contradiction_count = Column(Integer, nullable=False, default=0)
+    entry_low = Column(Float)
+    entry_high = Column(Float)
+    stop_loss = Column(Float)
+    target_price = Column(Float)
+    evidence_json = Column(Text, nullable=False, default='{}')
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        Index('ix_paper_strategy_transition_scope_time', 'source_model', 'market', 'stock_code', 'created_at'),
+    )
+
+
+class PaperSyncLink(Base):
+    """Idempotent explicit synchronization between portfolio and paper ledgers."""
+
+    __tablename__ = 'paper_sync_links'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    idempotency_key = Column(String(160), nullable=False, unique=True, index=True)
+    payload_hash = Column(String(64), nullable=False)
+    direction = Column(String(32), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default='synced', index=True)
+    source_model = Column(String(255), nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    portfolio_account_id = Column(Integer, ForeignKey('portfolio_accounts.id'), index=True)
+    portfolio_position_id = Column(Integer, index=True)
+    portfolio_trade_id = Column(Integer, ForeignKey('portfolio_trades.id'), index=True)
+    paper_plan_id = Column(Integer, ForeignKey('paper_execution_plans.id'), index=True)
+    paper_position_id = Column(Integer, ForeignKey('paper_positions.id'), index=True)
+    paper_event_id = Column(Integer, ForeignKey('paper_trade_events.id'), index=True)
+    quantity = Column(Float, nullable=False)
+    price = Column(Float, nullable=False)
+    fee = Column(Float, nullable=False, default=0.0)
+    trade_date = Column(Date, nullable=False, index=True)
+    origin = Column(String(32), nullable=False)
+    details_json = Column(Text, nullable=False, default='{}')
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_paper_sync_identity_direction', 'source_model', 'market', 'stock_code', 'direction'),
+        Index('ix_paper_sync_portfolio_position', 'portfolio_position_id', 'direction'),
+    )
+
+
+class PaperNotificationDispatch(Base):
+    """Idempotent outbound notification state for paper trade events."""
+
+    __tablename__ = 'paper_notification_dispatches'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dispatch_key = Column(String(220), nullable=False, unique=True, index=True)
+    event_id = Column(Integer, ForeignKey('paper_trade_events.id'), nullable=False, index=True)
+    channel = Column(String(32), nullable=False, index=True)
+    status = Column(String(24), nullable=False, default='pending', index=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text)
+    payload_json = Column(Text, nullable=False, default='{}')
+    sent_at = Column(DateTime, index=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_paper_dispatch_channel_status', 'channel', 'status'),
+    )
+
+
+class RuntimeSchedulerHeartbeat(Base):
+    """Shared scheduler heartbeat visible across API and worker containers."""
+
+    __tablename__ = 'runtime_scheduler_heartbeats'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    heartbeat_key = Column(String(160), nullable=False, unique=True, index=True)
+    owner_id = Column(String(128), nullable=False, index=True)
+    owner_kind = Column(String(32), nullable=False, index=True)
+    task_name = Column(String(96), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default='alive', index=True)
+    pid = Column(Integer)
+    observed_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    last_success_at = Column(DateTime, index=True)
+    last_error_at = Column(DateTime, index=True)
+    error_message = Column(Text)
+    details_json = Column(Text, nullable=False, default='{}')
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_runtime_scheduler_heartbeat_task_time', 'task_name', 'observed_at'),
+    )
+
+
+class RuntimeSchedulerLease(Base):
+    """Cross-process duplicate-bucket claim for scheduled worker execution."""
+
+    __tablename__ = 'runtime_scheduler_leases'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    lease_key = Column(String(220), nullable=False, unique=True, index=True)
+    owner_id = Column(String(128), nullable=False, index=True)
+    owner_kind = Column(String(32), nullable=False, index=True)
+    task_name = Column(String(96), nullable=False, index=True)
+    bucket_started_at = Column(DateTime, nullable=False, index=True)
+    lease_until = Column(DateTime, nullable=False, index=True)
+    status = Column(String(32), nullable=False, default='claimed', index=True)
+    started_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    finished_at = Column(DateTime, index=True)
+    last_heartbeat_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    last_error = Column(Text)
+    details_json = Column(Text, nullable=False, default='{}')
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_runtime_scheduler_lease_task_bucket', 'task_name', 'bucket_started_at'),
+    )
+
+
+class ReportPlanReconciliation(Base):
+    """Durable report -> DecisionSignal -> paper-plan processing state."""
+
+    __tablename__ = 'report_plan_reconciliations'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    reconciliation_key = Column(String(220), nullable=False, unique=True, index=True)
+    source_report_id = Column(Integer, ForeignKey('analysis_history.id'), nullable=False, index=True)
+    plan_version = Column(String(32), nullable=False, index=True)
+    source_model = Column(String(255), index=True)
+    decision_signal_id = Column(Integer, ForeignKey('decision_signals.id'), index=True)
+    paper_plan_id = Column(Integer, ForeignKey('paper_execution_plans.id'), index=True)
+    status = Column(String(32), nullable=False, default='pending', index=True)
+    classification = Column(String(64), index=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=3)
+    next_retry_at = Column(DateTime, index=True)
+    last_attempt_at = Column(DateTime, index=True)
+    last_error = Column(Text)
+    details_json = Column(Text, nullable=False, default='{}')
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_report_plan_reconcile_status_retry', 'status', 'next_retry_at'),
+        Index('ix_report_plan_reconcile_report_version', 'source_report_id', 'plan_version'),
+    )
+
+
+class DailyMarketRegime(Base):
+    """Structured market regime consumed by deterministic paper entry gates."""
+
+    __tablename__ = 'daily_market_regimes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    regime_key = Column(String(160), nullable=False, unique=True, index=True)
+    region = Column(String(16), nullable=False, index=True)
+    session_date = Column(Date, nullable=False, index=True)
+    regime = Column(String(32), nullable=False, default='unavailable', index=True)
+    allocation_multiplier = Column(Float, nullable=False, default=0.0)
+    entry_allowed = Column(Boolean, nullable=False, default=False, index=True)
+    source_report_id = Column(Integer, ForeignKey('analysis_history.id'), index=True)
+    source_query_id = Column(String(64), index=True)
+    provenance_json = Column(Text, nullable=False, default='{}')
+    freshness_expires_at = Column(DateTime, index=True)
+    policy_version = Column(String(32), nullable=False, default='market-regime-v1', index=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_daily_market_regime_region_date', 'region', 'session_date'),
+    )
+
+
+class MarketOpportunityRun(Base):
+    """Durable market-theme opportunity discovery run."""
+
+    __tablename__ = 'market_opportunity_runs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_key = Column(String(220), nullable=False, unique=True, index=True)
+    market = Column(String(16), nullable=False, default='cn', index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    source_report_id = Column(Integer, ForeignKey('analysis_history.id'), nullable=False, index=True)
+    market_regime_id = Column(Integer, ForeignKey('daily_market_regimes.id'), index=True)
+    market_regime = Column(String(32), nullable=False, default='unavailable', index=True)
+    mode = Column(String(16), nullable=False, default='off', index=True)
+    status = Column(String(32), nullable=False, default='pending', index=True)
+    policy_version = Column(String(64), nullable=False, default='opportunity-policy-v1', index=True)
+    config_snapshot_json = Column(Text, nullable=False, default='{}')
+    provenance_json = Column(Text, nullable=False, default='{}')
+    theme_count = Column(Integer, nullable=False, default=0)
+    selected_theme_count = Column(Integer, nullable=False, default=0)
+    candidate_count = Column(Integer, nullable=False, default=0)
+    selected_candidate_count = Column(Integer, nullable=False, default=0)
+    llm_budget = Column(Integer, nullable=False, default=0)
+    error_message = Column(Text)
+    started_at = Column(DateTime, index=True)
+    completed_at = Column(DateTime, index=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_market_opportunity_run_scope', 'market', 'trade_date', 'status'),
+        Index('ix_market_opportunity_run_report', 'source_report_id', 'policy_version'),
+    )
+
+
+class MarketOpportunityTheme(Base):
+    """Theme-level opportunity score and constituent provenance."""
+
+    __tablename__ = 'market_opportunity_themes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(Integer, ForeignKey('market_opportunity_runs.id'), nullable=False, index=True)
+    theme_key = Column(String(220), nullable=False, index=True)
+    theme_type = Column(String(16), nullable=False, index=True)
+    theme_name = Column(String(128), nullable=False, index=True)
+    theme_code = Column(String(64))
+    rank = Column(Integer)
+    change_pct = Column(Float)
+    status = Column(String(32), nullable=False, default='rejected', index=True)
+    score = Column(Float)
+    score_components_json = Column(Text, nullable=False, default='{}')
+    rejection_reasons_json = Column(Text, nullable=False, default='[]')
+    data_quality_json = Column(Text, nullable=False, default='{}')
+    constituent_snapshot_json = Column(Text, nullable=False, default='{}')
+    constituent_count = Column(Integer, nullable=False, default=0)
+    eligible_constituent_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'theme_key', name='uix_market_opportunity_theme_run_key'),
+        Index('ix_market_opportunity_theme_status_score', 'status', 'score'),
+    )
+
+
+class MarketOpportunityCandidate(Base):
+    """Stock-level opportunity candidate with deterministic score evidence."""
+
+    __tablename__ = 'market_opportunity_candidates'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(Integer, ForeignKey('market_opportunity_runs.id'), nullable=False, index=True)
+    theme_id = Column(Integer, ForeignKey('market_opportunity_themes.id'), index=True)
+    candidate_key = Column(String(260), nullable=False, index=True)
+    market = Column(String(16), nullable=False, default='cn', index=True)
+    exchange = Column(String(8), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    symbol = Column(String(32), nullable=False, index=True)
+    stock_name = Column(String(128))
+    primary_theme_key = Column(String(220), index=True)
+    related_themes_json = Column(Text, nullable=False, default='[]')
+    status = Column(String(32), nullable=False, default='rejected', index=True)
+    rank = Column(Integer)
+    score = Column(Float)
+    score_components_json = Column(Text, nullable=False, default='{}')
+    rejection_reasons_json = Column(Text, nullable=False, default='[]')
+    data_quality_json = Column(Text, nullable=False, default='{}')
+    quote_snapshot_json = Column(Text, nullable=False, default='{}')
+    as_of = Column(Date, nullable=False, index=True)
+    valid_until = Column(Date, index=True)
+    snapshot_hash = Column(String(80), index=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'candidate_key', name='uix_market_opportunity_candidate_run_key'),
+        Index('ix_market_opportunity_candidate_status_score', 'status', 'score'),
+        Index('ix_market_opportunity_candidate_identity', 'market', 'exchange', 'stock_code'),
+    )
+
+
+class MarketOpportunityAnalysisJob(Base):
+    """Per-model opportunity analysis job ledger."""
+
+    __tablename__ = 'market_opportunity_analysis_jobs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_key = Column(String(300), nullable=False, unique=True, index=True)
+    run_id = Column(Integer, ForeignKey('market_opportunity_runs.id'), nullable=False, index=True)
+    candidate_id = Column(Integer, ForeignKey('market_opportunity_candidates.id'), nullable=False, index=True)
+    model = Column(String(255), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default='pending', index=True)
+    lease_owner = Column(String(128), index=True)
+    lease_expires_at = Column(DateTime, index=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=2)
+    next_retry_at = Column(DateTime, index=True)
+    task_id = Column(String(64), index=True)
+    query_id = Column(String(64), index=True)
+    analysis_history_id = Column(Integer, ForeignKey('analysis_history.id'), index=True)
+    decision_signal_id = Column(Integer, ForeignKey('decision_signals.id'), index=True)
+    paper_plan_id = Column(Integer, ForeignKey('paper_execution_plans.id'), index=True)
+    failure_reason = Column(String(160))
+    evidence_json = Column(Text, nullable=False, default='{}')
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('candidate_id', 'model', name='uix_market_opportunity_job_candidate_model'),
+        Index('ix_market_opportunity_job_status_retry', 'status', 'next_retry_at'),
+        Index('ix_market_opportunity_job_run_model', 'run_id', 'model', 'status'),
+    )
+
+
+# 机会池 run/job 的来源由不可变 key 前缀区分；研究任务的前缀在首次落库时写入，
+# 后续状态更新不会改变 job_key，因此外部输入无法把研究任务提升为可执行任务。
+MARKET_OPPORTUNITY_DISCOVERY_RUN_KEY_PREFIX = "market-opportunity:"
+MARKET_OPPORTUNITY_FOLLOWUP_RUN_KEY_PREFIX = "opportunity-followup:"
+MARKET_OPPORTUNITY_RESEARCH_REVIEW_RUN_KEY_PREFIX = "opportunity-research-review:"
+MARKET_OPPORTUNITY_RESEARCH_JOB_KEY_PREFIX = "market-opportunity-research:"
+
+
+def is_market_opportunity_research_job_key(job_key: Any) -> bool:
+    """Return whether a persisted opportunity job was created research-only."""
+
+    return str(job_key or "").startswith(MARKET_OPPORTUNITY_RESEARCH_JOB_KEY_PREFIX)
+
+
+class MarketOpportunityResearchBudgetSlot(Base):
+    """Per-market, per-session research LLM budget ledger.
+
+    Each row occupies one numbered slot. ``reserved`` rows hold a slot for a
+    due research review; ``charged`` rows record one submitted model attempt.
+    Slots are never released, so retries and restarts cannot exceed the limit.
+    """
+
+    __tablename__ = 'market_opportunity_research_budget_slots'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    market = Column(String(16), nullable=False, default='cn', index=True)
+    session_date = Column(Date, nullable=False, index=True)
+    slot_no = Column(Integer, nullable=False)
+    job_id = Column(Integer, index=True)
+    attempt_no = Column(Integer)
+    job_kind = Column(String(16), nullable=False, default='initial')
+    state = Column(String(16), nullable=False, default='charged', index=True)
+    reservation_key = Column(String(200), unique=True)
+    query_id = Column(String(64), index=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('market', 'session_date', 'slot_no', name='uix_mo_research_budget_slot'),
+        UniqueConstraint('job_id', 'attempt_no', name='uix_mo_research_budget_attempt'),
+    )
+
+
+class BoardObservation(Base):
+    """Daily complete board-ranking snapshot for opportunity discovery."""
+
+    __tablename__ = 'board_observations'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_key = Column(String(220), nullable=False, unique=True, index=True)
+    market = Column(String(8), nullable=False, default='cn', index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    source = Column(String(64), nullable=False, index=True)
+    taxonomy = Column(String(64), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default='healthy', index=True)
+    reason = Column(String(128))
+    coverage_json = Column(Text, nullable=False, default='{}')
+    themes_json = Column(Text, nullable=False, default='[]')
+    snapshot_hash = Column(String(64), nullable=False, default='', index=True)
+    fetched_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('market', 'trade_date', 'source', 'taxonomy', name='uix_board_observation_identity'),
+        Index('ix_board_observation_market_date_status', 'market', 'trade_date', 'status'),
+        Index('ix_board_observation_source_taxonomy_date', 'source', 'taxonomy', 'trade_date'),
+    )
+
+
 class _DatabaseManagerMeta(type):
     """Serialize DatabaseManager construction across __new__ and __init__."""
 
@@ -1142,28 +2398,45 @@ class _DatabaseManagerMeta(type):
 class DatabaseManager(metaclass=_DatabaseManagerMeta):
     """
     数据库管理器 - 单例模式
-    
+
     职责：
     1. 管理数据库连接池
     2. 提供 Session 上下文管理
     3. 封装数据存取操作
     """
-    
+
     _instance: Optional['DatabaseManager'] = None
     _init_lock = threading.RLock()
     _initialized: bool = False
-    
+
+    @staticmethod
+    def _legacy_paper_opened_at_utc(market: str, opened_on: date) -> datetime:
+        """Backfill legacy paper lots to market-close UTC-naive timestamps."""
+
+        market_norm = str(market or "").lower()
+        close_times = {
+            "cn": (dt_time(15, 0), "Asia/Shanghai"),
+            "hk": (dt_time(16, 0), "Asia/Shanghai"),
+            "us": (dt_time(16, 0), "America/New_York"),
+            "jp": (dt_time(15, 30), "Asia/Tokyo"),
+            "kr": (dt_time(15, 30), "Asia/Seoul"),
+            "tw": (dt_time(13, 30), "Asia/Taipei"),
+        }
+        close_time, zone_name = close_times.get(market_norm, (dt_time(15, 0), "Asia/Shanghai"))
+        local_dt = datetime.combine(opened_on, close_time, tzinfo=ZoneInfo(zone_name))
+        return local_dt.astimezone(timezone.utc).replace(tzinfo=None)
+
     def __new__(cls, *args, **kwargs):
         """单例模式实现"""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._initialized = False
         return cls._instance
-    
+
     def __init__(self, db_url: Optional[str] = None):
         """
         初始化数据库管理器
-        
+
         Args:
             db_url: 数据库连接 URL（可选，默认从配置读取）
         """
@@ -1198,7 +2471,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 **engine_kwargs,
             )
             self._engine = created_engine
-            self._is_sqlite_engine = self._engine.url.get_backend_name() == 'sqlite'
+            self._dialect_name = self._engine.url.get_backend_name()
+            self._is_sqlite_engine = self._dialect_name == 'sqlite'
             self._sqlite_file_db = self._is_sqlite_engine and self._is_file_sqlite_database()
             self._install_sqlite_pragma_handler()
 
@@ -1209,16 +2483,37 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 autoflush=False,
             )
 
-            # 创建所有表
-            Base.metadata.create_all(self._engine)
+            # 创建所有表。Docker 会同时启动 API 与调度容器；PostgreSQL 下用
+            # transaction-scoped advisory lock 串行化首次建表，避免两个进程
+            # 在空库上并发 create_all 产生系统目录唯一键冲突。
+            if self._dialect_name == "postgresql":
+                with self._engine.begin() as connection:
+                    connection.execute(
+                        text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                        {"lock_id": POSTGRES_SCHEMA_ADVISORY_LOCK_ID},
+                    )
+                    create_application_schema(connection)
+            else:
+                Base.metadata.create_all(self._engine)
+            self._ensure_analysis_attempt_schema()
             self._ensure_llm_usage_telemetry_columns()
             self._ensure_decision_signal_profile_schema()
+            self._ensure_analysis_history_model_used_column()
+            self._ensure_backtest_metric_columns()
+            self._ensure_paper_trading_observation_schema()
+            self._ensure_paper_trading_capital_schema()
+            self._ensure_paper_positions_multi_lot_schema()
+            self._ensure_paper_evaluations_position_leg_schema()
+            self._ensure_paper_sync_links_portfolio_position_fk_removed()
+            self._ensure_board_observation_schema()
             self._ensure_intelligence_item_scope_values()
             self._ensure_schema_migration_record()
+            self._ensure_report_execution_intent_baseline()
             self._ensure_intelligence_items_unique_index()
 
             self._initialized = True
-            logger.info(f"数据库初始化完成: {db_url}")
+            safe_db_url = self._engine.url.render_as_string(hide_password=True)
+            logger.info("数据库初始化完成: %s", safe_db_url)
 
             # 注册退出钩子，确保程序退出时关闭数据库连接
             atexit.register(DatabaseManager._cleanup_engine, self._engine)
@@ -1234,6 +2529,658 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self.__class__._instance = None
             raise
 
+    def _ensure_analysis_history_model_used_column(self) -> None:
+        """Add/backfill the model dimension for existing local SQLite databases."""
+
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        if not inspector.has_table(AnalysisHistory.__tablename__):
+            return
+
+        existing = {
+            column["name"]
+            for column in inspector.get_columns(AnalysisHistory.__tablename__)
+        }
+        needs_backfill = "model_used" not in existing
+        if needs_backfill:
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {AnalysisHistory.__tablename__} "
+                        "ADD COLUMN model_used VARCHAR(255)"
+                    )
+            except OperationalError as exc:
+                if not self._is_sqlite_duplicate_column_error(exc, "model_used"):
+                    raise
+
+        with self._engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_analysis_history_model_used "
+                "ON analysis_history (model_used)"
+            )
+            rows = connection.exec_driver_sql(
+                "SELECT id, raw_result FROM analysis_history "
+                "WHERE model_used IS NULL AND raw_result IS NOT NULL"
+            ).fetchall()
+            for row_id, raw_result in rows:
+                try:
+                    payload = json.loads(raw_result)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                model_used = str(payload.get("model_used") or "").strip()
+                if not model_used:
+                    continue
+                connection.exec_driver_sql(
+                    "UPDATE analysis_history SET model_used = ? WHERE id = ?",
+                    (model_used[:255], row_id),
+                )
+
+    def _ensure_analysis_attempt_schema(self) -> None:
+        """Create analysis_attempts for upgraded databases that predate the model."""
+
+        try:
+            Base.metadata.create_all(self._engine, tables=[AnalysisAttempt.__table__])
+        except Exception as exc:
+            logger.warning("analysis_attempts schema ensure failed: %s", exc)
+
+    def _ensure_board_observation_schema(self) -> None:
+        """Create board_observations for upgraded databases that predate the model."""
+
+        try:
+            Base.metadata.create_all(self._engine, tables=[BoardObservation.__table__])
+        except Exception as exc:
+            logger.warning("board_observations schema ensure failed: %s", exc)
+
+    def _ensure_backtest_metric_columns(self) -> None:
+        """Idempotently add dual-metric columns to existing SQLite databases."""
+
+        if not self._is_sqlite_engine:
+            return
+
+        table_columns = {
+            BacktestResult.__tablename__: {
+                "holding_state": "VARCHAR(16)",
+                "holding_action": "VARCHAR(16)",
+                "holding_action_applicable": "BOOLEAN NOT NULL DEFAULT 0",
+                "holding_action_evaluable": "BOOLEAN NOT NULL DEFAULT 0",
+                "holding_eval_status": "VARCHAR(24) NOT NULL DEFAULT 'unavailable'",
+                "holding_direction_expected": "VARCHAR(16)",
+                "holding_decision_correct": "BOOLEAN",
+                "holding_outcome": "VARCHAR(16)",
+                "holding_decision_return_pct": "FLOAT",
+            },
+            BacktestSummary.__tablename__: {
+                "direction_evaluable_count": "INTEGER DEFAULT 0",
+                "holding_applicable_count": "INTEGER DEFAULT 0",
+                "holding_evaluable_count": "INTEGER DEFAULT 0",
+                "holding_unavailable_count": "INTEGER DEFAULT 0",
+                "holding_correct_count": "INTEGER DEFAULT 0",
+                "holding_incorrect_count": "INTEGER DEFAULT 0",
+                "holding_neutral_count": "INTEGER DEFAULT 0",
+                "holding_decision_accuracy_pct": "FLOAT",
+                "avg_holding_decision_return_pct": "FLOAT",
+            },
+        }
+        inspector = inspect(self._engine)
+        for table_name, columns in table_columns.items():
+            if not inspector.has_table(table_name):
+                continue
+            existing = {column["name"] for column in inspector.get_columns(table_name)}
+            for column_name, column_sql in columns.items():
+                if column_name in existing:
+                    continue
+                try:
+                    with self._engine.begin() as connection:
+                        connection.exec_driver_sql(
+                            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"
+                        )
+                except OperationalError as exc:
+                    if not self._is_sqlite_duplicate_column_error(exc, column_name):
+                        raise
+        # Existing summaries predate the frozen holding contract. They must
+        # remain excluded from holding accuracy, but should be counted as
+        # unavailable instead of presenting a misleading zero.
+        if inspector.has_table(BacktestSummary.__tablename__):
+            with self._engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "UPDATE backtest_summaries "
+                    "SET holding_unavailable_count = COALESCE(total_evaluations, 0) "
+                    "WHERE COALESCE(total_evaluations, 0) > 0 "
+                    "AND COALESCE(holding_unavailable_count, 0) = 0 "
+                    "AND COALESCE(holding_applicable_count, 0) = 0 "
+                    "AND COALESCE(holding_evaluable_count, 0) = 0 "
+                    "AND COALESCE(holding_correct_count, 0) = 0 "
+                    "AND COALESCE(holding_incorrect_count, 0) = 0"
+                )
+
+    def _ensure_paper_sync_links_portfolio_position_fk_removed(self) -> None:
+        """Remove legacy SQLite FK from paper_sync_links to refreshable portfolio_positions."""
+
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        if not inspector.has_table(PaperSyncLink.__tablename__):
+            return
+        try:
+            with self._engine.connect() as connection:
+                foreign_keys = connection.execute(
+                    text(f"PRAGMA foreign_key_list({PaperSyncLink.__tablename__})")
+                ).fetchall()
+        except Exception as exc:
+            logger.warning(
+                "Failed to inspect paper_sync_links foreign keys; skip FK repair: %s",
+                exc,
+            )
+            return
+
+        has_legacy_fk = any(
+            row[2] == PortfolioPosition.__tablename__
+            and row[3] == "portfolio_position_id"
+            and row[4] == "id"
+            for row in foreign_keys
+        )
+        if not has_legacy_fk:
+            return
+
+        self._rebuild_paper_sync_links_table_without_portfolio_position_fk()
+
+    def _rebuild_paper_sync_links_table_without_portfolio_position_fk(self) -> None:
+        temporary_table = f"paper_sync_links_recreate_tmp_{int(time.time() * 1_000_000_000)}"
+        target_columns = [column.name for column in PaperSyncLink.__table__.columns]
+
+        inspector = inspect(self._engine)
+        existing_columns = {
+            column["name"]
+            for column in inspector.get_columns(PaperSyncLink.__tablename__)
+        }
+        copy_columns = [column for column in target_columns if column in existing_columns]
+        if not copy_columns:
+            logger.warning("paper_sync_links FK repair skipped because no shared columns were found.")
+            return
+
+        column_clause = ", ".join(f'"{column}"' for column in copy_columns)
+        select_expressions = []
+        for column in copy_columns:
+            if column in {"created_at", "updated_at"}:
+                select_expressions.append(f'COALESCE("{column}", CURRENT_TIMESTAMP) AS "{column}"')
+            elif column == "status":
+                select_expressions.append(f'COALESCE("{column}", \'synced\') AS "{column}"')
+            elif column == "fee":
+                select_expressions.append(f'COALESCE("{column}", 0) AS "{column}"')
+            elif column == "details_json":
+                select_expressions.append(f'COALESCE("{column}", \'{{}}\') AS "{column}"')
+            else:
+                select_expressions.append(f'"{column}"')
+        select_clause = ", ".join(select_expressions)
+        create_table_sql = str(
+            CreateTable(PaperSyncLink.__table__).compile(dialect=self._engine.dialect)
+        ).replace(
+            f"CREATE TABLE {PaperSyncLink.__tablename__}",
+            f'CREATE TABLE "{temporary_table}"',
+            1,
+        )
+        logger.info(
+            "Rebuilding paper_sync_links table to remove legacy portfolio_positions FK."
+        )
+        with self._engine.begin() as connection:
+            connection.execute(text(f'DROP TABLE IF EXISTS "{temporary_table}"'))
+            connection.execute(text(create_table_sql))
+            connection.execute(
+                text(
+                    f'INSERT INTO "{temporary_table}" ({column_clause}) '
+                    f'SELECT {select_clause} FROM "{PaperSyncLink.__tablename__}"'
+                )
+            )
+            connection.execute(text(f'DROP TABLE "{PaperSyncLink.__tablename__}"'))
+            connection.execute(
+                text(
+                    f'ALTER TABLE "{temporary_table}" '
+                    f'RENAME TO "{PaperSyncLink.__tablename__}"'
+                )
+            )
+            for index in PaperSyncLink.__table__.indexes:
+                index.create(connection, checkfirst=True)
+
+    def _ensure_paper_trading_observation_schema(self) -> None:
+        """Idempotently add hybrid paper-monitor tables/columns to local SQLite."""
+
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        if not inspector.has_table(PaperExecutionPlan.__tablename__):
+            return
+        Base.metadata.create_all(self._engine, tables=[PaperPlanObservation.__table__])
+
+    def _ensure_paper_trading_capital_schema(self) -> None:
+        """Idempotently add paper capital/dispatch tables and nullable legacy columns."""
+
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        Base.metadata.create_all(
+            self._engine,
+            tables=[
+                PaperCapitalAccount.__table__,
+                PaperCapitalAdjustment.__table__,
+                PaperSyncLink.__table__,
+                PaperNotificationDispatch.__table__,
+                RuntimeSchedulerHeartbeat.__table__,
+                RuntimeSchedulerLease.__table__,
+                ReportPlanReconciliation.__table__,
+                DailyMarketRegime.__table__,
+                PaperReanalysisRequest.__table__,
+                PaperResolution.__table__,
+                PaperRiskRevision.__table__,
+                PaperStrategyThesis.__table__,
+                PaperStrategyTransition.__table__,
+                PaperSignalConsumption.__table__,
+                PaperAccountRiskSnapshot.__table__,
+                PaperAccountRiskEvent.__table__,
+            ],
+        )
+        table_columns = {
+            PaperPlanObservation.__tablename__: {
+                "resolution_key": "VARCHAR(220)",
+                "resolution_bucket_json": "TEXT",
+                "logical_order_key": "VARCHAR(220)",
+            },
+            PaperCapitalAccount.__tablename__: {
+                "external_cash_flow": "FLOAT NOT NULL DEFAULT 0",
+            },
+            PaperExecutionPlan.__tablename__: {
+                "valid_for_date": "DATE",
+                "plan_allocation_budget": "FLOAT",
+                "plan_risk_budget": "FLOAT",
+                "budget_snapshot_equity": "FLOAT",
+                "budget_snapshot_at": "DATETIME",
+                "trading_style": "VARCHAR(32)",
+                "trading_style_policy_version": "VARCHAR(32)",
+                "trading_style_settings_json": "TEXT",
+                "market_regime_context_id": "INTEGER",
+                "market_regime": "VARCHAR(32)",
+                "market_regime_policy_version": "VARCHAR(32)",
+            },
+            PaperPosition.__tablename__: {
+                "entry_leg_id": "VARCHAR(64) NOT NULL DEFAULT 'legacy_entry'",
+                "execution_index": "INTEGER NOT NULL DEFAULT 1",
+                "opened_at": "DATETIME",
+                "capital_account_id": "INTEGER",
+                "currency": "VARCHAR(8)",
+                "allocated_capital": "FLOAT",
+                "initial_quantity": "FLOAT",
+                "initial_allocated_capital": "FLOAT",
+                "remaining_cost": "FLOAT",
+                "realized_quantity": "FLOAT NOT NULL DEFAULT 0",
+                "realized_proceeds": "FLOAT NOT NULL DEFAULT 0",
+                "realized_fees": "FLOAT NOT NULL DEFAULT 0",
+                "realized_pnl": "FLOAT NOT NULL DEFAULT 0",
+                "lot_size": "INTEGER",
+                "risk_amount": "FLOAT",
+                "risk_per_share": "FLOAT",
+                "sizing_reason": "VARCHAR(64)",
+                "legacy_fixed_notional": "BOOLEAN NOT NULL DEFAULT 1",
+                "trading_style": "VARCHAR(32)",
+                "trading_style_policy_version": "VARCHAR(32)",
+                "trading_style_settings_json": "TEXT",
+                "market_regime_context_id": "INTEGER",
+                "market_regime": "VARCHAR(32)",
+                "market_regime_policy_version": "VARCHAR(32)",
+                "sync_origin": "VARCHAR(32) NOT NULL DEFAULT 'paper_generated'",
+                "sync_status": "VARCHAR(32) NOT NULL DEFAULT 'paper_only'",
+                "source_portfolio_position_id": "INTEGER",
+                "last_synced_at": "DATETIME",
+                "available_quantity": "FLOAT",
+                "frozen_quantity": "FLOAT",
+                "pending_exit_reason": "VARCHAR(64)",
+                "pending_exit_on": "DATE",
+                "pending_exit_price": "FLOAT",
+                "pending_exit_event_id": "INTEGER",
+                "sellability_rule": "VARCHAR(32) NOT NULL DEFAULT 'unknown_t1_fail_closed'",
+            },
+            PaperTradeEvent.__tablename__: {
+                "capital_account_id": "INTEGER",
+                "currency": "VARCHAR(8)",
+                "allocated_capital": "FLOAT",
+                "quantity": "FLOAT",
+                "requested_quantity": "FLOAT",
+                "executed_quantity": "FLOAT",
+                "unfilled_quantity": "FLOAT",
+                "gross_amount": "FLOAT",
+                "commission": "FLOAT",
+                "tax": "FLOAT",
+                "slippage_amount": "FLOAT",
+                "fees": "FLOAT",
+                "net_amount": "FLOAT",
+                "gross_realized_pnl": "FLOAT",
+                "net_realized_pnl": "FLOAT",
+                "fill_price": "FLOAT",
+                "fill_evidence_grade": "VARCHAR(32)",
+                "resolution_key": "VARCHAR(220)",
+                "logical_order_key": "VARCHAR(220)",
+                "instrument_assumption": "VARCHAR(64)",
+                "quote_provider_timestamp": "VARCHAR(64)",
+                "quote_fetched_at": "VARCHAR(64)",
+                "cash_after": "FLOAT",
+                "exposure_after": "FLOAT",
+                "realized_pnl_after": "FLOAT",
+            },
+        }
+        for table_name, columns in table_columns.items():
+            if not inspector.has_table(table_name):
+                continue
+            existing = {column["name"] for column in inspector.get_columns(table_name)}
+            for column_name, column_sql in columns.items():
+                if column_name in existing:
+                    continue
+                try:
+                    with self._engine.begin() as connection:
+                        connection.exec_driver_sql(
+                            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"
+                        )
+                except OperationalError as exc:
+                    if not self._is_sqlite_duplicate_column_error(exc, column_name):
+                        raise
+        if inspector.has_table(PaperPosition.__tablename__):
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        "UPDATE paper_positions "
+                        "SET initial_quantity = COALESCE(initial_quantity, quantity), "
+                        "initial_allocated_capital = COALESCE(initial_allocated_capital, allocated_capital, normalized_notional, quantity * opened_price), "
+                        "remaining_cost = COALESCE(remaining_cost, allocated_capital, normalized_notional, quantity * opened_price), "
+                        "realized_quantity = COALESCE(realized_quantity, 0), "
+                        "realized_proceeds = COALESCE(realized_proceeds, 0), "
+                        "realized_fees = COALESCE(realized_fees, 0), "
+                        "realized_pnl = CASE "
+                        "WHEN COALESCE(realized_pnl, 0) = 0 AND simulated_pnl IS NOT NULL THEN simulated_pnl "
+                        "ELSE COALESCE(realized_pnl, 0) END"
+                    )
+            except OperationalError:
+                logger.debug("paper_positions partial-ledger backfill skipped; columns not ready", exc_info=True)
+        if inspector.has_table(PaperTradeEvent.__tablename__):
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        "UPDATE paper_trade_events "
+                        "SET fill_price = COALESCE(fill_price, price), "
+                        "fill_evidence_grade = COALESCE(fill_evidence_grade, 'legacy_quote_based'), "
+                        "gross_amount = COALESCE(gross_amount, allocated_capital), "
+                        "fees = COALESCE(fees, 0), "
+                        "net_amount = COALESCE(net_amount, allocated_capital)"
+                    )
+            except OperationalError:
+                logger.debug("paper_trade_events fill-evidence backfill skipped; columns not ready", exc_info=True)
+
+    def _ensure_paper_positions_multi_lot_schema(self) -> None:
+        """Allow one plan to own multiple explicit entry-leg lots in SQLite."""
+
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        if not inspector.has_table(PaperPosition.__tablename__):
+            return
+        columns = {column["name"] for column in inspector.get_columns(PaperPosition.__tablename__)}
+        if "entry_leg_id" not in columns:
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        "ALTER TABLE paper_positions "
+                        "ADD COLUMN entry_leg_id VARCHAR(64) NOT NULL DEFAULT 'legacy_entry'"
+                    )
+            except OperationalError as exc:
+                if not self._is_sqlite_duplicate_column_error(exc, "entry_leg_id"):
+                    raise
+        if "execution_index" not in columns:
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        "ALTER TABLE paper_positions "
+                        "ADD COLUMN execution_index INTEGER NOT NULL DEFAULT 1"
+                    )
+            except OperationalError as exc:
+                if not self._is_sqlite_duplicate_column_error(exc, "execution_index"):
+                    raise
+        if "opened_at" not in columns:
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        "ALTER TABLE paper_positions ADD COLUMN opened_at DATETIME"
+                    )
+            except OperationalError as exc:
+                if not self._is_sqlite_duplicate_column_error(exc, "opened_at"):
+                    raise
+        refreshed_columns = {
+            column["name"]
+            for column in inspect(self._engine).get_columns(PaperPosition.__tablename__)
+        }
+        if {"opened_at", "opened_on", "market"}.issubset(refreshed_columns):
+            session = self._SessionLocal()
+            try:
+                legacy_rows = list(session.execute(
+                    select(PaperPosition)
+                    .where(
+                        PaperPosition.opened_at.is_(None),
+                        PaperPosition.opened_on.is_not(None),
+                    )
+                ).scalars().all())
+                for row in legacy_rows:
+                    row.opened_at = self._legacy_paper_opened_at_utc(row.market, row.opened_on)
+                    row.updated_at = utc_naive_now()
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+        if not {"plan_id", "entry_leg_id", "execution_index"}.issubset(refreshed_columns):
+            return
+        try:
+            with self._engine.connect() as connection:
+                indexes = connection.execute(
+                    text("PRAGMA index_list(paper_positions)")
+                ).fetchall()
+                unique_plan_index_names = []
+                for index_row in indexes:
+                    index_name = index_row[1]
+                    is_unique = bool(index_row[2])
+                    if not is_unique:
+                        continue
+                    index_columns = connection.execute(
+                        text(f'PRAGMA index_info("{index_name}")')
+                    ).fetchall()
+                    indexed_names = [row[2] for row in index_columns]
+                    if indexed_names == ["plan_id"]:
+                        unique_plan_index_names.append(index_name)
+        except Exception as exc:
+            logger.warning(
+                "Failed to inspect paper_positions unique plan index; skip multi-lot repair: %s",
+                exc,
+            )
+            return
+        if not unique_plan_index_names:
+            for index in PaperPosition.__table__.indexes:
+                index.create(self._engine, checkfirst=True)
+            return
+        self._rebuild_paper_positions_table_without_unique_plan_id()
+
+    def _rebuild_paper_positions_table_without_unique_plan_id(self) -> None:
+        temporary_table = f"paper_positions_recreate_tmp_{int(time.time() * 1_000_000_000)}"
+        target_columns = [column.name for column in PaperPosition.__table__.columns]
+
+        inspector = inspect(self._engine)
+        existing_columns = {
+            column["name"]
+            for column in inspector.get_columns(PaperPosition.__tablename__)
+        }
+        copy_columns = [column for column in target_columns if column in existing_columns]
+        if not copy_columns:
+            logger.warning("paper_positions multi-lot repair skipped because no shared columns were found.")
+            return
+
+        column_clause = ", ".join(f'"{column}"' for column in copy_columns)
+        select_expressions = []
+        for column in copy_columns:
+            if column in {"created_at", "updated_at"}:
+                select_expressions.append(f'COALESCE("{column}", CURRENT_TIMESTAMP) AS "{column}"')
+            elif column == "entry_leg_id":
+                select_expressions.append(f'COALESCE("{column}", \'legacy_entry\') AS "{column}"')
+            elif column == "execution_index":
+                select_expressions.append(f'COALESCE("{column}", 1) AS "{column}"')
+            elif column == "status":
+                select_expressions.append(f'COALESCE("{column}", \'open\') AS "{column}"')
+            elif column == "normalized_notional":
+                select_expressions.append(f'COALESCE("{column}", 100000.0) AS "{column}"')
+            elif column == "legacy_fixed_notional":
+                select_expressions.append(f'COALESCE("{column}", 1) AS "{column}"')
+            elif column == "sync_origin":
+                select_expressions.append(f'COALESCE("{column}", \'paper_generated\') AS "{column}"')
+            elif column == "sync_status":
+                select_expressions.append(f'COALESCE("{column}", \'paper_only\') AS "{column}"')
+            elif column == "sellability_rule":
+                select_expressions.append(f'COALESCE("{column}", \'unknown_t1_fail_closed\') AS "{column}"')
+            elif column == "max_holding_sessions":
+                select_expressions.append(f'COALESCE("{column}", 10) AS "{column}"')
+            else:
+                select_expressions.append(f'"{column}"')
+        select_clause = ", ".join(select_expressions)
+        create_table_sql = str(
+            CreateTable(PaperPosition.__table__).compile(dialect=self._engine.dialect)
+        ).replace(
+            f"CREATE TABLE {PaperPosition.__tablename__}",
+            f'CREATE TABLE "{temporary_table}"',
+            1,
+        )
+        logger.info("Rebuilding paper_positions table to allow multiple lots per plan.")
+        with self._engine.begin() as connection:
+            connection.execute(text(f'DROP TABLE IF EXISTS "{temporary_table}"'))
+            connection.execute(text(create_table_sql))
+            connection.execute(
+                text(
+                    f'INSERT INTO "{temporary_table}" ({column_clause}) '
+                    f'SELECT {select_clause} FROM "{PaperPosition.__tablename__}"'
+                )
+            )
+            connection.execute(text(f'DROP TABLE "{PaperPosition.__tablename__}"'))
+            connection.execute(
+                text(
+                    f'ALTER TABLE "{temporary_table}" '
+                    f'RENAME TO "{PaperPosition.__tablename__}"'
+                )
+            )
+            for index in PaperPosition.__table__.indexes:
+                index.create(connection, checkfirst=True)
+
+    def _ensure_paper_evaluations_position_leg_schema(self) -> None:
+        """Migrate EOD evaluations from plan/date uniqueness to lot-aware keys."""
+
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        if not inspector.has_table(PaperPlanEvaluation.__tablename__):
+            return
+        existing = {column["name"] for column in inspector.get_columns(PaperPlanEvaluation.__tablename__)}
+        for column_name, column_sql in {
+            "evaluation_key": "VARCHAR(220) NOT NULL DEFAULT ''",
+            "position_id": "INTEGER",
+            "entry_leg_id": "VARCHAR(64) NOT NULL DEFAULT 'legacy_entry'",
+        }.items():
+            if column_name in existing:
+                continue
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {PaperPlanEvaluation.__tablename__} "
+                        f"ADD COLUMN {column_name} {column_sql}"
+                    )
+            except OperationalError as exc:
+                if not self._is_sqlite_duplicate_column_error(exc, column_name):
+                    raise
+        with self._engine.begin() as connection:
+            connection.exec_driver_sql(
+                "UPDATE paper_plan_evaluations "
+                "SET entry_leg_id = COALESCE(NULLIF(entry_leg_id, ''), 'legacy_entry')"
+            )
+            connection.exec_driver_sql(
+                "UPDATE paper_plan_evaluations "
+                "SET evaluation_key = 'plan:' || plan_id || ':leg:' || "
+                "COALESCE(NULLIF(entry_leg_id, ''), 'legacy_entry') || ':pos:' || "
+                "COALESCE(position_id, 0) || ':eod:' || evaluation_date "
+                "WHERE evaluation_key IS NULL OR evaluation_key = ''"
+            )
+        try:
+            with self._engine.connect() as connection:
+                indexes = connection.execute(
+                    text("PRAGMA index_list(paper_plan_evaluations)")
+                ).fetchall()
+                has_legacy_unique = False
+                has_evaluation_key_unique = False
+                for index_row in indexes:
+                    index_name = index_row[1]
+                    is_unique = bool(index_row[2])
+                    index_columns = connection.execute(
+                        text(f'PRAGMA index_info("{index_name}")')
+                    ).fetchall()
+                    names = [row[2] for row in index_columns]
+                    if is_unique and names == ["plan_id", "evaluation_date"]:
+                        has_legacy_unique = True
+                    if is_unique and names == ["evaluation_key"]:
+                        has_evaluation_key_unique = True
+        except Exception as exc:
+            logger.warning("Failed to inspect paper_plan_evaluations indexes; skip lot-aware repair: %s", exc)
+            return
+        if has_legacy_unique or not has_evaluation_key_unique:
+            self._rebuild_paper_evaluations_table_with_lot_keys()
+
+    def _rebuild_paper_evaluations_table_with_lot_keys(self) -> None:
+        temporary_table = f"paper_plan_evaluations_recreate_tmp_{int(time.time() * 1_000_000_000)}"
+        target_columns = [column.name for column in PaperPlanEvaluation.__table__.columns]
+        inspector = inspect(self._engine)
+        existing_columns = {
+            column["name"]
+            for column in inspector.get_columns(PaperPlanEvaluation.__tablename__)
+        }
+        copy_columns = [column for column in target_columns if column in existing_columns]
+        if not copy_columns:
+            logger.warning("paper_plan_evaluations repair skipped because no shared columns were found.")
+            return
+        column_clause = ", ".join(f'"{column}"' for column in copy_columns)
+        select_clause = ", ".join(
+            f'COALESCE("{column}", CURRENT_TIMESTAMP) AS "{column}"'
+            if column == "created_at"
+            else f'COALESCE(NULLIF("{column}", \'\'), \'legacy_entry\') AS "{column}"'
+            if column == "entry_leg_id"
+            else f'"{column}"'
+            for column in copy_columns
+        )
+        create_table_sql = str(
+            CreateTable(PaperPlanEvaluation.__table__).compile(dialect=self._engine.dialect)
+        ).replace(
+            f"CREATE TABLE {PaperPlanEvaluation.__tablename__}",
+            f'CREATE TABLE "{temporary_table}"',
+            1,
+        )
+        with self._engine.begin() as connection:
+            connection.execute(text(f'DROP TABLE IF EXISTS "{temporary_table}"'))
+            connection.execute(text(create_table_sql))
+            connection.execute(
+                text(
+                    f'INSERT OR IGNORE INTO "{temporary_table}" ({column_clause}) '
+                    f'SELECT {select_clause} FROM "{PaperPlanEvaluation.__tablename__}"'
+                )
+            )
+            connection.execute(text(f'DROP TABLE "{PaperPlanEvaluation.__tablename__}"'))
+            connection.execute(
+                text(
+                    f'ALTER TABLE "{temporary_table}" '
+                    f'RENAME TO "{PaperPlanEvaluation.__tablename__}"'
+                )
+            )
+            for index in PaperPlanEvaluation.__table__.indexes:
+                index.create(connection, checkfirst=True)
+
     def _ensure_schema_migration_record(self) -> None:
         session = self._SessionLocal()
         values = {
@@ -1243,6 +3190,10 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         try:
             if self._is_sqlite_engine:
                 statement = sqlite_insert(DatabaseSchemaMigration).values(**values)
+                statement = statement.on_conflict_do_nothing(index_elements=["version"])
+                session.execute(statement)
+            elif self._dialect_name == "postgresql":
+                statement = postgresql_insert(DatabaseSchemaMigration).values(**values)
                 statement = statement.on_conflict_do_nothing(index_elements=["version"])
                 session.execute(statement)
             else:
@@ -1259,6 +3210,83 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             raise
         finally:
             session.close()
+
+    def _ensure_report_execution_intent_baseline(self) -> None:
+        """Give reports that predate execution intents one explicit legacy row.
+
+        The marker and the backfill commit together, so the baseline runs once
+        per database. Reports saved later without an intent stay unauthorized
+        instead of being promoted by a restart.
+        """
+
+        marker = {
+            "version": REPORT_EXECUTION_INTENT_BASELINE_VERSION,
+            "description": "Legacy stock reports keep primary paper execution",
+        }
+        # Partial legacy schemas may lack the market-review markers; paper
+        # execution still rejects market reviews before reading intent.
+        history_columns = {
+            column["name"]
+            for column in inspect(self._engine).get_columns(AnalysisHistory.__tablename__)
+        }
+        legacy_filters = [
+            ~exists().where(
+                AnalysisReportExecutionIntent.analysis_history_id == AnalysisHistory.id
+            ),
+        ]
+        if "code" in history_columns:
+            legacy_filters.append(AnalysisHistory.code != "MARKET")
+        if "report_type" in history_columns:
+            legacy_filters.append(or_(
+                AnalysisHistory.report_type.is_(None),
+                AnalysisHistory.report_type != "market_review",
+            ))
+        with self._engine.begin() as connection:
+            if self._is_sqlite_engine:
+                statement = sqlite_insert(DatabaseSchemaMigration).values(**marker)
+                statement = statement.on_conflict_do_nothing(index_elements=["version"])
+                claimed = bool(connection.execute(statement).rowcount)
+            elif self._dialect_name == "postgresql":
+                # psycopg 3 reports rowcount=-1 for this INSERT, so only
+                # RETURNING proves that this transaction claimed the marker.
+                statement = postgresql_insert(DatabaseSchemaMigration).values(**marker)
+                statement = statement.on_conflict_do_nothing(index_elements=["version"])
+                claimed = connection.execute(
+                    statement.returning(DatabaseSchemaMigration.version)
+                ).first() is not None
+            else:
+                claimed = connection.execute(
+                    select(DatabaseSchemaMigration.version).where(
+                        DatabaseSchemaMigration.version == marker["version"]
+                    )
+                ).first() is None
+                if claimed:
+                    connection.execute(DatabaseSchemaMigration.__table__.insert().values(**marker))
+            if not claimed:
+                return
+            legacy_reports = select(
+                AnalysisHistory.id,
+                literal(REPORT_EXECUTION_INTENT_PAPER_CANDIDATE),
+                literal(REPORT_EXECUTION_SCOPE_PRIMARY),
+                literal(REPORT_EXECUTION_INTENT_BASELINE_VERSION),
+                literal("legacy_baseline"),
+                literal(utc_naive_now()),
+            ).where(*legacy_filters)
+            inserted = connection.execute(
+                AnalysisReportExecutionIntent.__table__.insert().from_select(
+                    [
+                        "analysis_history_id",
+                        "execution_intent",
+                        "execution_scope",
+                        "execution_policy_version",
+                        "intent_source",
+                        "created_at",
+                    ],
+                    legacy_reports,
+                ),
+                execution_options={"preserve_rowcount": True},
+            ).rowcount
+        logger.info("报告执行用途 legacy 基线已建立: %s 条既有个股报告", inserted)
 
     def _ensure_decision_signal_profile_schema(self) -> None:
         """Add and backfill nullable decision_profile for existing SQLite DBs."""
@@ -1637,6 +3665,68 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                     cls._instance._engine.dispose()
                 cls._instance._initialized = False
                 cls._instance = None
+
+    @classmethod
+    def create_scoped_readonly(cls, db_url: str) -> 'DatabaseManager':
+        """构建一个绑定到其它数据库的隔离只读管理器，用于跨范围读取。
+
+        用于 Web/API 进程读取实验组（``experiment:<id>:<arm>``）隔离数据库中的
+        账本，而**不触碰进程主库单例**：它既不写入 ``cls._instance``，失败时也不
+        清空主单例；目标库必须已由工作进程建好，本工厂不建表、不迁移 schema。
+        只提供读取所需的 engine/session；使用完须调用 :meth:`dispose`。
+        """
+
+        if not db_url or not str(db_url).strip():
+            raise ValueError("create_scoped_readonly requires a database URL")
+
+        instance = object.__new__(cls)
+        instance._initialized = False
+        instance._scoped_readonly = True
+
+        config = get_config()
+        instance._db_url = db_url
+        instance._sqlite_wal_enabled = config.sqlite_wal_enabled
+        instance._sqlite_busy_timeout_ms = config.sqlite_busy_timeout_ms
+        instance._sqlite_write_retry_max = config.sqlite_write_retry_max
+        instance._sqlite_write_retry_base_delay = config.sqlite_write_retry_base_delay
+
+        engine_kwargs = {"echo": False, "pool_pre_ping": True}
+        if str(db_url).startswith("sqlite:") and instance._sqlite_busy_timeout_ms > 0:
+            engine_kwargs["connect_args"] = {"timeout": instance._sqlite_busy_timeout_ms / 1000}
+
+        created_engine = create_engine(db_url, **engine_kwargs)
+        try:
+            instance._engine = created_engine
+            instance._dialect_name = created_engine.url.get_backend_name()
+            instance._is_sqlite_engine = instance._dialect_name == 'sqlite'
+            instance._sqlite_file_db = instance._is_sqlite_engine and instance._is_file_sqlite_database()
+            instance._install_sqlite_pragma_handler()
+            instance._SessionLocal = sessionmaker(
+                bind=created_engine, autocommit=False, autoflush=False,
+            )
+            instance._initialized = True
+            atexit.register(DatabaseManager._cleanup_engine, created_engine)
+        except Exception:
+            try:
+                created_engine.dispose()
+            except Exception as cleanup_exc:
+                logger.warning("跨范围只读引擎初始化失败后的清理也失败: %s", cleanup_exc)
+            instance._engine = None
+            instance._SessionLocal = None
+            instance._initialized = False
+            raise
+        return instance
+
+    def dispose(self) -> None:
+        """释放隔离只读管理器的引擎；不用于释放进程主单例。"""
+        if not getattr(self, "_scoped_readonly", False):
+            return
+        engine = getattr(self, "_engine", None)
+        if engine is not None:
+            engine.dispose()
+        self._engine = None
+        self._SessionLocal = None
+        self._initialized = False
 
     @classmethod
     def _cleanup_engine(cls, engine) -> None:
@@ -2107,17 +4197,28 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         report_type: str,
         news_content: Optional[str],
         context_snapshot: Optional[Dict[str, Any]] = None,
-        save_snapshot: bool = True
+        save_snapshot: bool = True,
+        execution_intent: Optional[Dict[str, Any]] = None,
     ) -> int:
         """
         保存分析结果历史记录。
+
+        ``execution_intent`` 只能来自后端可信任务上下文，与报告同一事务首次写入且不可修改；
+        不提供时报告不获得模拟交易执行权限（大盘复盘等非交易报告无需提供）。
 
         Returns:
             新保存的 AnalysisHistory.id；保存失败返回 0。
         """
         if result is None:
             return 0
+        if getattr(result, "success", True) is False:
+            logger.info(
+                "跳过失败分析结果历史保存: %s",
+                getattr(result, "code", "unknown"),
+            )
+            return 0
 
+        apply_position_aware_result_contract(result, report_type=report_type)
         sniper_points = self._extract_sniper_points(result)
         raw_result = self._build_raw_result(result)
         context_text = None
@@ -2125,12 +4226,19 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             context_text = self._safe_json_dumps(context_snapshot)
 
         try:
+            intent_values = (
+                normalize_report_execution_intent(execution_intent)
+                if execution_intent is not None
+                else None
+            )
+
             def _write(session: Session) -> int:
                 history = AnalysisHistory(
                     query_id=query_id,
                     code=result.code,
                     name=result.name,
                     report_type=report_type,
+                    model_used=(str(getattr(result, "model_used", "") or "").strip() or None),
                     sentiment_score=result.sentiment_score,
                     operation_advice=result.operation_advice,
                     trend_prediction=result.trend_prediction,
@@ -2146,6 +4254,14 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 )
                 session.add(history)
                 session.flush()
+                if intent_values is not None:
+                    session.add(
+                        AnalysisReportExecutionIntent(
+                            analysis_history_id=history.id,
+                            **intent_values,
+                        )
+                    )
+                    session.flush()
                 return int(history.id or 0)
             return self._run_write_transaction(
                 f"save_analysis_history[{result.code}]",
@@ -2154,6 +4270,83 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         except Exception as e:
             logger.error(f"保存分析历史失败: {e}")
             return 0
+
+    def save_analysis_attempt(
+        self,
+        *,
+        query_id: str,
+        code: str,
+        name: Optional[str] = None,
+        report_type: Optional[str] = None,
+        model_used: Optional[str] = None,
+        status: str,
+        error_message: Optional[str] = None,
+        analysis_history_id: Optional[int] = None,
+    ) -> int:
+        """Persist the outcome of one analysis attempt, including no-report failures."""
+
+        safe_status = str(status or "").strip().lower()
+        if safe_status not in {"completed", "failed", "degraded"}:
+            safe_status = "failed"
+        safe_error_message = sanitize_diagnostic_text(error_message, max_length=1000)
+
+        try:
+            def _write(session: Session) -> int:
+                row = AnalysisAttempt(
+                    query_id=query_id,
+                    code=code,
+                    name=name,
+                    report_type=report_type,
+                    model_used=(str(model_used or "").strip() or None),
+                    status=safe_status,
+                    error_message=(safe_error_message or None),
+                    analysis_history_id=(
+                        int(analysis_history_id)
+                        if isinstance(analysis_history_id, int)
+                        and not isinstance(analysis_history_id, bool)
+                        and analysis_history_id > 0
+                        else None
+                    ),
+                    created_at=datetime.now(),
+                )
+                session.add(row)
+                session.flush()
+                return int(row.id or 0)
+
+            return self._run_write_transaction(
+                f"save_analysis_attempt[{code}:{model_used or '*'}:{safe_status}]",
+                _write,
+            )
+        except Exception as e:
+            logger.warning("保存分析尝试记录失败: %s", e)
+            return 0
+
+    def get_latest_analysis_attempts(
+        self,
+        *,
+        model_used: Optional[str] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        limit: int = 500,
+    ) -> List[AnalysisAttempt]:
+        """Return latest attempts for stock-bar reconciliation."""
+
+        with self.get_session() as session:
+            conditions = []
+            if model_used:
+                conditions.append(AnalysisAttempt.model_used == model_used)
+            if start_date:
+                conditions.append(AnalysisAttempt.created_at >= datetime.combine(start_date, datetime.min.time()))
+            if end_date:
+                conditions.append(AnalysisAttempt.created_at < datetime.combine(end_date + timedelta(days=1), datetime.min.time()))
+            where_clause = and_(*conditions) if conditions else True
+            rows = session.execute(
+                select(AnalysisAttempt)
+                .where(where_clause)
+                .order_by(desc(AnalysisAttempt.created_at), desc(AnalysisAttempt.id))
+                .limit(max(1, min(int(limit), 2000)))
+            ).scalars().all()
+            return list(rows)
 
     def update_analysis_history_diagnostics(
         self,
@@ -2308,6 +4501,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         self,
         code: Optional[Union[str, List[str]]] = None,
         report_type: Optional[str] = None,
+        model_used: Optional[str] = None,
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
         offset: int = 0,
@@ -2341,6 +4535,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                     conditions.append(AnalysisHistory.code == code)
             if report_type:
                 conditions.append(AnalysisHistory.report_type == report_type)
+            if model_used:
+                conditions.append(AnalysisHistory.model_used == model_used)
             if start_date:
                 # created_at >= start_date 00:00:00
                 conditions.append(AnalysisHistory.created_at >= datetime.combine(start_date, datetime.min.time()))
@@ -2386,6 +4582,16 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             ).scalars().first()
             return result
 
+    def get_report_execution_intent(self, record_id: int) -> Optional[AnalysisReportExecutionIntent]:
+        """Return the execution purpose frozen with one report, if any."""
+
+        with self.get_session() as session:
+            return session.execute(
+                select(AnalysisReportExecutionIntent).where(
+                    AnalysisReportExecutionIntent.analysis_history_id == int(record_id)
+                )
+            ).scalar_one_or_none()
+
     def delete_analysis_history_records(self, record_ids: List[int]) -> int:
         """
         删除指定的分析历史记录。
@@ -2413,6 +4619,49 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             if not existing_ids:
                 return 0
 
+            linked_plan_ids = sorted(
+                session.execute(
+                    select(PaperExecutionPlan.id).where(
+                        PaperExecutionPlan.source_report_id.in_(existing_ids)
+                    )
+                ).scalars().all()
+            )
+            linked_position_ids = sorted(
+                session.execute(
+                    select(PaperPosition.id).where(
+                        PaperPosition.source_report_id.in_(existing_ids)
+                    )
+                ).scalars().all()
+            )
+            if linked_plan_ids or linked_position_ids:
+                event_conditions = [PaperTradeEvent.source_report_id.in_(existing_ids)]
+                if linked_plan_ids:
+                    event_conditions.append(PaperTradeEvent.plan_id.in_(linked_plan_ids))
+                if linked_position_ids:
+                    event_conditions.append(PaperTradeEvent.position_id.in_(linked_position_ids))
+                session.execute(delete(PaperTradeEvent).where(or_(*event_conditions)))
+                observation_conditions = [PaperPlanObservation.source_report_id.in_(existing_ids)]
+                if linked_plan_ids:
+                    observation_conditions.append(PaperPlanObservation.plan_id.in_(linked_plan_ids))
+                if linked_position_ids:
+                    observation_conditions.append(PaperPlanObservation.position_id.in_(linked_position_ids))
+                session.execute(delete(PaperPlanObservation).where(or_(*observation_conditions)))
+                if linked_position_ids:
+                    session.execute(
+                        delete(PaperPosition).where(PaperPosition.id.in_(linked_position_ids))
+                    )
+                if linked_plan_ids:
+                    session.execute(
+                        delete(PaperPlanEvaluation).where(
+                            PaperPlanEvaluation.plan_id.in_(linked_plan_ids)
+                        )
+                    )
+                    session.execute(
+                        delete(PaperExecutionPlan).where(
+                            PaperExecutionPlan.id.in_(linked_plan_ids)
+                        )
+                    )
+
             linked_signal_ids = sorted(
                 session.execute(
                     select(DecisionSignalRecord.id).where(
@@ -2424,6 +4673,16 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 ).scalars().all()
             )
             if linked_signal_ids:
+                session.execute(
+                    update(PaperPosition)
+                    .where(PaperPosition.close_signal_id.in_(linked_signal_ids))
+                    .values(close_signal_id=None)
+                )
+                session.execute(
+                    update(PaperTradeEvent)
+                    .where(PaperTradeEvent.triggering_signal_id.in_(linked_signal_ids))
+                    .values(triggering_signal_id=None)
+                )
                 session.execute(
                     delete(DecisionSignalOutcomeRecord).where(
                         DecisionSignalOutcomeRecord.signal_id.in_(linked_signal_ids)
@@ -2440,6 +4699,11 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             session.execute(
                 delete(BacktestResult).where(BacktestResult.analysis_history_id.in_(existing_ids))
             )
+            session.execute(
+                delete(AnalysisReportExecutionIntent).where(
+                    AnalysisReportExecutionIntent.analysis_history_id.in_(existing_ids)
+                )
+            )
             result = session.execute(
                 delete(AnalysisHistory).where(AnalysisHistory.id.in_(existing_ids))
             )
@@ -2451,6 +4715,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         end_date: Optional[date] = None,
         limit: int = 200,
         include_market_review: bool = False,
+        model_used: Optional[str] = None,
     ) -> List[AnalysisHistory]:
         """
         获取历史记录中的不重复股票列表，每只股票取最新一条记录。
@@ -2482,6 +4747,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 subq = subq.where(
                     AnalysisHistory.created_at < datetime.combine(end_date + timedelta(days=1), datetime.min.time())
                 )
+            if model_used:
+                subq = subq.where(AnalysisHistory.model_used == model_used)
             if not include_market_review:
                 subq = subq.where(
                     and_(
@@ -2603,6 +4870,9 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
         now = datetime.now()
         records_by_date: Dict[date, Dict[str, Any]] = {}
+        from data_provider.volume_units import SHARES_SOURCE_SUFFIX
+        if df.attrs.get('volume_unit') == 'shares' and not data_source.endswith(SHARES_SOURCE_SUFFIX):
+            data_source += SHARES_SOURCE_SUFFIX
         for row in df.to_dict(orient='records'):
             row_date = self._normalize_daily_date(row.get('date'))
             records_by_date[row_date] = {
@@ -2682,6 +4952,42 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                         )
                     )
                 return len(new_records)
+            elif self._dialect_name == "postgresql":
+                existing_dates = set(
+                    session.execute(
+                        select(StockDaily.date).where(
+                            and_(
+                                StockDaily.code == code,
+                                StockDaily.date.in_(batch_dates),
+                            )
+                        )
+                    ).scalars().all()
+                )
+                stmt = postgresql_insert(StockDaily).values(records)
+                excluded = stmt.excluded
+                session.execute(
+                    stmt.on_conflict_do_update(
+                        index_elements=["code", "date"],
+                        set_={
+                            "open": excluded.open,
+                            "high": excluded.high,
+                            "low": excluded.low,
+                            "close": excluded.close,
+                            "volume": excluded.volume,
+                            "amount": excluded.amount,
+                            "pct_chg": excluded.pct_chg,
+                            "ma5": excluded.ma5,
+                            "ma10": excluded.ma10,
+                            "ma20": excluded.ma20,
+                            "volume_ratio": excluded.volume_ratio,
+                            "data_source": excluded.data_source,
+                            "updated_at": excluded.updated_at,
+                        },
+                    )
+                )
+                return sum(
+                    1 for record in records if record["date"] not in existing_dates
+                )
             else:
                 existing_rows = {
                     row.date: row
@@ -2771,9 +5077,11 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             context['yesterday'] = yesterday_data.to_dict()
             
             # 计算相比昨日的变化
-            if yesterday_data.volume and yesterday_data.volume > 0:
+            today_volume = context['today'].get('volume')
+            yesterday_volume = context['yesterday'].get('volume')
+            if today_volume is not None and yesterday_volume and yesterday_volume > 0:
                 context['volume_change_ratio'] = round(
-                    today_data.volume / yesterday_data.volume, 2
+                    today_volume / yesterday_volume, 2
                 )
             
             if yesterday_data.close and yesterday_data.close > 0:
@@ -3124,7 +5432,18 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 "estimated_tokens": int(estimated_tokens or 0),
                 "updated_at": now,
             }
-            stmt = sqlite_insert(ConversationSummary).values(**values)
+            if self._dialect_name == "postgresql":
+                stmt = postgresql_insert(ConversationSummary).values(**values)
+            elif self._is_sqlite_engine:
+                stmt = sqlite_insert(ConversationSummary).values(**values)
+            else:
+                existing = session.get(ConversationSummary, session_id)
+                if existing is None:
+                    session.add(ConversationSummary(**values))
+                else:
+                    for key, value in values.items():
+                        setattr(existing, key, value)
+                return
             session.execute(
                 stmt.on_conflict_do_update(
                     index_elements=["session_id"],

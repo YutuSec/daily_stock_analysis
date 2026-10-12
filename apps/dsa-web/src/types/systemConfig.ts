@@ -14,6 +14,7 @@ export type SystemConfigDataType =
   | 'number'
   | 'boolean'
   | 'array'
+  | 'list'
   | 'json'
   | 'time';
 

@@ -67,7 +67,8 @@ import logging
 import sys
 import time
 import uuid
-from datetime import date, datetime, timezone, timedelta
+from datetime import date, datetime, time as datetime_time, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 from src.webui_frontend import prepare_webui_frontend_assets
 from src.config import get_config, Config
@@ -454,13 +455,24 @@ def _compute_trading_day_filter(
         get_market_for_stock,
         get_open_markets_today,
         compute_effective_region,
+        MARKET_TIMEZONE,
     )
 
-    open_markets = get_open_markets_today()
+    stock_markets = {get_market_for_stock(code) for code in stock_codes}
+    if None in stock_markets:
+        raise ValueError("无法确定股票所属市场，暂停自动分析；请使用带交易所标识的代码或显式 --force-run")
+    required_markets = set(stock_markets)
+    if config.market_review_enabled and not getattr(args, 'no_market_review', False):
+        review_markets = compute_effective_region(
+            getattr(config, 'market_review_region', 'cn') or 'cn', set(MARKET_TIMEZONE)
+        )
+        required_markets.update((review_markets or '').split(','))
+        required_markets.discard('')
+    open_markets = get_open_markets_today(markets=required_markets)
     filtered_codes = []
     for code in stock_codes:
         mkt = get_market_for_stock(code)
-        if mkt in open_markets or mkt is None:
+        if mkt in open_markets:
             filtered_codes.append(code)
 
     if config.market_review_enabled and not getattr(args, 'no_market_review', False):
@@ -991,6 +1003,13 @@ def run_full_analysis(
         except Exception as e:
             logger.warning(f"自动回测失败（已忽略）: {e}")
 
+        # Pipeline.run keeps successful reports when individual stocks fail.
+        # Preserve those reports/notifications, but do not call a partial batch
+        # successful merely because the pipeline returned without raising.
+        if raise_errors and not args.dry_run and len(results) < len(stock_codes):
+            raise RuntimeError(
+                f"analysis_partial_failure: succeeded={len(results)} expected={len(stock_codes)}"
+            )
         return True
 
     except Exception as e:
@@ -1000,13 +1019,377 @@ def run_full_analysis(
         return False
 
 
+def _run_paper_trading_monitor_if_enabled(config: Config) -> None:
+    """Run the auxiliary paper ledger once after the complete model batch."""
+
+    if not getattr(config, "paper_trading_enabled", False):
+        return
+    try:
+        stats = _build_paper_trading_service(config).run_monitor()
+        logger.info(
+            "盘后模拟交易监控完成: date=%s plans=%s opened=%s closed=%s failed_closed=%s",
+            stats.get("evaluation_date"),
+            stats.get("plans_evaluated"),
+            stats.get("positions_opened"),
+            stats.get("positions_closed"),
+            stats.get("failed_closed"),
+        )
+    except Exception as exc:
+        # The batch isolates auxiliary failures; propagate so scheduler status
+        # records failure without invalidating already-persisted reports.
+        logger.warning("盘后模拟交易监控失败（已保留分析报告）: %s", exc, exc_info=True)
+        raise
+
+
+def _run_market_opportunity_pool_if_enabled(config: Config) -> None:
+    """Run the market-review driven opportunity pool after a completed batch."""
+
+    if not _market_opportunity_pool_enabled(config):
+        return
+    try:
+        from src.services.market_opportunity_service import MarketOpportunityService
+
+        region = _resolve_market_opportunity_region(config)
+        if region is None:
+            logger.info("大盘风口机会池跳过: market_review_region 不包含 A 股 CN")
+            return
+        stats = MarketOpportunityService(config=config).run_after_market_review(
+            market=region,
+            current_time=datetime.now(timezone.utc),
+            owner="scheduled-analysis",
+        )
+        discovery = stats.get("discovery", {}) if isinstance(stats, dict) else {}
+        jobs = stats.get("jobs", {}) if isinstance(stats, dict) else {}
+        research = discovery.get("research") if isinstance(discovery.get("research"), dict) else {}
+        research_outcomes = stats.get("research_outcomes") if isinstance(stats, dict) else None
+        logger.info(
+            "大盘风口机会池完成: status=%s run_id=%s candidates=%s jobs=%s processed=%s failed=%s reason=%s "
+            "research_block=%s research_outcomes=%s",
+            stats.get("status") if isinstance(stats, dict) else None,
+            discovery.get("run_id"),
+            discovery.get("selected_candidate_count"),
+            discovery.get("job_count"),
+            jobs.get("processed"),
+            jobs.get("failed"),
+            discovery.get("reason"),
+            research.get("block_reason"),
+            research_outcomes if isinstance(research_outcomes, dict) else {},
+        )
+    except Exception as exc:
+        logger.warning("大盘风口机会池失败（已保留分析报告）: %s", exc, exc_info=True)
+        raise
+
+
+def _market_opportunity_pool_enabled(config: Config) -> bool:
+    try:
+        from src.services.runtime_settings_service import RuntimeSettingsService
+
+        mode = RuntimeSettingsService(config=config).get_market_opportunity_mode().value
+        return str(mode or "off").strip().lower() != "off"
+    except Exception as exc:
+        logger.warning("大盘风口机会池模式解析失败，已 fail-closed 跳过: %s", exc, exc_info=True)
+        return False
+
+
+def _resolve_market_opportunity_region(config: Config) -> Optional[str]:
+    region = str(getattr(config, "market_review_region", "cn") or "cn").strip().lower()
+    parts = {part.strip() for part in region.split(",") if part.strip()}
+    if region in {"", "both"} or "cn" in parts or "a" in parts:
+        return "cn"
+    return None
+
+
+_market_opportunity_evening_last_session: Optional[str] = None
+
+# The server's runtime scheduler and the analyzer's CLI scheduler both register
+# the evening task.  Their shared lease is per 5-minute bucket, so a later
+# bucket could start a second run; this per-session DB lease admits one.
+_MARKET_OPPORTUNITY_EVENING_SESSION_TASK = "market_opportunity_evening_session"
+# A crashed or recreated owner frees the session only after this expires.
+_MARKET_OPPORTUNITY_EVENING_SESSION_LEASE_SECONDS = 3 * 3600
+
+
+def _claim_market_opportunity_evening_session(session_key: str) -> Dict[str, Any]:
+    from src.services.scheduler_heartbeat import claim_scheduler_task_bucket
+
+    return claim_scheduler_task_bucket(
+        task_name=_MARKET_OPPORTUNITY_EVENING_SESSION_TASK,
+        bucket_started_at=datetime.combine(date.fromisoformat(session_key), datetime_time()),
+        lease_seconds=_MARKET_OPPORTUNITY_EVENING_SESSION_LEASE_SECONDS,
+        owner_kind="evening_pool",
+        details={"session": session_key},
+    )
+
+
+def _finish_market_opportunity_evening_session(lease_key: str, error_message: Optional[str] = None) -> None:
+    from src.services.scheduler_heartbeat import finish_scheduler_task_lease
+
+    # A failure is terminal too ("finished" + last_error): no other instance
+    # retries the same session, matching the in-process single attempt.
+    try:
+        finish_scheduler_task_lease(
+            lease_key=lease_key,
+            status="finished" if error_message else "succeeded",
+            error_message=error_message,
+        )
+    except Exception as exc:
+        logger.warning("大盘风口机会池晚间运行租约收尾失败: lease=%s error=%s", lease_key, exc)
+
+
+def _run_market_opportunity_pool_evening_if_due(config: Config):
+    """Run the opportunity pool once per CN session after MARKET_OPPORTUNITY_RUN_TIME.
+
+    End-of-day bars are often still incomplete right after the close, so the
+    pool can be deferred to the evening.  It still waits for the session's
+    market review and for any running analysis batch.  One attempt per session
+    across all scheduler instances (per-session DB lease); a run after a
+    restart reuses the session's discovery run.
+    """
+
+    run_time = str(getattr(config, "market_opportunity_run_time", "") or "").strip()
+    if not run_time:
+        return {"status": "skipped", "reason": "evening_run_disabled"}
+    china_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    if china_now.strftime("%H:%M") < run_time:
+        return {"status": "skipped", "reason": "before_run_time"}
+    session_key = china_now.date().isoformat()
+    global _market_opportunity_evening_last_session
+    if _market_opportunity_evening_last_session == session_key:
+        return {"status": "skipped", "reason": "already_ran_today"}
+    try:
+        from src.core.trading_calendar import is_market_open
+
+        if not is_market_open("cn", china_now.date(), strict=True):
+            return {"status": "skipped", "reason": "market_closed"}
+    except Exception:
+        # Unverifiable calendar is not a holiday: keep the session and check
+        # again later; the pool's own new-work gate fails closed here too.
+        return {"status": "skipped", "reason": "trading_calendar_unavailable"}
+    if not _market_opportunity_pool_enabled(config):
+        return {"status": "skipped", "reason": "pool_disabled"}
+    region = _resolve_market_opportunity_region(config)
+    if region is None:
+        return {"status": "skipped", "reason": "market_review_region_not_cn"}
+    from src.services.runtime_scheduler import global_analysis_running
+
+    if global_analysis_running():
+        return {"status": "skipped", "reason": "analysis_busy"}
+    from src.services.market_opportunity_service import MarketOpportunityService
+
+    readiness = MarketOpportunityService(config=config).market_review_readiness(
+        market=region,
+        current_time=datetime.now(timezone.utc),
+    )
+    if not readiness.get("ready"):
+        return {"status": "skipped", "reason": str(readiness.get("reason") or "market_review_not_ready")}
+    try:
+        claim = _claim_market_opportunity_evening_session(session_key)
+    except Exception as exc:
+        # Unverifiable claim: do not run (could duplicate) and do not consume
+        # the session; the next tick tries again.
+        logger.warning("大盘风口机会池晚间运行租约领取失败，稍后重试: %s", exc)
+        return {"status": "skipped", "reason": "session_claim_unavailable"}
+    if not claim.get("claimed"):
+        # Not consumed locally either, so an expired lease of a crashed owner
+        # can still be taken over by this instance later.
+        return {"status": "skipped", "reason": "session_claimed_by_other_instance"}
+    _market_opportunity_evening_last_session = session_key
+    logger.info(
+        "大盘风口机会池晚间运行开始: run_time=%s session=%s market_review_id=%s",
+        run_time,
+        readiness.get("session"),
+        readiness.get("report_id"),
+    )
+    lease_key = str(claim.get("lease_key") or "")
+    try:
+        _run_market_opportunity_pool_if_enabled(config)
+    except Exception as exc:
+        _finish_market_opportunity_evening_session(lease_key, error_message=str(exc) or type(exc).__name__)
+        raise
+    _finish_market_opportunity_evening_session(lease_key)
+    return None
+
+
+def _build_paper_trading_service(config: Config):
+    from src.services.paper_trading_service import PaperTradingService
+
+    return PaperTradingService.from_config(config)
+
+
+_paper_trading_intraday_last_attempt_monotonic: Optional[float] = None
+_paper_trading_opening_confirmation_last_attempt_monotonic: Optional[float] = None
+
+
+def _run_paper_trading_intraday_monitor_if_enabled(config: Config):
+    """Run one realtime quote paper-monitor sweep inside schedule mode."""
+
+    if not (
+        getattr(config, "paper_trading_enabled", False)
+        and getattr(config, "paper_trading_intraday_enabled", False)
+    ):
+        return {"status": "skipped", "reason": "monitor_disabled"}
+    interval_minutes = max(1, getattr(config, "paper_trading_intraday_interval_minutes", 1))
+    interval_seconds = interval_minutes * 60
+    global _paper_trading_intraday_last_attempt_monotonic
+    now_monotonic = time.monotonic()
+    if (
+        _paper_trading_intraday_last_attempt_monotonic is not None
+        and now_monotonic - _paper_trading_intraday_last_attempt_monotonic < interval_seconds
+    ):
+        return {"status": "skipped", "reason": "monitor_throttled"}
+    _paper_trading_intraday_last_attempt_monotonic = now_monotonic
+    started_perf = time.perf_counter()
+    try:
+        stats = _build_paper_trading_service(config).run_intraday_monitor(
+            interval_seconds=interval_seconds,
+        )
+        logger.info(
+            "盘中模拟交易监控完成: bucket=%s observations=%s opened=%s closed=%s "
+            "failed_closed=%s skipped_closed_market=%s duration_seconds=%.2f",
+            stats.get("bucket_started_at"),
+            stats.get("observations"),
+            stats.get("positions_opened"),
+            stats.get("positions_closed"),
+            stats.get("failed_closed"),
+            stats.get("skipped_closed_market"),
+            time.perf_counter() - started_perf,
+        )
+        return stats
+    except Exception as exc:
+        logger.warning("盘中模拟交易监控失败: %s", exc, exc_info=True)
+        raise
+
+
+def _run_paper_trading_opening_confirmation_if_enabled(config: Config):
+    """Run the independent CN opening-confirmation quote sweep."""
+
+    if not (
+        getattr(config, "paper_trading_enabled", False)
+        and getattr(config, "paper_trading_intraday_enabled", False)
+    ):
+        return {"status": "skipped", "reason": "monitor_disabled"}
+    china_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    china_clock = china_now.time().replace(tzinfo=None)
+    if not (datetime_time(9, 30) <= china_clock <= datetime_time(9, 35)):
+        return {"status": "skipped", "reason": "outside_opening_window"}
+    try:
+        from src.core.trading_calendar import is_market_open
+
+        if not is_market_open("cn", china_now.date()):
+            return {"status": "skipped", "reason": "market_closed"}
+    except Exception:
+        # The trading calendar is fail-open elsewhere in the project.  Keep
+        # that behavior here so a missing optional calendar package does not
+        # silently disable a configured local monitor.
+        pass
+    global _paper_trading_opening_confirmation_last_attempt_monotonic
+    now_monotonic = time.monotonic()
+    if (
+        _paper_trading_opening_confirmation_last_attempt_monotonic is not None
+        and now_monotonic - _paper_trading_opening_confirmation_last_attempt_monotonic < 30
+    ):
+        return {"status": "skipped", "reason": "monitor_throttled"}
+    _paper_trading_opening_confirmation_last_attempt_monotonic = now_monotonic
+    started_perf = time.perf_counter()
+    try:
+        stats = _build_paper_trading_service(config).run_opening_confirmation_check()
+        logger.info(
+            "开盘确认模拟交易校验完成: bucket=%s observations=%s confirmed=%s "
+            "reanalysis_requested=%s failed_closed=%s "
+            "duration_seconds=%.2f",
+            stats.get("bucket_started_at"),
+            stats.get("observations"),
+            stats.get("confirmed"),
+            stats.get("reanalysis_requested"),
+            stats.get("failed_closed"),
+            time.perf_counter() - started_perf,
+        )
+    except Exception as exc:
+        logger.warning("开盘确认模拟交易校验失败: %s", exc, exc_info=True)
+        raise
+
+
+def _run_paper_trading_opening_auction_if_enabled(config: Config) -> None:
+    """Backward-compatible alias for callers upgraded before the task rename."""
+
+    _run_paper_trading_opening_confirmation_if_enabled(config)
+
+
 def run_scheduled_analysis(
     config: Config,
     args: argparse.Namespace,
     stock_codes: Optional[List[str]] = None,
 ) -> bool:
-    """Run scheduled analysis with failures propagated to the scheduler."""
-    return run_full_analysis(config, args, stock_codes, raise_errors=True)
+    """Run one scheduled batch, optionally once per configured LLM route.
+
+    Multi-model runs are intentionally sequential: the stock universe is frozen
+    once for the whole batch, while each model receives an isolated config with
+    cross-model fallback disabled.  This avoids concurrent provider/cache writes
+    and ensures every stored history row identifies the model that produced it.
+    """
+    from src.services.analysis_model_service import (
+        build_model_scoped_config,
+        list_analysis_models,
+    )
+
+    failures: List[str] = []
+    models = [None]
+    scheduled_stock_codes = stock_codes
+    try:
+        if getattr(config, "schedule_multi_model_enabled", False):
+            if stock_codes is None:
+                config.refresh_stock_list()
+                scheduled_stock_codes = list(config.stock_list)
+            else:
+                scheduled_stock_codes = list(stock_codes)
+            models = list_analysis_models(config)
+            if not models:
+                raise RuntimeError("定时多模型已启用，但未找到可用的 LLM 模型配置")
+            logger.info("定时多模型分析已启用: models=%s stocks=%s", models, scheduled_stock_codes)
+    except Exception as exc:
+        models = []
+        failures.append(f"analysis_setup: {exc}")
+        logger.exception("定时分析准备失败")
+
+    for model in models:
+        try:
+            scoped_config = build_model_scoped_config(config, model) if model else config
+            if model:
+                # Isolate multi-model Markdown artifacts as well as histories.
+                scoped_config.report_filename_suffix = model
+                logger.info("定时多模型分析开始: model=%s fallback=disabled", model)
+            succeeded = run_full_analysis(
+                scoped_config,
+                args,
+                scheduled_stock_codes,
+                raise_errors=True,
+            )
+            if not succeeded:
+                failures.append(f"{model or 'default_model'}: analysis_unsuccessful (reported failure)")
+        except Exception as exc:
+            failures.append(f"{model or 'default_model'}: {exc}")
+            logger.exception("定时分析失败: model=%s", model or "default_model")
+
+    # Auxiliary ledgers must still advance when one model route fails.  The
+    # opportunity pool will independently require a current complete market
+    # review, while the paper monitor must continue protecting existing lots.
+    # Run both before surfacing the partial batch failure to the scheduler.
+    # MARKET_OPPORTUNITY_RUN_TIME moves the pool to its evening background task.
+    auxiliary_tasks = [("paper_monitor", _run_paper_trading_monitor_if_enabled)]
+    evening_run_time = str(getattr(config, "market_opportunity_run_time", "") or "").strip()
+    if evening_run_time:
+        logger.info("大盘风口机会池改为晚间运行（MARKET_OPPORTUNITY_RUN_TIME=%s），本批次不内联执行", evening_run_time)
+    else:
+        auxiliary_tasks.insert(0, ("market_opportunity", _run_market_opportunity_pool_if_enabled))
+    for name, task in auxiliary_tasks:
+        try:
+            task(config)
+        except Exception as exc:
+            failures.append(f"{name}: {exc}")
+            logger.exception("定时辅助任务失败: %s", name)
+    if failures:
+        raise RuntimeError("定时分析/辅助任务存在失败: " + "; ".join(failures))
+    return True
 
 
 def _run_analysis_with_runtime_scheduler_lock(
@@ -1417,8 +1800,13 @@ def main() -> int:
             # explicit --market-review invocation when the flag is disabled.
             effective_region = None
             if not getattr(args, 'force_run', False) and getattr(config, 'trading_day_check_enabled', True):
-                from src.core.trading_calendar import get_open_markets_today, compute_effective_region as _compute_region
-                open_markets = get_open_markets_today()
+                from src.core.trading_calendar import (
+                    get_open_markets_today, compute_effective_region as _compute_region, MARKET_TIMEZONE,
+                )
+                requested_region = _compute_region(
+                    getattr(config, 'market_review_region', 'cn') or 'cn', set(MARKET_TIMEZONE)
+                )
+                open_markets = get_open_markets_today(markets=set((requested_region or '').split(',')) - {''})
                 effective_region = _compute_region(
                     getattr(config, 'market_review_region', 'cn') or 'cn', open_markets
                 )
@@ -1468,13 +1856,30 @@ def main() -> int:
             logger.info(f"启动时立即执行: {should_run_immediately}")
 
             from src.scheduler import run_with_schedule
+            from src.services.runtime_scheduler import (
+                build_market_opportunity_evening_background_tasks,
+                run_with_global_analysis_lock,
+            )
             scheduled_stock_codes = _resolve_scheduled_stock_codes(stock_codes)
             schedule_time_provider = _build_schedule_time_provider(config.schedule_time)
             schedule_times_provider = _build_schedule_times_provider(config.schedule_time)
 
+            def _run_full_analysis_raising(task_config, task_args, task_stock_codes):
+                return run_full_analysis(task_config, task_args, task_stock_codes, raise_errors=True)
+
             def scheduled_task():
                 runtime_config = _reload_runtime_config()
-                run_full_analysis(runtime_config, args, scheduled_stock_codes)
+                if (
+                    getattr(runtime_config, "schedule_multi_model_enabled", False)
+                    or getattr(runtime_config, "paper_trading_enabled", False)
+                    or _market_opportunity_pool_enabled(runtime_config)
+                ):
+                    runner = run_scheduled_analysis
+                else:
+                    runner = _run_full_analysis_raising
+                # Hold the shared analysis lock so the evening opportunity pool
+                # never starts while this batch is still running.
+                return run_with_global_analysis_lock(runner, runtime_config, args, scheduled_stock_codes)
 
             background_tasks = []
             if getattr(config, 'agent_event_monitor_enabled', False):
@@ -1496,12 +1901,49 @@ def main() -> int:
                     "name": "agent_event_monitor",
                 })
 
+            def paper_trading_intraday_task():
+                return _run_paper_trading_intraday_monitor_if_enabled(_reload_runtime_config())
+
+            def paper_trading_opening_confirmation_task():
+                return _run_paper_trading_opening_confirmation_if_enabled(_reload_runtime_config())
+
+            background_tasks.append({
+                "task": paper_trading_opening_confirmation_task,
+                "interval_seconds": 30,
+                "run_immediately": False,
+                "name": "paper_trading_opening_confirmation_0930",
+                "lease_task_name": "paper_trading_opening_confirmation_0930",
+                "active_time_start": "09:30:00",
+                "active_time_end": "09:35:00",
+                "active_timezone": "Asia/Shanghai",
+            })
+
+            paper_interval_minutes = max(
+                1,
+                int(getattr(config, "paper_trading_intraday_interval_minutes", 5) or 5),
+            )
+            background_tasks.append({
+                "task": paper_trading_intraday_task,
+                "interval_seconds": paper_interval_minutes * 60,
+                "run_immediately": False,
+                "name": "paper_trading_intraday_monitor",
+                "lease_task_name": "paper_trading_intraday_monitor",
+            })
+            background_tasks.extend(
+                build_market_opportunity_evening_background_tasks(
+                    config,
+                    config_provider=_reload_runtime_config,
+                    runner=_run_market_opportunity_pool_evening_if_due,
+                )
+            )
+
             schedule_kwargs = {
                 "task": scheduled_task,
                 "schedule_time": config.schedule_time,
                 "run_immediately": should_run_immediately,
                 "background_tasks": background_tasks,
                 "schedule_time_provider": schedule_time_provider,
+                "shared_lease_enabled": True,
             }
             if hasattr(config, "schedule_times"):
                 schedule_kwargs["schedule_times"] = config.schedule_times

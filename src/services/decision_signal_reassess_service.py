@@ -7,7 +7,12 @@ import re
 from collections.abc import Mapping
 from typing import Any, Optional
 
-from src.schemas.decision_action import build_action_fields, normalize_decision_action
+from src.schemas.decision_action import (
+    build_action_fields,
+    normalize_decision_action,
+    normalize_holding_state,
+    resolve_position_aware_action_fields,
+)
 from src.schemas.decision_profile import normalize_decision_profile
 from src.schemas.decision_scale import action_for_score, score_action_conflicts_without_guardrail
 from src.services.decision_profile_policy import (
@@ -84,6 +89,7 @@ class DecisionSignalReassessService:
             data_quality_level=data_quality_level,
         )
         preview_candidate = policy.candidate
+        action_resolution = _candidate_action_resolution(record, raw_result, candidate.score)
         metadata = {
             "decision_profile": decision_profile_norm,
             "profile_source": "user_selected",
@@ -93,6 +99,10 @@ class DecisionSignalReassessService:
             "scoring_breakdown": policy.scoring_breakdown,
             "data_quality_level": data_quality_level,
             "guardrail_result": policy.guardrail_result.as_dict(),
+            "holding_state": action_resolution["holding_state"],
+            "position_actions": _as_mapping(raw_result.get("position_actions")),
+            "base_action": action_resolution["base_action"],
+            "effective_action_source": action_resolution["resolution_source"],
         }
         preview = {
             "action": preview_candidate.action,
@@ -137,22 +147,7 @@ def _build_candidate(
         _score_from_value(_first_present(raw_result.get("sentiment_score"), getattr(record, "sentiment_score", None))),
         dashboard=dashboard,
     )
-    raw_action = normalize_decision_action(raw_result.get("action")) or normalize_decision_action(
-        _first_present(raw_result.get("operation_advice"), getattr(record, "operation_advice", None))
-    )
-    guardrail_reason = _extract_guardrail_reason(raw_result, score=score, raw_action=raw_action)
-    action_fields = build_action_fields(
-        operation_advice=_first_present(
-            raw_result.get("operation_advice"),
-            getattr(record, "operation_advice", None),
-        ),
-        explicit_action=raw_result.get("action"),
-        report_type=report_type,
-        report_language=raw_result.get("report_language"),
-        sentiment_score=score,
-        guardrail_reason=guardrail_reason,
-        align_with_score=True,
-    )
+    action_fields = _candidate_action_resolution(record, raw_result, score)
     action = action_fields.get("action")
     if not action:
         raise DecisionSignalUnsupportedReportSnapshotError("source report has no structured decision action")
@@ -182,6 +177,36 @@ def _build_candidate(
         risk_summary=_extract_risk_summary(raw_result),
         watch_conditions=_extract_watch_conditions(raw_result),
         market_phase=market_phase,
+    )
+
+
+def _candidate_action_resolution(
+    record: AnalysisHistory,
+    raw_result: Mapping[str, Any],
+    score: Optional[int],
+) -> dict[str, Any]:
+    report_type = str(getattr(record, "report_type", "") or "").strip().lower()
+    raw_action = normalize_decision_action(raw_result.get("action")) or normalize_decision_action(
+        _first_present(raw_result.get("operation_advice"), getattr(record, "operation_advice", None))
+    )
+    guardrail_reason = _extract_guardrail_reason(raw_result, score=score, raw_action=raw_action)
+    base_fields = build_action_fields(
+        operation_advice=_first_present(
+            raw_result.get("operation_advice"),
+            getattr(record, "operation_advice", None),
+        ),
+        explicit_action=raw_result.get("action"),
+        report_type=report_type,
+        report_language=raw_result.get("report_language"),
+        sentiment_score=score,
+        guardrail_reason=guardrail_reason,
+        align_with_score=True,
+    )
+    return resolve_position_aware_action_fields(
+        holding_state=normalize_holding_state(raw_result.get("holding_state")),
+        position_actions=raw_result.get("position_actions"),
+        fallback_action=base_fields.get("action"),
+        report_language=raw_result.get("report_language"),
     )
 
 
@@ -384,6 +409,22 @@ def _extract_horizon(
     )
     if explicit in {"intraday", "1d", "3d", "5d", "10d", "swing", "long"}:
         return explicit
+    snapshot = _as_mapping(context_snapshot)
+    enhanced = _as_mapping(snapshot.get("enhanced_context"))
+    style_context = _as_mapping(snapshot.get("paper_trading_style_context")) or _as_mapping(
+        enhanced.get("paper_trading_style_context")
+    )
+    settings = _as_mapping(style_context.get("settings"))
+    configured = str(settings.get("default_signal_horizon") or "").strip().lower()
+    if configured in {"intraday", "1d", "3d", "5d", "10d", "swing", "long"}:
+        return configured
+    style_default = {
+        "short_swing": "3d",
+        "position": "swing",
+        "trend": "long",
+    }.get(str(style_context.get("trading_style") or "").strip().lower())
+    if style_default:
+        return style_default
     phase = market_phase or _nested_get(context_snapshot, ("market_phase_summary", "phase"))
     return "intraday" if action == "alert" or phase == "intraday" else "3d"
 

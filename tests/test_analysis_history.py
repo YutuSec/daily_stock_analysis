@@ -556,6 +556,7 @@ class AnalysisHistoryTestCase(unittest.TestCase):
             self.assertEqual(row.id, saved)
             payload = json.loads(row.raw_result or "{}")
             self.assertEqual(payload.get("model_used"), "gemini/gemini-2.0-flash")
+            self.assertEqual(row.model_used, "gemini/gemini-2.0-flash")
 
     def test_update_analysis_history_diagnostics_preserves_snapshot_fields(self) -> None:
         """通知发送后补写 diagnostics 时，不应覆盖已有上下文字段。"""
@@ -812,6 +813,51 @@ class AnalysisHistoryTestCase(unittest.TestCase):
 
         self.assertEqual([record.code for record in records], ["600519"])
 
+    def test_history_and_stock_bar_can_filter_by_persisted_model(self) -> None:
+        if get_stock_bar is None:
+            self.skipTest("fastapi is not installed in this test environment")
+
+        deepseek = self._build_result()
+        deepseek.code = "600519"
+        deepseek.model_used = "deepseek"
+        claude = self._build_result()
+        claude.code = "000858"
+        claude.model_used = "claude"
+
+        self.assertGreater(self.db.save_analysis_history(
+            result=deepseek,
+            query_id="query_model_deepseek",
+            report_type="detailed",
+            news_content="deepseek report",
+            context_snapshot=None,
+            save_snapshot=False,
+        ), 0)
+        self.assertGreater(self.db.save_analysis_history(
+            result=claude,
+            query_id="query_model_claude",
+            report_type="detailed",
+            news_content="claude report",
+            context_snapshot=None,
+            save_snapshot=False,
+        ), 0)
+
+        listing = HistoryService(self.db).get_history_list(
+            model_used="claude",
+            page=1,
+            limit=10,
+        )
+        stock_bar = get_stock_bar(
+            start_date=None,
+            end_date=None,
+            model_used="claude",
+            limit=10,
+            db_manager=self.db,
+        )
+
+        self.assertEqual([item["stock_code"] for item in listing["items"]], ["000858"])
+        self.assertEqual([item.stock_code for item in stock_bar.items], ["000858"])
+        self.assertEqual(stock_bar.items[0].model_used, "claude")
+
     def test_stock_bar_item_derives_action_fields_from_legacy_advice(self) -> None:
         if get_stock_bar is None:
             self.skipTest("fastapi is not installed in this test environment")
@@ -910,6 +956,314 @@ class AnalysisHistoryTestCase(unittest.TestCase):
         self.assertEqual(response.items[0].operation_advice, "Hold")
         self.assertEqual(response.items[0].action, "buy")
         self.assertEqual(response.items[0].action_label, "Buy")
+
+    def test_empty_position_branch_resolves_legacy_reduce_report_before_persisting(self) -> None:
+        if get_stock_bar is None:
+            self.skipTest("fastapi is not installed in this test environment")
+
+        result = self._build_result()
+        result.code = "002173.SZ"
+        result.name = "创新医疗"
+        result.sentiment_score = 37
+        result.operation_advice = "减仓"
+        result.action = "reduce"
+        result.action_label = "减仓"
+        result.holding_state = "empty"
+        result.position_actions = {
+            "empty": {"action": "watch", "advice": "空仓者观望"},
+            "holding": {"action": "reduce", "advice": "持仓者减仓"},
+        }
+
+        saved = self.db.save_analysis_history(
+            result=result,
+            query_id="query_empty_innovation_medical",
+            report_type="detailed",
+            news_content="个股正文",
+            context_snapshot=None,
+            save_snapshot=False,
+        )
+        self.assertGreater(saved, 0)
+
+        listing = HistoryService(self.db).get_history_list(page=1, limit=10)
+        detail = HistoryService(self.db).get_history_detail_by_id(saved)
+        stock_bar = get_stock_bar(
+            start_date=None,
+            end_date=None,
+            limit=10,
+            db_manager=self.db,
+        )
+
+        self.assertEqual(listing["items"][0]["operation_advice"], "观望")
+        self.assertEqual(listing["items"][0]["action"], "watch")
+        self.assertEqual(detail["operation_advice"], "观望")
+        self.assertEqual(detail["action"], "watch")
+        self.assertEqual(stock_bar.items[0].operation_advice, "观望")
+        self.assertEqual(stock_bar.items[0].action, "watch")
+
+        with self.db.session_scope() as session:
+            persisted = session.query(AnalysisHistory).filter(AnalysisHistory.id == saved).one()
+            self.assertEqual(persisted.operation_advice, "观望")
+            persisted_raw = json.loads(persisted.raw_result)
+            self.assertEqual(persisted_raw["operation_advice"], "观望")
+            self.assertEqual(persisted_raw["action"], "watch")
+
+    def test_failed_analysis_attempt_is_visible_and_non_actionable(self) -> None:
+        if get_stock_bar is None:
+            self.skipTest("fastapi is not installed in this test environment")
+
+        result = self._build_result()
+        result.code = "601606.SH"
+        result.name = "长城军工"
+        result.success = False
+        result.error_message = "schema_validation_failed"
+        result.operation_advice = "分析失败"
+        result.action = None
+        result.action_label = None
+        result.decision_type = "failed"
+
+        saved = self.db.save_analysis_history(
+            result=result,
+            query_id="query_failed_schema",
+            report_type="detailed",
+            news_content="",
+            context_snapshot=None,
+            save_snapshot=False,
+        )
+        self.assertEqual(saved, 0)
+
+        with self.db.get_session() as session:
+            self.assertEqual(session.query(AnalysisHistory).count(), 0)
+
+    def test_database_initialization_does_not_rewrite_legacy_position_contract_rows(self) -> None:
+        legacy_raw = {
+            "success": True,
+            "holding_state": "empty",
+            "operation_advice": "减仓",
+            "action": "reduce",
+            "action_label": "减仓",
+            "position_actions": {
+                "empty": {"action": "watch", "advice": "空仓观望"},
+                "holding": {"action": "reduce", "advice": "持仓减仓"},
+            },
+        }
+        with self.db.session_scope() as session:
+            session.add(AnalysisHistory(
+                query_id="legacy_position_contract",
+                code="002173.SZ",
+                name="创新医疗",
+                report_type="detailed",
+                sentiment_score=37,
+                operation_advice="减仓",
+                trend_prediction="震荡",
+                analysis_summary="旧历史审计样例",
+                raw_result=json.dumps(legacy_raw, ensure_ascii=False),
+                created_at=datetime.now(),
+            ))
+
+        DatabaseManager.reset_instance()
+        self.db = DatabaseManager.get_instance()
+
+        with self.db.get_session() as session:
+            row = session.query(AnalysisHistory).filter_by(query_id="legacy_position_contract").one()
+            self.assertEqual(row.operation_advice, "减仓")
+            raw = json.loads(row.raw_result)
+            self.assertEqual(raw["operation_advice"], "减仓")
+            self.assertEqual(raw["action"], "reduce")
+
+    def test_schema_valid_watch_report_is_not_marked_degraded(self) -> None:
+        valid_raw_response = json.dumps({
+            "stock_name": "测试ETF",
+            "sentiment_score": 50,
+            "trend_prediction": "震荡",
+            "operation_advice": "观望",
+            "analysis_summary": "等待进一步确认",
+            "dashboard": {"core_conclusion": {"one_sentence": "观望"}},
+        }, ensure_ascii=False)
+        result = self._build_result()
+        result.code = "159915.SZ"
+        result.name = "创业板ETF"
+        result.sentiment_score = 50
+        result.operation_advice = "观望"
+        result.action = "watch"
+        result.action_label = "观望"
+        result.raw_response = valid_raw_response
+
+        saved = self.db.save_analysis_history(
+            result=result,
+            query_id="query_valid_watch_raw_response",
+            report_type="detailed",
+            news_content="",
+            context_snapshot=None,
+            save_snapshot=False,
+        )
+        self.assertGreater(saved, 0)
+
+        listing = HistoryService(self.db).get_history_list(page=1, limit=10)
+        detail = HistoryService(self.db).get_history_detail_by_id(saved)
+
+        self.assertEqual(listing["items"][0]["analysis_status"], "success")
+        self.assertEqual(detail["analysis_status"], "success")
+        self.assertEqual(listing["items"][0]["action"], "watch")
+
+    def test_legacy_schema_drift_raw_response_is_marked_degraded_without_rewrite(self) -> None:
+        if get_stock_bar is None:
+            self.skipTest("fastapi is not installed in this test environment")
+
+        drift_raw_response = json.dumps({
+            "stock_name": "创新医疗",
+            "sentiment_score": 37,
+            "trend_prediction": "震荡",
+            "operation_advice": "减仓",
+            "analysis_summary": "Claude schema drift sample",
+            "dashboard": {
+                "phase_decision": {
+                    "phase_context": "CN · 盘后",
+                },
+            },
+        }, ensure_ascii=False)
+        raw_result = {
+            "success": True,
+            "sentiment_score": 37,
+            "operation_advice": "观望",
+            "action": "watch",
+            "action_label": "观望",
+            "raw_response": drift_raw_response,
+        }
+        with self.db.session_scope() as session:
+            legacy = AnalysisHistory(
+                query_id="query_legacy_schema_drift",
+                code="002173.SZ",
+                name="创新医疗",
+                report_type="detailed",
+                sentiment_score=37,
+                operation_advice="观望",
+                trend_prediction="震荡",
+                analysis_summary="旧逻辑已兜底样例",
+                raw_result=json.dumps(raw_result, ensure_ascii=False),
+                created_at=datetime.now(),
+            )
+            session.add(legacy)
+            session.flush()
+            legacy_id = legacy.id
+
+        listing = HistoryService(self.db).get_history_list(page=1, limit=10)
+        detail = HistoryService(self.db).get_history_detail_by_id(legacy_id)
+        stock_bar = get_stock_bar(
+            start_date=None,
+            end_date=None,
+            limit=10,
+            db_manager=self.db,
+        )
+
+        self.assertEqual(listing["items"][0]["analysis_status"], "degraded")
+        self.assertEqual(listing["items"][0]["error_message"], "legacy_schema_validation_failed")
+        self.assertIsNone(listing["items"][0]["action"])
+        self.assertEqual(detail["analysis_status"], "degraded")
+        self.assertEqual(stock_bar.items[0].analysis_status, "degraded")
+        self.assertEqual(stock_bar.items[0].latest_attempt_error, "legacy_schema_validation_failed")
+
+        with self.db.get_session() as session:
+            persisted = session.query(AnalysisHistory).filter_by(id=legacy_id).one()
+            persisted_raw = json.loads(persisted.raw_result)
+            self.assertEqual(persisted_raw["operation_advice"], "观望")
+            self.assertEqual(persisted_raw["action"], "watch")
+
+    def test_legacy_unparseable_or_ambiguous_raw_response_is_marked_degraded(self) -> None:
+        for suffix, raw_response in (
+            ("text", "这是旧逻辑文本兜底，不是合格 JSON"),
+            (
+                "ambiguous",
+                """```json
+{"sentiment_score": 50}
+```
+```json
+{"sentiment_score": 55}
+```""",
+            ),
+        ):
+            raw_result = {
+                "success": True,
+                "sentiment_score": 50,
+                "operation_advice": "观望",
+                "action": "watch",
+                "action_label": "观望",
+                "raw_response": raw_response,
+            }
+            with self.db.session_scope() as session:
+                session.add(AnalysisHistory(
+                    query_id=f"query_legacy_unparseable_{suffix}",
+                    code=f"6005{len(suffix)}9.SH",
+                    name=f"测试{suffix}",
+                    report_type="detailed",
+                    sentiment_score=50,
+                    operation_advice="观望",
+                    trend_prediction="震荡",
+                    analysis_summary="旧兜底样例",
+                    raw_result=json.dumps(raw_result, ensure_ascii=False),
+                    created_at=datetime.now(),
+                ))
+
+        listing = HistoryService(self.db).get_history_list(page=1, limit=10)
+
+        by_name = {item["stock_name"]: item for item in listing["items"]}
+        self.assertEqual(by_name["测试text"]["analysis_status"], "degraded")
+        self.assertEqual(by_name["测试ambiguous"]["analysis_status"], "degraded")
+        self.assertEqual(by_name["测试text"]["error_message"], "legacy_schema_validation_failed")
+        self.assertIsNone(by_name["测试ambiguous"]["action"])
+
+    def test_newer_failed_attempt_overrides_stale_success_in_stock_bar(self) -> None:
+        if get_stock_bar is None:
+            self.skipTest("fastapi is not installed in this test environment")
+
+        result = self._build_result()
+        result.code = "518880.SH"
+        result.name = "黄金ETF华安"
+        result.sentiment_score = 78
+        result.operation_advice = "买入"
+        result.action = "buy"
+        result.action_label = "买入"
+        result.model_used = "deepseek/deepseek-v4-pro"
+
+        saved = self.db.save_analysis_history(
+            result=result,
+            query_id="query_gold_success_old",
+            report_type="detailed",
+            news_content="个股正文",
+            context_snapshot=None,
+            save_snapshot=False,
+        )
+        self.assertGreater(saved, 0)
+
+        attempt_id = self.db.save_analysis_attempt(
+            query_id="query_gold_failed_today",
+            code="518880.SH",
+            name="黄金ETF华安",
+            report_type="detailed",
+            model_used="deepseek/deepseek-v4-pro",
+            status="failed",
+            error_message="Insufficient Balance Authorization: Bearer sk-test-secret-token",
+        )
+        self.assertGreater(attempt_id, 0)
+
+        stock_bar = get_stock_bar(
+            start_date=None,
+            end_date=None,
+            model_used="deepseek/deepseek-v4-pro",
+            limit=10,
+            db_manager=self.db,
+        )
+
+        self.assertEqual(len(stock_bar.items), 1)
+        item = stock_bar.items[0]
+        self.assertEqual(item.stock_code, "518880.SH")
+        self.assertEqual(item.analysis_status, "failed")
+        self.assertEqual(item.operation_advice, "分析失败")
+        self.assertIsNone(item.action)
+        self.assertIsNone(item.action_label)
+        self.assertIn("Insufficient Balance", item.latest_attempt_error)
+        self.assertNotIn("sk-test-secret-token", item.latest_attempt_error)
+        self.assertNotIn("Bearer", item.latest_attempt_error)
+        self.assertIsNotNone(item.last_success_time)
 
     def test_history_detail_uses_service_resolved_action_fields(self) -> None:
         if get_history_detail is None:
@@ -1211,7 +1565,7 @@ class AnalysisHistoryTestCase(unittest.TestCase):
 
         self.assertIsNotNone(detail)
         self.assertIsInstance(detail.get("raw_result"), dict)
-        self.assertIsNone(detail.get("model_used"))
+        self.assertEqual(detail.get("model_used"), "gemini/gemini-2.0-flash")
 
     def test_history_detail_prefers_raw_sniper_strings(self) -> None:
         """History detail should display the original sniper point strings from raw_result."""

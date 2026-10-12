@@ -44,10 +44,15 @@ def run_with_global_analysis_lock(
     if not _RUNTIME_ANALYSIS_LOCK.acquire(blocking=blocking):
         return False
     try:
-        task_runner(config, args, stock_codes)
+        result = task_runner(config, args, stock_codes)
     finally:
         _RUNTIME_ANALYSIS_LOCK.release()
-    return True
+    return result is not False
+
+
+def global_analysis_running() -> bool:
+    """Return whether an analysis batch in this process holds the shared lock."""
+    return _RUNTIME_ANALYSIS_LOCK.locked()
 
 
 def _agent_event_monitor_interval_seconds(config: Config) -> int:
@@ -93,6 +98,85 @@ def build_agent_event_monitor_background_tasks(
         "interval_seconds": interval_seconds,
         "run_immediately": True,
         "name": "agent_event_monitor",
+    }]
+
+
+def build_paper_trading_intraday_background_tasks(
+    config: Config,
+    *,
+    config_provider: Callable[[], Config],
+) -> List[Dict[str, Any]]:
+    """Build the paper-only intraday monitor background task.
+
+    The callback still reloads config and applies its own throttle, but the
+    scheduler interval follows the configured polling interval to avoid
+    unnecessary wakeups and quote-provider pressure.
+    """
+    def paper_trading_intraday_task():
+        from main import _run_paper_trading_intraday_monitor_if_enabled
+
+        return _run_paper_trading_intraday_monitor_if_enabled(config_provider())
+
+    def paper_trading_opening_confirmation_task():
+        from main import _run_paper_trading_opening_confirmation_if_enabled
+
+        return _run_paper_trading_opening_confirmation_if_enabled(config_provider())
+
+    return [
+        {
+            "task": paper_trading_opening_confirmation_task,
+            "interval_seconds": 30,
+            "run_immediately": False,
+            "name": "paper_trading_opening_confirmation_0930",
+            "lease_task_name": "paper_trading_opening_confirmation_0930",
+            "active_time_start": "09:30:00",
+            "active_time_end": "09:35:00",
+            "active_timezone": "Asia/Shanghai",
+        },
+        {
+            "task": paper_trading_intraday_task,
+            "interval_seconds": max(
+                1,
+                int(getattr(config, "paper_trading_intraday_interval_minutes", 5) or 5),
+            ) * 60,
+            "run_immediately": False,
+            "name": "paper_trading_intraday_monitor",
+            "lease_task_name": "paper_trading_intraday_monitor",
+        },
+    ]
+
+
+def build_market_opportunity_evening_background_tasks(
+    config: Config,
+    *,
+    config_provider: Callable[[], Config],
+    runner: Optional[Callable[[Config], Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Build the deferred (evening) opportunity-pool task.
+
+    Always registered: the callback reloads config and stays dormant until
+    ``MARKET_OPPORTUNITY_RUN_TIME`` is set, so the Web setting applies without
+    restarting the scheduler.  The window opens at the CN close because the pool
+    needs that session's post-market review.  CLI schedule mode passes its own
+    ``runner`` to avoid importing ``main`` a second time.
+    """
+    def market_opportunity_evening_task():
+        task = runner
+        if task is None:
+            from main import _run_market_opportunity_pool_evening_if_due
+
+            task = _run_market_opportunity_pool_evening_if_due
+        return task(config_provider())
+
+    return [{
+        "task": market_opportunity_evening_task,
+        "interval_seconds": 300,
+        "run_immediately": False,
+        "name": "market_opportunity_evening_run",
+        "lease_task_name": "market_opportunity_evening_run",
+        "active_time_start": "15:00:00",
+        "active_time_end": "23:59:59",
+        "active_timezone": "Asia/Shanghai",
     }]
 
 
@@ -170,7 +254,7 @@ class RuntimeSchedulerService:
         self._last_skip_reason = "analysis_already_running"
         logger.warning("Runtime scheduler skipped run: analysis already running")
 
-    def _run_analysis_locked(self, stock_codes: Optional[List[str]]) -> None:
+    def _run_analysis_locked(self, stock_codes: Optional[List[str]]) -> bool:
         try:
             config = self._reload_config()
             runner = self._task_runner
@@ -184,19 +268,20 @@ class RuntimeSchedulerService:
                 raise RuntimeError("runtime scheduled analysis reported failure")
             self._last_success_at = datetime.now().isoformat()
             self._last_error = None
+            return True
         except Exception as exc:  # noqa: BLE001 - scheduled runs must not kill API process.
             self._last_error = str(exc)
             logger.exception("Runtime scheduled analysis failed: %s", exc)
+            return False
 
     def _run_analysis_once(self, stock_codes: Optional[List[str]] = None) -> bool:
         if not self._run_lock.acquire(blocking=False):
             self._record_analysis_busy_skip()
             return False
         try:
-            self._run_analysis_locked(stock_codes)
+            return self._run_analysis_locked(stock_codes)
         finally:
             self._run_lock.release()
-        return True
 
     def _current_times(self) -> List[str]:
         config = self._config_provider()
@@ -211,7 +296,17 @@ class RuntimeSchedulerService:
     def _current_background_tasks(self, config: Config) -> List[Dict[str, Any]]:
         if self._background_tasks_provider is not None:
             return self._background_tasks_provider(config)
-        return self._current_agent_event_monitor_background_tasks(config)
+        return [
+            *self._current_agent_event_monitor_background_tasks(config),
+            *build_paper_trading_intraday_background_tasks(
+                config,
+                config_provider=self._reload_config,
+            ),
+            *build_market_opportunity_evening_background_tasks(
+                config,
+                config_provider=self._reload_config,
+            ),
+        ]
 
     def _current_agent_event_monitor_background_tasks(self, config: Config) -> List[Dict[str, Any]]:
         name = "agent_event_monitor"
@@ -281,6 +376,8 @@ class RuntimeSchedulerService:
                 schedule_times=times,
                 schedule_times_provider=self._current_times,
                 register_signals=False,
+                shared_lease_enabled=True,
+                owner_kind="runtime_scheduler",
             )
             if run_immediately and self._run_immediately_in_background:
                 scheduler.set_daily_task(self._run_analysis_once, run_immediately=False)
@@ -292,6 +389,13 @@ class RuntimeSchedulerService:
                     interval_seconds=entry["interval_seconds"],
                     run_immediately=entry.get("run_immediately", False),
                     name=entry.get("name"),
+                    active_time_start=entry.get("active_time_start"),
+                    active_time_end=entry.get("active_time_end"),
+                    active_timezone=entry.get("active_timezone", "Asia/Shanghai"),
+                    run_once_per_window=entry.get("run_once_per_window", False),
+                    lease_enabled=entry.get("lease_enabled", True),
+                    lease_task_name=entry.get("lease_task_name") or entry.get("name"),
+                    lease_seconds=entry.get("lease_seconds"),
                 )
             if run_immediately and self._run_immediately_in_background:
                 self._run_in_background_thread(self._run_analysis_once)
@@ -371,9 +475,17 @@ class RuntimeSchedulerService:
             except Exception:  # pragma: no cover - defensive status fallback
                 schedule_times = []
         running = self._run_lock.locked()
+        try:
+            from src.services.scheduler_heartbeat import scheduler_task_states
+
+            shared_states = scheduler_task_states()
+        except Exception as exc:  # pragma: no cover - status endpoint must remain readable.
+            shared_states = {"available": False, "fresh": False, "error": str(exc), "tasks": {}}
         return {
             "enabled": self._enabled,
             "running": running,
+            "shared_scheduler": shared_states,
+            "shared_scheduler_tasks": shared_states.get("tasks", {}),
             "schedule_times": schedule_times,
             "next_run_at": next_run,
             "last_run_at": self._last_run_at,

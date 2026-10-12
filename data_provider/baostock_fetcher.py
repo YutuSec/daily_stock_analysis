@@ -38,8 +38,48 @@ from .base import (
     _is_hk_market,
 )
 import os
+import socket
+import threading
 
 logger = logging.getLogger(__name__)
+
+# Baostock 的 socket 没有超时，服务端不回包时 recv 会永久阻塞（曾导致晚间机会池卡死）。
+# 设置后超时会变成 Baostock 的“网络接收错误”，由 DataFetchError 切换到下一个数据源。
+try:
+    _BAOSTOCK_SOCKET_TIMEOUT = float(os.environ.get("BAOSTOCK_SOCKET_TIMEOUT", "30"))
+    if _BAOSTOCK_SOCKET_TIMEOUT <= 0:
+        raise ValueError
+except (ValueError, TypeError):
+    logger.warning("BAOSTOCK_SOCKET_TIMEOUT 无效，使用默认 30 秒")
+    _BAOSTOCK_SOCKET_TIMEOUT = 30.0
+
+# socket.setdefaulttimeout 是进程级设置，登录期间串行化，避免并发会话互相覆盖/还原。
+_BAOSTOCK_LOGIN_LOCK = threading.Lock()
+
+
+def _baostock_login_with_timeout(bs, timeout: float):
+    """登录 Baostock，并让登录及后续查询使用的连接都带读写超时。
+
+    baostock 在 login() 内部用 socket.socket() 新建连接并立即收发，调用方拿不到
+    这个 socket，所以只能在登录期间临时设置进程默认超时（新建 socket 会继承），
+    登录后再给 baostock 保存的连接显式设置超时。
+    """
+    with _BAOSTOCK_LOGIN_LOCK:
+        previous = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(timeout)
+        try:
+            result = bs.login()
+        finally:
+            socket.setdefaulttimeout(previous)
+    try:
+        import baostock.common.context as bs_context
+
+        conn = getattr(bs_context, "default_socket", None)
+        if conn is not None:
+            conn.settimeout(timeout)
+    except Exception:  # pragma: no cover - 仅防御 baostock 内部结构变化
+        pass
+    return result
 
 
 def _is_us_code(stock_code: str) -> bool:
@@ -109,7 +149,7 @@ class BaostockFetcher(BaseFetcher):
         
         try:
             # 登录 Baostock
-            login_result = bs.login()
+            login_result = _baostock_login_with_timeout(bs, _BAOSTOCK_SOCKET_TIMEOUT)
             
             if login_result.error_code != '0':
                 raise DataFetchError(f"Baostock 登录失败: {login_result.error_msg}")

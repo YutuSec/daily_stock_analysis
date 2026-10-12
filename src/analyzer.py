@@ -28,7 +28,6 @@ from src.agent.llm_adapter import (
     register_fallback_model_pricing,
 )
 from src.agent.provider_trace import resolved_model_provider_identity
-from src.agent.skills.defaults import CORE_TRADING_SKILL_POLICY_ZH
 from src.config import (
     Config,
     extra_litellm_params,
@@ -63,6 +62,18 @@ from src.llm.generation_backend import (
     GenerationError,
     GenerationErrorCode,
 )
+from src.llm.deepseek_structured import (
+    DEEPSEEK_REPORT_MAX_OUTPUT_TOKENS,
+    DeepSeekStructuredGenerationError,
+    OfficialDeepSeekStructuredClient,
+    chat_completion_finish_reason,
+    ensure_json_instruction,
+    extract_chat_completion_text,
+    extract_responses_text,
+    normalize_deepseek_usage,
+    responses_diagnostics,
+    resolve_official_deepseek_structured_route,
+)
 from src.llm.usage import (
     attach_legacy_message_stability_audit,
     attach_message_hmacs,
@@ -92,9 +103,14 @@ from src.report_language import (
     localize_trend_prediction,
     normalize_report_language,
 )
-from src.schemas.decision_action import build_action_fields
+from src.schemas.decision_action import (
+    build_action_fields,
+    normalize_decision_action,
+    normalize_result_decision_contract,
+)
 from src.schemas.decision_scale import (
     CANONICAL_DECISION_SCALE_PROMPT_ZH,
+    normalize_score,
     score_band_metadata,
 )
 from src.schemas.report_schema import AnalysisReportSchema
@@ -105,6 +121,38 @@ from src.market_structure_prompt import format_market_structure_prompt_section
 
 logger = logging.getLogger(__name__)
 
+ANALYSIS_REPORT_TOOL_SCHEMA_VERSION = "analysis-report-tool-v1"
+
+LEGACY_DEFAULT_TRADING_POLICY_ZH = """## 默认技能基线（无显式风格时适用）
+
+当前激活的 skills 可以补充细化分析视角；没有显式风格或技能时，以下基线作为默认短周期/波段风控参考，而不是覆盖纸面交易风格的硬门槛。
+
+### 1. 严进策略（不追高）
+- MA5 乖离用于衡量入场位置：<2% 通常更接近理想买点，2-5% 需要小仓与确认，>5% 一般不追高
+- 若处于强趋势、趋势延续或中线持仓风格，必须结合更长均线、ATR/波动、支撑压力、成交参与度和风险收益后再判断，不能仅因 MA5 乖离一项直接定为观望
+
+### 2. 趋势交易（顺势而为）
+- MA5/MA10/MA20 多头排列是短周期趋势参考，不是所有交易风格的买入必要条件
+- 空头排列或均线显著走弱时，新开仓需更严格；已有持仓应结合止损、目标位、T+1 和最新防御信号处理
+- 均线发散上行优于均线粘合，但中线/趋势风格还需参考 MA20/MA60/MA120 或配置给出的核心窗口
+
+### 3. 效率优先（筹码结构）
+- 关注筹码集中度：90%集中度 < 15% 表示筹码集中
+- 获利比例分析：70-90% 获利盘时需警惕获利回吐
+- 平均成本与现价关系：现价高于平均成本 5-15% 通常较健康，但 ETF 或无筹码数据时不得编造或强行扣分
+
+### 4. 买点偏好（回踩支撑）
+- 优先寻找与当前 setup 匹配的买点：突破看放量确认，回踩看缩量与支撑，趋势延续看参与度和风险收益
+- MA5/MA10 回踩可作为短周期买点参考；中线风格应同时检查 MA20/MA60、关键支撑、波动和资金
+- 跌破关键支撑或风格失效线时优先防御，而不是机械套用单一均线
+
+### 5. 风险排查重点
+- 减持公告、业绩预亏、监管处罚、行业政策利空、大额解禁
+
+### 6. 估值关注（PE/PB）
+- PE/PB 明显偏高时需在风险点中说明；ETF、指数或缺少估值数据时不得把不适用当成负面证据
+"""
+
 
 def _localized_text(language: Any, *, en: str, zh: str, ko: str) -> str:
     """Pick a deterministic fallback string for the report language (zh/en/ko)."""
@@ -114,6 +162,56 @@ def _localized_text(language: Any, *, en: str, zh: str, ko: str) -> str:
     if normalized == "ko":
         return ko
     return zh
+
+
+def _report_display_text(value: Any, default: str = "") -> str:
+    """Return a safe text value for non-trading report/display fields.
+
+    Provider-native structured output still carries the original dashboard
+    object into the trading contract checks.  This helper is only used for
+    narrative fields that are stored or rendered as text, so type drift such as
+    a list of news bullets should not fail the report or leak raw Python
+    objects into downstream UI/notifications.
+    """
+
+    if value is None:
+        return default
+    if isinstance(value, str):
+        text = value.strip()
+        return text if text else default
+    if isinstance(value, (list, tuple, set)):
+        parts = [str(item).strip() for item in value if str(item or "").strip()]
+        return "；".join(parts) if parts else default
+    if isinstance(value, dict):
+        try:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return str(value)
+    text = str(value).strip()
+    return text if text else default
+
+
+def _analysis_failed_label(language: Any) -> str:
+    return _localized_text(
+        language,
+        en="Analysis failed",
+        zh="分析失败",
+        ko="분석 실패",
+    )
+
+
+def _mark_failed_result_non_actionable(result: "AnalysisResult") -> "AnalysisResult":
+    """Failed model output is an attempt record, not an investment decision."""
+
+    result.success = False
+    result.sentiment_score = 50
+    result.trend_prediction = localize_trend_prediction('震荡', result.report_language)
+    result.action = None
+    result.action_label = None
+    result.operation_advice = _analysis_failed_label(result.report_language)
+    result.decision_type = "failed"
+    result.confidence_level = localize_confidence_level('低', result.report_language)
+    return result
 
 
 def _normalize_risk_warning_values(value: Any) -> List[str]:
@@ -285,14 +383,333 @@ class _AllModelsFailedError(Exception):
         last_response_text: Optional[str] = None,
         last_model: Optional[str] = None,
         last_usage: Optional[Dict[str, Any]] = None,
+        last_error_kind: Optional[str] = None,
     ):
         super().__init__(message)
         self.last_response_text = last_response_text
         self.last_model = last_model
         self.last_usage = last_usage or {}
+        self.last_error_kind = last_error_kind
+
+
+class _StructuredToolExtractionError(ValueError):
+    """Tool-call extraction failed, optionally with an untrusted visible draft."""
+
+    def __init__(self, message: str, *, draft_text: Optional[str] = None):
+        super().__init__(message)
+        self.draft_text = draft_text
+
+
+def _looks_like_structured_submission_error(error: Any) -> bool:
+    """Return whether an LLM failure is recoverable by re-submitting the tool payload."""
+    explicit_kind = getattr(error, "last_error_kind", None)
+    if explicit_kind is not None:
+        return explicit_kind == "structured_submission"
+
+    text = str(error or "").lower()
+    recoverable_markers = (
+        "tool_call_",
+        "schema_validation_failed",
+        "minimal_contract_failed",
+        "parser_contract_failed",
+        "json_root_not_object",
+        "ambiguous_json",
+        "empty_response",
+    )
+    if any(marker in text for marker in recoverable_markers):
+        return True
+
+    # Compatibility for callers that constructed the aggregate exception
+    # before ``last_error_kind`` existed. Runtime exceptions always carry the
+    # explicit terminal kind, so an earlier draft cannot turn a later network
+    # failure into a structured retry.
+    return bool(getattr(error, "last_response_text", None))
+
+
+def _classify_litellm_failure(error: Any) -> str:
+    """Classify the terminal provider attempt without consulting prior responses."""
+    return (
+        "structured_submission"
+        if _looks_like_structured_submission_error(error)
+        else "transport_provider"
+    )
 
 
 from src.utils.data_processing import normalize_report_signal_attribution
+
+
+def _positive_price_from_any(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, (list, tuple, dict)):
+        return None
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) and parsed > 0 else None
+    text = str(value).strip()
+    if not text:
+        return None
+    match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", text.replace(",", ""))
+    if not match:
+        return None
+    try:
+        parsed = float(match.group(1))
+    except ValueError:
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _valid_entry_leg(leg: Any) -> bool:
+    if not isinstance(leg, dict):
+        return False
+    if not str(leg.get("leg_id") or "").strip():
+        return False
+    if not str(leg.get("role") or "").strip():
+        return False
+    prerequisites = leg.get("prerequisites")
+    if not isinstance(prerequisites, list) or any(
+        not isinstance(item, str) or not item.strip()
+        for item in prerequisites
+    ):
+        return False
+    try:
+        allocation = float(leg.get("allocation_fraction"))
+        sequence = int(leg.get("sequence"))
+        max_executions = int(leg.get("max_executions", 1))
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(allocation) and 0 < allocation <= 1 and sequence > 0 and max_executions > 0):
+        return False
+    price_rules = leg.get("price_rules")
+    if not isinstance(price_rules, list) or not price_rules:
+        return False
+    has_valid_rule = False
+    for rule in price_rules:
+        if not isinstance(rule, dict):
+            return False
+        rule_type = str(rule.get("type") or "").strip()
+        if rule_type != "close_between":
+            return False
+        low = _positive_price_from_any(rule.get("low"))
+        high = _positive_price_from_any(rule.get("high"))
+        if low is not None and high is not None and low <= high:
+            has_valid_rule = True
+        else:
+            return False
+    return has_valid_rule
+
+
+def _entry_leg_bounds(entry_legs: Any) -> Optional[Tuple[float, float]]:
+    if not isinstance(entry_legs, list) or not entry_legs:
+        return None
+    lows: List[float] = []
+    highs: List[float] = []
+    allocations: List[float] = []
+    seen_ids: set[str] = set()
+    seen_sequences: set[int] = set()
+    for leg in entry_legs:
+        if not _valid_entry_leg(leg):
+            return None
+        leg_id = str(leg.get("leg_id") or "").strip()
+        sequence = int(leg.get("sequence"))
+        if leg_id in seen_ids or sequence in seen_sequences:
+            return None
+        seen_ids.add(leg_id)
+        seen_sequences.add(sequence)
+        allocations.append(float(leg.get("allocation_fraction")))
+        for rule in leg.get("price_rules") or []:
+            if isinstance(rule, dict) and str(rule.get("type") or "").strip() == "close_between":
+                low = _positive_price_from_any(rule.get("low"))
+                high = _positive_price_from_any(rule.get("high"))
+                if low is not None and high is not None:
+                    lows.append(low)
+                    highs.append(high)
+                    break
+    if not lows or not highs:
+        return None
+    total_allocation = sum(allocations)
+    if total_allocation <= 0 or total_allocation > 1.02:
+        return None
+    return min(lows), max(highs)
+
+
+def _valid_exit_legs(exit_legs: Any) -> bool:
+    if not isinstance(exit_legs, list) or not exit_legs:
+        return False
+    allocations: List[float] = []
+    targets: List[float] = []
+    seen_ids: set[str] = set()
+    seen_sequences: set[int] = set()
+    sequences: List[int] = []
+    for leg in exit_legs:
+        if not isinstance(leg, dict):
+            return False
+        leg_id = str(leg.get("leg_id") or "").strip()
+        role = str(leg.get("role") or "").strip()
+        if not leg_id or not role or leg_id in seen_ids:
+            return False
+        seen_ids.add(leg_id)
+        try:
+            sequence = int(leg.get("sequence"))
+            allocation = float(leg.get("allocation_fraction"))
+        except (TypeError, ValueError):
+            return False
+        target = _positive_price_from_any(leg.get("target_price"))
+        if (
+            sequence <= 0
+            or sequence in seen_sequences
+            or not math.isfinite(allocation)
+            or not 0 < allocation <= 1
+            or target is None
+        ):
+            return False
+        seen_sequences.add(sequence)
+        sequences.append(sequence)
+        allocations.append(allocation)
+        targets.append(target)
+    ordered_sequences = all(left < right for left, right in zip(sequences, sequences[1:]))
+    strictly_increasing = all(left < right for left, right in zip(targets, targets[1:]))
+    return ordered_sequences and abs(sum(allocations) - 1.0) <= 0.02 and strictly_increasing
+
+
+def _buy_contract_missing_fields(result: "AnalysisResult", sniper_points: Dict[str, Any]) -> List[str]:
+    action = normalize_decision_action(getattr(result, "action", None))
+    if action not in {"buy", "add"}:
+        return []
+
+    missing: List[str] = []
+    entry_legs = sniper_points.get("entry_legs")
+    entry_bounds = _entry_leg_bounds(entry_legs)
+    if sniper_points.get("entry_leg_schema_version") != "entry-legs-v1":
+        missing.append("dashboard.battle_plan.sniper_points.entry_leg_schema_version")
+    if entry_bounds is None:
+        missing.append("dashboard.battle_plan.sniper_points.entry_legs")
+
+    stop_loss = _positive_price_from_any(sniper_points.get("stop_loss"))
+    take_profit = _positive_price_from_any(sniper_points.get("take_profit"))
+    final_target = _positive_price_from_any(sniper_points.get("final_target")) or take_profit
+    if stop_loss is None:
+        missing.append("dashboard.battle_plan.sniper_points.stop_loss")
+    if take_profit is None:
+        missing.append("dashboard.battle_plan.sniper_points.take_profit")
+    if final_target is None:
+        missing.append("dashboard.battle_plan.sniper_points.final_target")
+
+    if sniper_points.get("exit_leg_schema_version") != "exit-legs-v1":
+        missing.append("dashboard.battle_plan.sniper_points.exit_leg_schema_version")
+    if not _valid_exit_legs(sniper_points.get("exit_legs")):
+        missing.append("dashboard.battle_plan.sniper_points.exit_legs")
+    else:
+        exit_targets = [
+            _positive_price_from_any(leg.get("target_price"))
+            for leg in sniper_points.get("exit_legs", [])
+            if isinstance(leg, dict)
+        ]
+        if final_target is not None and exit_targets and abs(exit_targets[-1] - final_target) > 0.01:
+            missing.append("dashboard.battle_plan.sniper_points.final_target_exit_mismatch")
+
+    if (
+        stop_loss is not None
+        and final_target is not None
+        and entry_bounds is not None
+        and not (stop_loss < entry_bounds[0] <= entry_bounds[1] < final_target)
+    ):
+        missing.append("dashboard.battle_plan.sniper_points.entry_stop_target_order")
+    elif stop_loss is not None and final_target is not None and stop_loss >= final_target:
+        missing.append("dashboard.battle_plan.sniper_points.stop_target_order")
+    return missing
+
+
+def buy_contract_missing_fields(
+    result: "AnalysisResult",
+    sniper_points: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Return executable buy/add contract violations for downstream gates.
+
+    Keeping this check reusable prevents a later score-alignment or
+    position-aware resolution step from turning a non-executable report into
+    a simulated buy.
+    """
+    if sniper_points is None:
+        dashboard = result.dashboard if isinstance(result.dashboard, dict) else {}
+        battle_plan = dashboard.get("battle_plan")
+        battle_plan = battle_plan if isinstance(battle_plan, dict) else {}
+        candidate = battle_plan.get("sniper_points")
+        sniper_points = candidate if isinstance(candidate, dict) else {}
+    missing = _buy_contract_missing_fields(result, sniper_points)
+    if normalize_decision_action(getattr(result, "action", None)) in {"buy", "add"}:
+        dashboard = result.dashboard if isinstance(result.dashboard, dict) else {}
+        missing.extend(_phase_decision_missing_fields(dashboard))
+    return list(dict.fromkeys(missing))
+
+
+def _is_execution_contract_field(field: str) -> bool:
+    """Whether a missing field should block execution, not report visibility."""
+
+    return (
+        field.startswith("dashboard.battle_plan.sniper_points.")
+        or field.startswith("dashboard.phase_decision.")
+        or field == "confidence_level"
+    )
+
+
+def _is_valid_trading_confidence_level(value: Any) -> bool:
+    key = str(value or "").strip().lower()
+    return key in {"高", "high", "中", "medium", "mid", "低", "low"}
+
+
+def _native_tool_core_contract_missing_fields(data: Dict[str, Any]) -> List[str]:
+    """Receive-side guard for fields that can alter trading behavior."""
+
+    if data.get("report_schema_version") != ANALYSIS_REPORT_TOOL_SCHEMA_VERSION:
+        return []
+    missing: List[str] = []
+    for field in ("raw_score", "adjusted_score", "sentiment_score"):
+        if normalize_score(data.get(field)) is None:
+            missing.append(field)
+    if not isinstance(data.get("action"), str) or not normalize_decision_action(data.get("action")):
+        missing.append("action")
+    position_actions = data.get("position_actions")
+    if not isinstance(position_actions, dict):
+        missing.append("position_actions")
+    else:
+        for branch in ("empty", "holding"):
+            branch_value = position_actions.get(branch)
+            if not isinstance(branch_value, dict):
+                missing.append(f"position_actions.{branch}")
+                continue
+            if (
+                not isinstance(branch_value.get("action"), str)
+                or not normalize_decision_action(branch_value.get("action"))
+            ):
+                missing.append(f"position_actions.{branch}.action")
+    if not _is_valid_trading_confidence_level(data.get("confidence_level")):
+        missing.append("confidence_level")
+    return missing
+
+
+def _phase_decision_missing_fields(dashboard: Dict[str, Any]) -> List[str]:
+    phase_decision = dashboard.get("phase_decision")
+    phase_decision = phase_decision if isinstance(phase_decision, dict) else {}
+    missing: List[str] = []
+    for field in ("action_window", "immediate_action", "next_check_time"):
+        value = phase_decision.get(field)
+        if not isinstance(value, str) or not value.strip():
+            missing.append(f"dashboard.phase_decision.{field}")
+    watch_conditions = phase_decision.get("watch_conditions")
+    if (
+        not isinstance(watch_conditions, list)
+        or not watch_conditions
+        or any(not isinstance(item, str) or not item.strip() for item in watch_conditions)
+    ):
+        missing.append("dashboard.phase_decision.watch_conditions")
+    return missing
+
+
+def _phase_entry_mode(dashboard: Dict[str, Any]) -> Optional[str]:
+    phase_decision = dashboard.get("phase_decision")
+    if not isinstance(phase_decision, dict):
+        return None
+    mode = str(phase_decision.get("entry_mode") or "").strip().lower()
+    return mode if mode in {"none", "conditional", "immediate"} else None
 
 
 def check_content_integrity(
@@ -331,46 +748,43 @@ def check_content_integrity(
 
     if result.sentiment_score is None:
         missing.append("sentiment_score")
+    trade_action = normalize_decision_action(getattr(result, "action", None))
     advice = result.operation_advice
-    if not advice or not isinstance(advice, str) or _is_blank_text(advice):
-        missing.append("operation_advice")
-    summary = result.analysis_summary
-    if not summary or not isinstance(summary, str) or _is_blank_text(summary):
-        missing.append("analysis_summary")
+    if not trade_action and (not advice or not isinstance(advice, str) or _is_blank_text(advice)):
+        missing.append("action")
+    if not _is_valid_trading_confidence_level(getattr(result, "confidence_level", None)):
+        missing.append("confidence_level")
     dash = result.dashboard if isinstance(result.dashboard, dict) else {}
-    core = dash.get("core_conclusion")
-    core = core if isinstance(core, dict) else {}
-    if _is_blank_text(core.get("one_sentence")):
-        missing.append("dashboard.core_conclusion.one_sentence")
-    intel = dash.get("intelligence")
-    intel = intel if isinstance(intel, dict) else None
-    if intel is None or _is_invalid_risk_alerts(intel.get("risk_alerts")):
-        missing.append("dashboard.intelligence.risk_alerts")
-    if result.decision_type in ("buy", "hold"):
-        battle = dash.get("battle_plan")
-        battle = battle if isinstance(battle, dict) else {}
-        sp = battle.get("sniper_points")
-        sp = sp if isinstance(sp, dict) else {}
-        stop_loss = sp.get("stop_loss")
-        if _is_invalid_stop_loss(stop_loss):
-            missing.append("dashboard.battle_plan.sniper_points.stop_loss")
-    if require_phase_decision:
-        phase_decision = dash.get("phase_decision")
-        phase_decision = phase_decision if isinstance(phase_decision, dict) else {}
-        if not isinstance(phase_decision.get("phase_context"), dict):
-            missing.append("dashboard.phase_decision.phase_context")
-        if _is_blank_text(phase_decision.get("action_window")):
-            missing.append("dashboard.phase_decision.action_window")
-        if _is_blank_text(phase_decision.get("immediate_action")):
-            missing.append("dashboard.phase_decision.immediate_action")
-        if not isinstance(phase_decision.get("watch_conditions"), list):
-            missing.append("dashboard.phase_decision.watch_conditions")
-        if _is_blank_text(phase_decision.get("next_check_time")):
-            missing.append("dashboard.phase_decision.next_check_time")
-        if _is_blank_text(phase_decision.get("confidence_reason")):
-            missing.append("dashboard.phase_decision.confidence_reason")
-        if not isinstance(phase_decision.get("data_limitations"), list):
-            missing.append("dashboard.phase_decision.data_limitations")
+    battle = dash.get("battle_plan")
+    battle = battle if isinstance(battle, dict) else {}
+    sp = battle.get("sniper_points")
+    sp = sp if isinstance(sp, dict) else {}
+    native_tool_contract = (
+        getattr(result, "report_schema_version", None)
+        == ANALYSIS_REPORT_TOOL_SCHEMA_VERSION
+    )
+    if native_tool_contract:
+        position_actions = getattr(result, "position_actions", None)
+        if not isinstance(position_actions, dict):
+            missing.append("position_actions")
+        else:
+            for branch in ("empty", "holding"):
+                branch_value = position_actions.get(branch)
+                if not isinstance(branch_value, dict):
+                    missing.append(f"position_actions.{branch}")
+                    continue
+                if not normalize_decision_action(branch_value.get("action")):
+                    missing.append(f"position_actions.{branch}.action")
+        missing.extend(_buy_contract_missing_fields(result, sp))
+        entry_mode = _phase_entry_mode(dash)
+        raw_action = normalize_decision_action(getattr(result, "action", None))
+        if entry_mode in {"conditional", "immediate"} and raw_action not in {"buy", "add"}:
+            missing.append("dashboard.phase_decision.entry_mode_action_mismatch")
+        elif entry_mode == "none" and raw_action in {"buy", "add"}:
+            missing.append("dashboard.phase_decision.entry_mode_action_mismatch")
+    require_trade_phase_contract = trade_action in {"buy", "add", "reduce", "sell"}
+    if require_trade_phase_contract:
+        missing.extend(_phase_decision_missing_fields(dash))
     return len(missing) == 0, missing
 
 
@@ -566,6 +980,17 @@ _CAPITAL_FLOW_UNAVAILABLE_STATUS = {
     "n/a",
     "null",
     "missing",
+}
+
+_CAPITAL_FLOW_FAILED_STATUS = {
+    "failed",
+    "error",
+    "fetch failed",
+    "fetch_failed",
+    "timeout",
+    "timed out",
+    "transport error",
+    "provider error",
 }
 
 
@@ -1363,6 +1788,8 @@ def _capital_flow_bias_with_status(
         return "unavailable", "capital_flow_block_missing"
     status = str(block.get("status") or "").strip().lower()
     normalized_status = status.replace("-", " ").replace("_", " ").strip()
+    if normalized_status in _CAPITAL_FLOW_FAILED_STATUS:
+        return "unavailable", status or "failed"
     if normalized_status in _CAPITAL_FLOW_UNAVAILABLE_STATUS or "not supported" in normalized_status:
         return "unavailable", status or "not_supported"
     data = block.get("data") if isinstance(block.get("data"), dict) else block
@@ -1395,10 +1822,24 @@ def _capital_flow_bias_with_status(
     return "neutral", "neutral"
 
 
+def _capital_flow_unavailable_kind(reason: str) -> str:
+    normalized = str(reason or "").strip().lower().replace("-", " ").replace("_", " ")
+    if "not supported" in normalized or "unsupported" in normalized or "not applicable" in normalized:
+        return "not_supported"
+    if normalized in _CAPITAL_FLOW_FAILED_STATUS or any(
+        token in normalized for token in ("failed", "error", "timeout", "timed out")
+    ):
+        return "failed"
+    return "missing"
+
+
 def _capital_flow_status_for_stability(reason: str, language: str) -> str:
+    kind = _capital_flow_unavailable_kind(reason)
+    if kind == "not_supported":
+        return "市场资金流服务不适用或暂不支持" if language == "zh" else "Capital flow source not applicable or unsupported"
+    if kind == "failed":
+        return "资金流获取失败" if language == "zh" else "capital flow fetch failed"
     normalized = str(reason or "").strip().lower()
-    if "not_supported" in normalized or "unsupported" in normalized or "not available" in normalized:
-        return "市场资金流服务暂不支持" if language == "zh" else "Capital flow source unsupported"
     if "empty_stock_flow" in normalized or "missing" in normalized:
         return "资金流数据缺失" if language == "zh" else "capital flow data unavailable"
     return "资金流数据不可用" if language == "zh" else "capital flow unavailable"
@@ -1415,15 +1856,51 @@ def _set_decision_stability_unavailable(
 ) -> None:
     dashboard = result.dashboard if isinstance(result.dashboard, dict) else {}
     result.dashboard = dashboard
+    flow_kind = _capital_flow_unavailable_kind(flow_status)
+    if language == "zh":
+        reason_text = (
+            "资金流不适用，未使用资金流校准"
+            if flow_kind == "not_supported"
+            else "资金流获取失败，未使用资金流校准"
+            if flow_kind == "failed"
+            else "资金流不可用，未使用资金流校准"
+        )
+    else:
+        reason_text = (
+            "Capital flow not applicable; stability calibration not applied"
+            if flow_kind == "not_supported"
+            else "Capital flow fetch failed; stability calibration not applied"
+            if flow_kind == "failed"
+            else "Capital flow unavailable; stability calibration not applied"
+        )
     dashboard["decision_stability"] = {
         "applied": False,
-        "reason": "资金流不可用，未使用资金流校准" if language == "zh" else "Capital flow unavailable; stability calibration not applied",
+        "reason": reason_text,
         "capital_flow_status": _capital_flow_status_for_stability(flow_status, language),
+        "capital_flow_unavailable_kind": flow_kind,
         "current_price": current_price,
         "support": support,
         "resistance": resistance,
         "capital_flow_bias": "unavailable",
     }
+    limitations = list(getattr(result, "limitations", None) or [])
+    limitation_code = (
+        "capital_flow_not_supported"
+        if flow_kind == "not_supported"
+        else "capital_flow_failed"
+        if flow_kind == "failed"
+        else "capital_flow_unavailable"
+    )
+    already_recorded = limitation_code in limitations
+    if not already_recorded:
+        limitations.append(limitation_code)
+    result.limitations = limitations
+    confidence_key = str(getattr(result, "confidence_level", "") or "").strip().lower()
+    if flow_kind == "failed" and not already_recorded:
+        if confidence_key in {"高", "high"}:
+            result.confidence_level = localize_confidence_level("中", language)
+        elif confidence_key in {"中", "medium", "mid"}:
+            result.confidence_level = localize_confidence_level("低", language)
     _sync_stability_dashboard_fields(result)
 
 
@@ -1456,18 +1933,23 @@ def _bound_hold_watch_sentiment_score(
     reason: Optional[str] = None,
     final_action: str = "watch",
 ) -> None:
+    """Record a neutral guardrail candidate without inventing a score.
+
+    A prior implementation forced every neutralized result into 45-59.  That
+    destroyed the model score and made optional/partial evidence look like a
+    real adjustment.  Final contract normalization now requires an explicit,
+    structured adjusted score before an action can leave its score band.
+    """
     try:
         score = int(getattr(result, "sentiment_score", 50))
     except (TypeError, ValueError):
         score = 50
-    adjusted_score = min(59, max(45, score))
-    result.sentiment_score = adjusted_score
     _record_decision_score_calibration(
         result,
         raw_score=score,
-        adjusted_score=adjusted_score,
+        adjusted_score=score,
         final_action=final_action,
-        guardrail_reason=reason,
+        guardrail_reason=None,
     )
 
 
@@ -1504,8 +1986,12 @@ def _apply_hold_watch_dashboard(
     position_advice["has_position"] = has_position
 
     stability = {
-        "applied": True,
-        "reason": reason,
+        "applied": False,
+        "reason": "结构信号仅形成候选调整；缺少显式 adjusted_score，未应用风控调整。"
+        if language == "zh"
+        else "Structural evidence proposed an adjustment, but no explicit adjusted_score was supplied.",
+        "candidate_reason": reason,
+        "reason_code": "explicit_adjusted_score_required",
         "current_price": current_price,
         "support": support,
         "resistance": resistance,
@@ -1580,7 +2066,6 @@ def _downgrade_to_structural_hold(
     resistance: Optional[float],
     flow_bias: str,
 ) -> None:
-    result.decision_type = "hold"
     _set_structural_hold_wording(
         result,
         language,
@@ -1655,6 +2140,25 @@ def _set_structural_hold_wording(
     if calibrate_score:
         final_action = "watch" if advice_key in {"range", "shakeout"} else "hold"
         _bound_hold_watch_sentiment_score(result, reason=reason, final_action=final_action)
+        dashboard = result.dashboard if isinstance(result.dashboard, dict) else {}
+        result.dashboard = dashboard
+        dashboard["decision_stability"] = {
+            "applied": False,
+            "reason_code": "explicit_adjusted_score_required",
+            "reason": "结构信号仅形成候选调整；缺少显式 adjusted_score，未应用风控调整。"
+            if language == "zh"
+            else "Structural evidence proposed an adjustment, but no explicit adjusted_score was supplied.",
+            "candidate_reason": reason,
+            "current_price": current_price,
+            "support": support,
+            "resistance": resistance,
+            "capital_flow_bias": flow_bias,
+        }
+        if reason and reason not in str(result.risk_warning or ""):
+            sep = "；" if language == "zh" else "; "
+            result.risk_warning = f"{result.risk_warning}{sep}{reason}" if result.risk_warning else reason
+        _sync_stability_dashboard_fields(result)
+        return
     result.operation_advice = advice
     if advice_key == "range":
         if language == "zh" and "震荡" not in str(result.trend_prediction):
@@ -1765,8 +2269,15 @@ class AnalysisResult:
     decision_type: str = "hold"  # 决策类型：buy/hold/sell（用于统计）
     confidence_level: str = "中"  # 置信度：高/中/低
     report_language: str = "zh"  # 报告输出语言：zh/en
+    report_schema_version: Optional[str] = None  # Native tool contract version, when present
     action: Optional[str] = None  # 建议动作 taxonomy：buy/add/hold/reduce/sell/watch/avoid/alert
     action_label: Optional[str] = None  # 本地化建议动作标签
+    raw_score: Optional[int] = None  # 模型原始评分
+    adjusted_score: Optional[int] = None  # 结构化风控后的最终评分
+    guardrail: Optional[Dict[str, Any]] = None  # 可审计风控调整
+    limitations: Optional[List[str]] = None  # 数据限制；不得隐式改变评分/动作
+    position_actions: Optional[Dict[str, Dict[str, Any]]] = None
+    holding_state: str = "unknown"  # 仅冻结持仓状态，不持久化账户/数量/成本
 
     # ========== 决策仪表盘 (新增) ==========
     dashboard: Optional[Dict[str, Any]] = None  # 完整的决策仪表盘数据
@@ -1831,8 +2342,15 @@ class AnalysisResult:
             'decision_type': self.decision_type,
             'confidence_level': self.confidence_level,
             'report_language': self.report_language,
+            'report_schema_version': self.report_schema_version,
             'action': self.action,
             'action_label': self.action_label,
+            'raw_score': self.raw_score,
+            'adjusted_score': self.adjusted_score,
+            'guardrail': self.guardrail,
+            'limitations': list(self.limitations or []),
+            'position_actions': self.position_actions,
+            'holding_state': self.holding_state,
             'dashboard': self.dashboard,  # 决策仪表盘数据
             'trend_analysis': self.trend_analysis,
             'short_term_outlook': self.short_term_outlook,
@@ -1924,24 +2442,17 @@ def populate_decision_action_fields(
     use_existing_action: bool = True,
     align_with_score: bool = True,
 ) -> AnalysisResult:
-    """Populate optional decision action fields without changing legacy advice."""
+    """Apply the unified score/action contract to every persisted result."""
 
     action_source = explicit_action
     if action_source is None and use_existing_action:
         action_source = getattr(result, "action", None)
 
-    fields = build_action_fields(
-        operation_advice=getattr(result, "operation_advice", None),
+    return normalize_result_decision_contract(
+        result,
         explicit_action=action_source,
-        report_type=report_type,
-        report_language=getattr(result, "report_language", "zh"),
-        sentiment_score=getattr(result, "sentiment_score", None),
-        guardrail_reason=getattr(result, "guardrail_reason", None),
         align_with_score=align_with_score,
     )
-    result.action = fields["action"]
-    result.action_label = fields["action_label"]
-    return result
 
 
 class GeminiAnalyzer:
@@ -1969,7 +2480,7 @@ class GeminiAnalyzer:
 
 {guidelines_placeholder}
 
-""" + CORE_TRADING_SKILL_POLICY_ZH + """
+    """ + LEGACY_DEFAULT_TRADING_POLICY_ZH + """
 
 """ + CANONICAL_DECISION_SCALE_PROMPT_ZH + """
 
@@ -1980,12 +2491,31 @@ class GeminiAnalyzer:
 ```json
 {
     "stock_name": "股票中文名称",
-    "sentiment_score": 0-100整数,
+    "raw_score": 0-100整数,
+    "adjusted_score": 0-100整数（无风控调整时等于 raw_score）,
+    "sentiment_score": 0-100整数（必须等于 adjusted_score）,
     "trend_prediction": "强烈看多/看多/震荡/看空/强烈看空",
     "operation_advice": "买入/加仓/持有/减仓/卖出/观望",
     "decision_type": "buy/hold/sell",
     "action": "buy/add/hold/reduce/sell/watch/avoid/alert",
-    "guardrail_reason": "当分数区间与最终 action 不一致时填写降级/升级原因，否则留空",
+    "guardrail": {
+        "applied": true/false,
+        "reason_code": "仅 applied=true 时填写稳定原因码",
+        "reason": "仅 applied=true 时填写明确证据",
+        "raw_score": 0-100整数,
+        "adjusted_score": 0-100整数,
+        "score_delta": 整数
+    },
+    "limitations": ["可选数据缺失项；只降低置信度，不改变评分或动作"],
+    "position_actions": {
+        "empty": {"action": "buy/watch/avoid/alert", "advice": "空仓者建议；空仓可以买入，但不得使用持有/减仓/卖出"},
+        "holding": {
+            "action": "add/hold/reduce/sell/watch/avoid/alert",
+            "advice": "持仓者建议",
+            "stop_loss": 持仓情况下建议继续生效的止损价（正数；无法可靠给出时省略）,
+            "target_price": 持仓情况下建议继续生效的止盈/目标价（正数；无法可靠给出时省略）
+        }
+    },
     "confidence_level": "高/中/低",
 
     "dashboard": {
@@ -2039,10 +2569,21 @@ class GeminiAnalyzer:
 
         "battle_plan": {
             "sniper_points": {
-                "ideal_buy": "理想买入点：XX元（在MA5附近）",
-                "secondary_buy": "次优买入点：XX元（在MA10附近）",
-                "stop_loss": "止损位：XX元（跌破MA20或X%）",
-                "take_profit": "目标位：XX元（前高/整数关口）"
+                "ideal_buy": "理想买入点：XX元（符合所选交易风格的支撑/突破/回踩条件）",
+                "secondary_buy": "次优买入点：XX元（更保守或二次确认后执行）",
+                "stop_loss": "止损位：XX元（风格失效条件、关键支撑或X%风险）",
+                "take_profit": "最终目标位：XX元（必须等于 final_target 或最后一条 exit_legs.target_price）",
+                "first_take_profit": "第一止盈位：XX元（可选；分批止盈时填写第一目标）",
+                "final_target": "最终目标位：XX元（可选；分批止盈时必须填写）",
+                "entry_leg_schema_version": "entry-legs-v1（可选；仅当你明确给出分批执行时填写）",
+                "entry_legs": [
+                    {"leg_id": "initial", "role": "initial", "sequence": 1, "allocation_fraction": 1.0, "max_executions": 1, "price_rules": [{"type": "close_between", "low": 0, "high": 0}], "prerequisites": []}
+                ],
+                "exit_leg_schema_version": "exit-legs-v1（可选；仅当你明确给出分段止盈时填写）",
+                "exit_legs": [
+                    {"leg_id": "tp1", "role": "partial_take_profit", "sequence": 1, "allocation_fraction": 0.5, "target_price": 0},
+                    {"leg_id": "tp2", "role": "final_take_profit", "sequence": 2, "allocation_fraction": 0.5, "target_price": 0}
+                ]
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
@@ -2061,6 +2602,7 @@ class GeminiAnalyzer:
 
         "phase_decision": {
             "phase_context": {"phase": "premarket/intraday/lunch_break/closing_auction/postmarket/non_trading/unknown"},
+            "entry_mode": "none/conditional/immediate",
             "action_window": "盘前计划/盘中跟踪/午间确认/收盘前风控/盘后复盘/非交易日观察",
             "immediate_action": "立即行动/等待确认/观察/止损止盈预警/禁止追高/无盘中动作",
             "watch_conditions": ["观察条件1", "观察条件2"],
@@ -2106,16 +2648,16 @@ class GeminiAnalyzer:
 ## 评分标准
 
 ### 强烈买入（80-100分）：
-- ✅ 多头排列：MA5 > MA10 > MA20
-- ✅ 低乖离率：<2%，最佳买点
-- ✅ 缩量回调或放量突破
+- ✅ 趋势结构符合所选交易风格：短线可重点看 MA5/MA10/MA20，中线/持仓需结合 MA10/MA20/MA60，趋势风格需结合 MA20/MA60/MA120 或更长周期
+- ✅ 价格位置与风格匹配：短线低乖离，中线回踩核心支撑，趋势风格处于主升/回撤可控区
+- ✅ 缩量回调、放量突破或趋势延续信号与当前 setup 匹配
 - ✅ 筹码集中健康
 - ✅ 消息面有利好催化
 
 ### 买入（60-79分）：
-- ✅ 多头排列或弱势多头
-- ✅ 乖离率 <5%
-- ✅ 量能正常
+- ✅ 主趋势或阶段结构偏积极，但允许短期均线缠绕
+- ✅ 入场位置、止损距离和风险收益比仍可控
+- ✅ 量能/资金/筹码至少部分确认，且没有重大否决项
 - ⚪ 允许一项次要条件不满足
 
 ### 观望（40-59分）：
@@ -2144,9 +2686,15 @@ class GeminiAnalyzer:
 ## 可操作性与稳定性约束
 
 - 不得仅因为单日涨跌或评分跨线就在“买入/卖出”之间剧烈切换。
-- 操作建议必须同时参考价格位置（支撑/压力位）、量能/筹码、主力资金流向和风险事件。
+- 持仓动作必须先分支判断：空仓允许 `buy/watch/avoid/alert`，不得输出 `hold/reduce/sell`，也不得写“空仓不能买入”；已有持仓允许 `add/hold/reduce/sell/watch/avoid/alert`，止损/止盈建议只对已有仓位或新入场计划生效。
+- `dashboard.phase_decision.entry_mode` 可选，取值只能为 `none`、`conditional`、`immediate`。`conditional` 表示已有明确入场授权但等待触发条件，顶层 `action` 仍必须是 `buy/add` 且买入契约完整；`none` 表示无入场授权。不得仅因理想买入价、评分或 watch 文案把 `watch` 升级为买入。
+- `confidence_level` 必须只填写单独标签：`高`、`中` 或 `低`；置信理由写入 `limitations`、`risk_warning` 或 `dashboard.phase_decision.confidence_reason`，不得写“中等偏低”或带括号长说明。
+- 趋势判断与入场择时必须分开：MA5 乖离和短均线更多用于买点时机，不能把 “MA5>MA10>MA20” 当作所有交易风格的买入硬门槛；中线和趋势风格应把核心 thesis 放在更长均线、波动、支撑压力、成交/资金和风险收益上。
+- 未搜索到新闻、新闻接口不可用或时间不合规，只能说明“当前窗口没有可引用的新闻证据”，不得推断为“没有事件/没有利空”；基本面数据陈旧只能作为历史背景，不得当作当前最新基本面。
+- 资金流、筹码或基本面字段缺失/不适用时，只能列为不确定性或适用性限制，不得当作真实利空，也不得仅因缺失自动扣分或改变动作；已有负面财报、趋势破位、风险事件仍应照常影响结论。
+- 操作建议必须同时参考价格位置（支撑/压力位）、量能/筹码、主力资金流向和风险事件；其中不适用于该标的的数据源应跳过，不作为否定条件。
 - 股价位于支撑与压力之间、资金流不明确时，优先输出“持有/震荡/观望/洗盘观察”等可执行的中性建议；`decision_type` 仍保持 `hold`。
-- 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
+- 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；未触价但条件策略有效时可用 `action=buy/add` + `entry_mode=conditional` 表达候选条件策略授权，预设入场区间仍须符合净盈亏比、ATR 和交易风格证据；两交易日报告确认、市场/账户风险和触价门禁由后端独立执行，不得声称这些后端门禁已经通过；接近压力且资金流出时不得追买。
 - 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
 - 必须输出 `dashboard.phase_decision` 七字段；盘中/午休/临近收盘要给出当前动作、观察条件和下一次检查点。
 - 建议输出可选展示字段 `dashboard.signal_attribution` 六字段；解释推荐理由的构成，包括技术指标、新闻舆情、基本面、市场环境的贡献度，以及最强看多/看空信号。
@@ -2168,12 +2716,31 @@ class GeminiAnalyzer:
 ```json
 {
     "stock_name": "股票中文名称",
-    "sentiment_score": 0-100整数,
+    "raw_score": 0-100整数,
+    "adjusted_score": 0-100整数（无风控调整时等于 raw_score）,
+    "sentiment_score": 0-100整数（必须等于 adjusted_score）,
     "trend_prediction": "强烈看多/看多/震荡/看空/强烈看空",
     "operation_advice": "买入/加仓/持有/减仓/卖出/观望",
     "decision_type": "buy/hold/sell",
     "action": "buy/add/hold/reduce/sell/watch/avoid/alert",
-    "guardrail_reason": "当分数区间与最终 action 不一致时填写降级/升级原因，否则留空",
+    "guardrail": {
+        "applied": true/false,
+        "reason_code": "仅 applied=true 时填写稳定原因码",
+        "reason": "仅 applied=true 时填写明确证据",
+        "raw_score": 0-100整数,
+        "adjusted_score": 0-100整数,
+        "score_delta": 整数
+    },
+    "limitations": ["可选数据缺失项；只降低置信度，不改变评分或动作"],
+    "position_actions": {
+        "empty": {"action": "buy/watch/avoid/alert", "advice": "空仓者建议；空仓可以买入，但不得使用持有/减仓/卖出"},
+        "holding": {
+            "action": "add/hold/reduce/sell/watch/avoid/alert",
+            "advice": "持仓者建议",
+            "stop_loss": 持仓情况下建议继续生效的止损价（正数；无法可靠给出时省略）,
+            "target_price": 持仓情况下建议继续生效的止盈/目标价（正数；无法可靠给出时省略）
+        }
+    },
     "confidence_level": "高/中/低",
 
     "dashboard": {
@@ -2230,7 +2797,18 @@ class GeminiAnalyzer:
                 "ideal_buy": "理想入场位：XX元（满足主要技能触发条件）",
                 "secondary_buy": "次优入场位：XX元（更保守或确认后执行）",
                 "stop_loss": "止损位：XX元（失效条件或X%风险）",
-                "take_profit": "目标位：XX元（按阻力位/风险回报比制定）"
+                "take_profit": "最终目标位：XX元（必须等于 final_target 或最后一条 exit_legs.target_price）",
+                "first_take_profit": "第一止盈位：XX元（可选；分批止盈时填写第一目标）",
+                "final_target": "最终目标位：XX元（可选；分批止盈时必须填写）",
+                "entry_leg_schema_version": "entry-legs-v1（可选；仅明确分批时填写）",
+                "entry_legs": [
+                    {"leg_id": "initial", "role": "initial", "sequence": 1, "allocation_fraction": 1.0, "max_executions": 1, "price_rules": [{"type": "close_between", "low": 0, "high": 0}], "prerequisites": []}
+                ],
+                "exit_leg_schema_version": "exit-legs-v1（可选；仅明确分段止盈时填写）",
+                "exit_legs": [
+                    {"leg_id": "tp1", "role": "partial_take_profit", "sequence": 1, "allocation_fraction": 0.5, "target_price": 0},
+                    {"leg_id": "tp2", "role": "final_take_profit", "sequence": 2, "allocation_fraction": 0.5, "target_price": 0}
+                ]
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
@@ -2249,6 +2827,7 @@ class GeminiAnalyzer:
 
         "phase_decision": {
             "phase_context": {"phase": "premarket/intraday/lunch_break/closing_auction/postmarket/non_trading/unknown"},
+            "entry_mode": "none/conditional/immediate",
             "action_window": "盘前计划/盘中跟踪/午间确认/收盘前风控/盘后复盘/非交易日观察",
             "immediate_action": "立即行动/等待确认/观察/止损止盈预警/禁止追高/无盘中动作",
             "watch_conditions": ["观察条件1", "观察条件2"],
@@ -2330,9 +2909,15 @@ class GeminiAnalyzer:
 ## 可操作性与稳定性约束
 
 - 不得仅因为单日涨跌或评分跨线就在“买入/卖出”之间剧烈切换。
-- 操作建议必须同时参考价格位置（支撑/压力位）、量能/筹码、主力资金流向和风险事件。
+- 持仓动作必须先分支判断：空仓允许 `buy/watch/avoid/alert`，不得输出 `hold/reduce/sell`，也不得写“空仓不能买入”；已有持仓允许 `add/hold/reduce/sell/watch/avoid/alert`，止损/止盈建议只对已有仓位或新入场计划生效。
+- `dashboard.phase_decision.entry_mode` 可选，取值只能为 `none`、`conditional`、`immediate`。`conditional` 表示已有明确入场授权但等待触发条件，顶层 `action` 仍必须是 `buy/add` 且买入契约完整；`none` 表示无入场授权。不得仅因理想买入价、评分或 watch 文案把 `watch` 升级为买入。
+- `confidence_level` 必须只填写单独标签：`高`、`中` 或 `低`；置信理由写入 `limitations`、`risk_warning` 或 `dashboard.phase_decision.confidence_reason`，不得写“中等偏低”或带括号长说明。
+- 趋势判断与入场择时必须分开：MA5 乖离和短均线更多用于买点时机，不能把 “MA5>MA10>MA20” 当作所有交易风格的买入硬门槛；中线和趋势风格应把核心 thesis 放在更长均线、波动、支撑压力、成交/资金和风险收益上。
+- 未搜索到新闻、新闻接口不可用或时间不合规，只能说明“当前窗口没有可引用的新闻证据”，不得推断为“没有事件/没有利空”；基本面数据陈旧只能作为历史背景，不得当作当前最新基本面。
+- 资金流、筹码或基本面字段缺失/不适用时，只能列为不确定性或适用性限制，不得当作真实利空，也不得仅因缺失自动扣分或改变动作；已有负面财报、趋势破位、风险事件仍应照常影响结论。
+- 操作建议必须同时参考价格位置（支撑/压力位）、量能/筹码、主力资金流向和风险事件；其中不适用于该标的的数据源应跳过，不作为否定条件。
 - 股价位于支撑与压力之间、资金流不明确时，优先输出“持有/震荡/观望/洗盘观察”等可执行的中性建议；`decision_type` 仍保持 `hold`。
-- 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
+- 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；未触价但条件策略有效时可用 `action=buy/add` + `entry_mode=conditional` 表达候选条件策略授权，预设入场区间仍须符合净盈亏比、ATR 和交易风格证据；两交易日报告确认、市场/账户风险和触价门禁由后端独立执行，不得声称这些后端门禁已经通过；接近压力且资金流出时不得追买。
 - 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
 - 必须输出 `dashboard.phase_decision` 七字段；盘中/午休/临近收盘要给出当前动作、观察条件和下一次检查点。
 - 建议输出可选展示字段 `dashboard.signal_attribution` 六字段；解释推荐理由的构成，包括技术指标、新闻舆情、基本面、市场环境的贡献度，以及最强看多/看空信号。
@@ -2344,6 +2929,313 @@ class GeminiAnalyzer:
 - 若信息不足，要明确指出不确定性
 - 不要编造价格、财报或新闻事实
 """
+
+    ANALYSIS_REPORT_TOOL_NAME = "submit_analysis_report"
+    ANALYSIS_REPORT_TOOL_SCHEMA_VERSION = ANALYSIS_REPORT_TOOL_SCHEMA_VERSION
+
+    @classmethod
+    def _analysis_report_tool(cls) -> Dict[str, Any]:
+        """Return the native tool contract used for standard stock reports."""
+        text = {"type": "string", "minLength": 1}
+        number_or_text = {
+            "anyOf": [
+                {"type": "number", "exclusiveMinimum": 0},
+                {"type": "string", "minLength": 1},
+            ]
+        }
+        metric_number_or_text = {
+            "anyOf": [
+                {"type": "number"},
+                {"type": "string", "minLength": 1},
+            ]
+        }
+        action_enum = {
+            "type": "string",
+            "enum": ["buy", "add", "hold", "reduce", "sell", "watch", "avoid", "alert"],
+        }
+        confidence_enum = {
+            "type": "string",
+            "enum": ["高", "中", "低", "high", "medium", "mid", "low"],
+        }
+        return {
+            "type": "function",
+            "function": {
+                "name": cls.ANALYSIS_REPORT_TOOL_NAME,
+                "description": (
+                    "Submit one complete stock-analysis decision dashboard. "
+                    "Use this tool exactly once; do not answer with plain text."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "required": [
+                        "report_schema_version",
+                        "raw_score",
+                        "adjusted_score",
+                        "sentiment_score",
+                        "action",
+                        "position_actions",
+                        "confidence_level",
+                    ],
+                    "properties": {
+                        "report_schema_version": {
+                            "type": "string",
+                            "const": cls.ANALYSIS_REPORT_TOOL_SCHEMA_VERSION,
+                        },
+                        "stock_name": text,
+                        "raw_score": {"type": "integer", "minimum": 0, "maximum": 100},
+                        "adjusted_score": {"type": "integer", "minimum": 0, "maximum": 100},
+                        "sentiment_score": {"type": "integer", "minimum": 0, "maximum": 100},
+                        "trend_prediction": text,
+                        "operation_advice": text,
+                        "decision_type": {"type": "string", "enum": ["buy", "hold", "sell"]},
+                        "action": action_enum,
+                        "confidence_level": confidence_enum,
+                        "limitations": {"type": "array", "items": text},
+                        "position_actions": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "required": ["empty", "holding"],
+                            "properties": {
+                                "empty": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                    "required": ["action"],
+                                    "properties": {"action": action_enum, "advice": text},
+                                },
+                                "holding": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                    "required": ["action"],
+                                    "properties": {
+                                        "action": action_enum,
+                                        "advice": text,
+                                        "stop_loss": {"type": "number", "exclusiveMinimum": 0},
+                                        "target_price": {"type": "number", "exclusiveMinimum": 0},
+                                    },
+                                },
+                            },
+                        },
+                        "dashboard": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "properties": {
+                                "core_conclusion": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                    "properties": {
+                                        "one_sentence": text,
+                                        "signal_type": text,
+                                        "time_sensitivity": text,
+                                        "position_advice": {
+                                            "type": "object",
+                                            "additionalProperties": True,
+                                            "properties": {
+                                                "no_position": text,
+                                                "has_position": text,
+                                            },
+                                        },
+                                    },
+                                },
+                                "data_perspective": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                    "properties": {
+                                        "trend_status": {
+                                            "type": "object",
+                                            "additionalProperties": True,
+                                            "properties": {
+                                                "ma_alignment": text,
+                                                "is_bullish": {"type": "boolean"},
+                                                "trend_score": metric_number_or_text,
+                                            },
+                                        },
+                                        "price_position": {
+                                            "type": "object",
+                                            "additionalProperties": True,
+                                            "properties": {
+                                                "current_price": number_or_text,
+                                                "ma5": number_or_text,
+                                                "ma10": number_or_text,
+                                                "ma20": number_or_text,
+                                                "bias_ma5": metric_number_or_text,
+                                                "bias_status": text,
+                                                "support_level": number_or_text,
+                                                "resistance_level": number_or_text,
+                                            },
+                                        },
+                                        "volume_analysis": {
+                                            "type": "object",
+                                            "additionalProperties": True,
+                                            "properties": {
+                                                "volume_ratio": metric_number_or_text,
+                                                "volume_status": text,
+                                                "turnover_rate": metric_number_or_text,
+                                                "volume_meaning": text,
+                                            },
+                                        },
+                                        "chip_structure": {
+                                            "type": "object",
+                                            "additionalProperties": True,
+                                            "properties": {
+                                                "profit_ratio": metric_number_or_text,
+                                                "avg_cost": number_or_text,
+                                                "concentration": metric_number_or_text,
+                                                "chip_health": text,
+                                            },
+                                        },
+                                    },
+                                },
+                                "intelligence": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                    "properties": {
+                                        "latest_news": text,
+                                        "risk_alerts": {"type": "array", "items": text},
+                                        "positive_catalysts": {"type": "array", "items": text},
+                                        "earnings_outlook": text,
+                                        "sentiment_summary": text,
+                                    },
+                                },
+                                "battle_plan": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                    "properties": {
+                                        "setup": {
+                                            "type": "object",
+                                            "properties": {
+                                                "setup_type": {"type": "string", "enum": ["breakout", "pullback", "trend_continuation"]},
+                                            },
+                                            "required": ["setup_type"],
+                                            "additionalProperties": False,
+                                        },
+                                        "sniper_points": {
+                                            "type": "object",
+                                            "additionalProperties": True,
+                                            # Entry/exit prices are conditionally mandatory only
+                                            # for buy/add.  Requiring them here for watch/sell
+                                            # would pressure the model to invent prices.
+                                            "properties": {
+                                                "ideal_buy": number_or_text,
+                                                "secondary_buy": number_or_text,
+                                                "stop_loss": number_or_text,
+                                                "take_profit": number_or_text,
+                                                "first_take_profit": number_or_text,
+                                                "final_target": number_or_text,
+                                                "entry_leg_schema_version": {"type": "string", "const": "entry-legs-v1"},
+                                                "entry_legs": {
+                                                    "type": "array",
+                                                    "items": {
+                                                        "type": "object",
+                                                        "additionalProperties": True,
+                                                        "required": ["leg_id", "role", "sequence", "allocation_fraction", "max_executions", "price_rules", "prerequisites"],
+                                                        "properties": {
+                                                            "leg_id": text,
+                                                            "role": text,
+                                                            "sequence": {"type": "integer", "minimum": 1},
+                                                            "allocation_fraction": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+                                                            "max_executions": {"type": "integer", "minimum": 1},
+                                                            "price_rules": {
+                                                                "type": "array",
+                                                                "minItems": 1,
+                                                                "items": {
+                                                                    "type": "object",
+                                                                    "additionalProperties": True,
+                                                                    "required": ["type", "low", "high"],
+                                                                    "properties": {
+                                                                        "type": {"type": "string", "const": "close_between"},
+                                                                        "low": {"type": "number", "exclusiveMinimum": 0},
+                                                                        "high": {"type": "number", "exclusiveMinimum": 0},
+                                                                    },
+                                                                },
+                                                            },
+                                                            "prerequisites": {"type": "array", "items": text},
+                                                        },
+                                                    },
+                                                },
+                                                "exit_leg_schema_version": {"type": "string", "const": "exit-legs-v1"},
+                                                "exit_legs": {
+                                                    "type": "array",
+                                                    "items": {
+                                                        "type": "object",
+                                                        "additionalProperties": True,
+                                                        "required": ["leg_id", "role", "sequence", "allocation_fraction", "target_price"],
+                                                        "properties": {
+                                                            "leg_id": text,
+                                                            "role": text,
+                                                            "sequence": {"type": "integer", "minimum": 1},
+                                                            "allocation_fraction": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+                                                            "target_price": {"type": "number", "exclusiveMinimum": 0},
+                                                        },
+                                                    },
+                                                },
+                                            },
+                                        },
+                                        "position_strategy": {
+                                            "type": "object",
+                                            "additionalProperties": True,
+                                            "properties": {
+                                                "suggested_position": text,
+                                                "entry_plan": text,
+                                                "risk_control": text,
+                                            },
+                                        },
+                                        "action_checklist": {"type": "array", "items": text},
+                                    },
+                                },
+                                "phase_decision": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                    "properties": {
+                                        "phase_context": {"type": "object", "additionalProperties": True},
+                                        "entry_mode": {
+                                            "type": "string",
+                                            "enum": ["none", "conditional", "immediate"],
+                                        },
+                                        "action_window": text,
+                                        "immediate_action": text,
+                                        "watch_conditions": {"type": "array", "minItems": 1, "items": text},
+                                        "next_check_time": text,
+                                        "confidence_reason": text,
+                                        "data_limitations": {"type": "array", "items": text},
+                                    },
+                                },
+                                "signal_attribution": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                    "properties": {
+                                        "technical_indicators": metric_number_or_text,
+                                        "news_sentiment": metric_number_or_text,
+                                        "fundamentals": metric_number_or_text,
+                                        "market_conditions": metric_number_or_text,
+                                        "strongest_bullish_signal": text,
+                                        "strongest_bearish_signal": text,
+                                    },
+                                },
+                            },
+                        },
+                        "analysis_summary": text,
+                        "key_points": text,
+                        "risk_warning": text,
+                        "buy_reason": text,
+                        "trend_analysis": text,
+                        "short_term_outlook": text,
+                        "medium_term_outlook": text,
+                        "technical_analysis": text,
+                        "ma_analysis": text,
+                        "volume_analysis": text,
+                        "pattern_analysis": text,
+                        "fundamental_analysis": text,
+                        "sector_position": text,
+                        "company_highlights": text,
+                        "news_summary": text,
+                        "market_sentiment": text,
+                        "hot_topics": text,
+                        "data_sources": text,
+                    },
+                },
+            },
+        }
 
     def __init__(
         self,
@@ -2426,13 +3318,24 @@ class GeminiAnalyzer:
             ),
         )
 
-    def _get_analysis_system_prompt(self, report_language: str, stock_code: str = "") -> str:
+    def _get_analysis_system_prompt(
+        self,
+        report_language: str,
+        stock_code: str = "",
+        *,
+        structured_tool_output: bool = False,
+        paper_trading_style_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Build the analyzer system prompt with output-language guidance."""
         lang = normalize_report_language(report_language)
         market_role = get_market_role(stock_code, lang)
         market_guidelines = get_market_guidelines(stock_code, lang)
         skill_instructions, default_skill_policy, use_legacy_default_prompt = self._get_skill_prompt_sections()
-        if use_legacy_default_prompt:
+        has_style_contract = isinstance(paper_trading_style_context, dict) and bool(
+            paper_trading_style_context.get("trading_style")
+            or paper_trading_style_context.get("settings")
+        )
+        if use_legacy_default_prompt and not has_style_contract:
             base_prompt = self.LEGACY_DEFAULT_SYSTEM_PROMPT.replace(
                 "{market_placeholder}", market_role
             ).replace(
@@ -2443,7 +3346,20 @@ class GeminiAnalyzer:
             if skill_instructions:
                 skills_section = f"## 激活的交易技能\n\n{skill_instructions}\n"
             default_skill_policy_section = ""
-            if default_skill_policy:
+            if has_style_contract:
+                style = str(paper_trading_style_context.get("trading_style") or "unknown").strip() or "unknown"
+                settings = paper_trading_style_context.get("settings")
+                settings = settings if isinstance(settings, dict) else {}
+                default_skill_policy_section = f"""## 纸面交易风格覆盖默认短周期基线（必须严格遵守）
+
+当前报告带有冻结纸面交易风格：`{style}`。该风格的输入窗口、核心均线、ATR/波动、持有期和刷新节奏以用户上下文中的“纸面交易风格契约”为准。
+
+- 默认 bull_trend / 多头排列基线只作为短周期参考，不是本次风格的硬门槛。
+- 不得把 `MA5 > MA10 > MA20`、MA5 乖离小于固定阈值或“只做多头排列”作为所有风格的买入必要条件。
+- 中线/持仓风格必须综合 MA10/MA20/MA60、支撑压力、ATR/波动、成交参与度、资金和风险收益；趋势风格还应参考 MA20/MA60/MA120 或更长周期。
+- 若配置给出的核心窗口为 `{settings.get('core_ma_windows', 'N/A')}`、分析窗口为 `{settings.get('analysis_window_sessions', 'N/A')}` 个交易日，后续价格、止损、止盈和观察条件必须与这些窗口一致。
+"""
+            elif default_skill_policy:
                 default_skill_policy_section = f"{default_skill_policy}\n"
             base_prompt = (
                 self.SYSTEM_PROMPT.replace("{market_placeholder}", market_role)
@@ -2451,7 +3367,28 @@ class GeminiAnalyzer:
                 .replace("{default_skill_policy_section}", default_skill_policy_section)
                 .replace("{skills_section}", skills_section)
             )
+        if structured_tool_output:
+            base_prompt = self._replace_output_template_with_tool_contract(base_prompt, lang)
         if lang == "en":
+            envelope = (
+                """
+
+## Output Envelope (highest priority)
+
+- Submit the report by calling `submit_analysis_report` exactly once.
+- Do not add plain text, Markdown fences, headings, a company-name preface, explanations, or a conclusion summary outside the tool arguments.
+- Put every requested answer and explanation inside the tool arguments. Never append a second narrative section.
+"""
+                if structured_tool_output
+                else """
+
+## Output Envelope (highest priority)
+
+- The entire response must be exactly one JSON object and nothing else.
+- Do not add Markdown fences, headings, a company-name preface, explanations, or a conclusion summary before or after the JSON object.
+- Put every requested answer and explanation inside the defined JSON fields. Never append a second narrative section.
+"""
+            )
             return base_prompt + """
 
 ## Output Language (highest priority)
@@ -2461,8 +3398,27 @@ class GeminiAnalyzer:
 - All human-readable JSON values must be written in English.
 - Use the common English company name when you are confident; otherwise keep the original listed company name instead of inventing one.
 - This includes `stock_name`, `trend_prediction`, `operation_advice`, `confidence_level`, nested dashboard text, checklist items, and all narrative summaries.
-"""
+""" + envelope
         if lang == "ko":
+            envelope = (
+                """
+
+## 출력 외피 (최우선)
+
+- `submit_analysis_report` 도구를 정확히 한 번 호출하여 보고서를 제출하세요.
+- 도구 인자 밖에 일반 텍스트, Markdown 코드 펜스, 제목, 종목명 확인 문구, 설명 또는 결론 요약을 추가하지 마세요.
+- 요청된 모든 답변과 설명은 도구 인자 안에 작성하고 별도의 서술 섹션을 덧붙이지 마세요.
+"""
+                if structured_tool_output
+                else """
+
+## 출력 외피 (최우선)
+
+- 전체 응답은 정확히 하나의 JSON 객체여야 하며 그 밖의 내용은 출력하지 마세요.
+- JSON 앞뒤에 Markdown 코드 펜스, 제목, 종목명 확인 문구, 설명 또는 결론 요약을 추가하지 마세요.
+- 요청된 모든 답변과 설명은 정의된 JSON 필드 안에 작성하고 별도의 서술 섹션을 덧붙이지 마세요.
+"""
+            )
             return base_prompt + """
 
 ## Output Language (highest priority)
@@ -2472,7 +3428,26 @@ class GeminiAnalyzer:
 - All human-readable JSON values must be written in Korean (한국어).
 - Use the common Korean or original listed company name when confident; do not invent one.
 - This includes `stock_name`, `trend_prediction`, `operation_advice`, `confidence_level`, nested dashboard text, checklist items, and all narrative summaries.
+""" + envelope
+        envelope = (
+            """
+
+## 输出封装（最高优先级）
+
+- 必须且只能调用 `submit_analysis_report` 工具一次来提交报告。
+- 工具参数外不得添加普通文本、Markdown 代码围栏、标题、股票名称核对、解释或结论摘要。
+- 所有重点问题的回答与说明都必须写入工具参数字段，禁止追加第二段说明。
 """
+            if structured_tool_output
+            else """
+
+## 输出封装（最高优先级）
+
+- 整个回复必须且只能是一个 JSON 对象，不得包含任何其他内容。
+- JSON 对象前后不得添加 Markdown 代码围栏、标题、股票名称核对、解释或结论摘要。
+- 所有重点问题的回答与说明都必须写入已定义的 JSON 字段，禁止在 JSON 后追加第二段说明。
+"""
+        )
         return base_prompt + """
 
 ## 输出语言（最高优先级）
@@ -2480,7 +3455,105 @@ class GeminiAnalyzer:
 - 所有 JSON 键名保持不变。
 - `decision_type` 必须保持为 `buy|hold|sell`。
 - 所有面向用户的人类可读文本值必须使用中文。
+""" + envelope
+
+    @classmethod
+    def _replace_output_template_with_tool_contract(cls, base_prompt: str, lang: str) -> str:
+        """Replace literal JSON examples with a semantic tool-submission contract."""
+        if lang in ("en", "ko"):
+            replacement = f"""
+## Structured report submission
+
+- Submit the complete decision dashboard through the `{cls.ANALYSIS_REPORT_TOOL_NAME}` tool with `report_schema_version="{cls.ANALYSIS_REPORT_TOOL_SCHEMA_VERSION}"`.
+- The tool schema replaces only the literal JSON example. It does not replace the reasoning or evidence contract below.
+- Preserve this complete chain: market phase → daily market context → market structure → technical indicators → price/volume and turnover → chip structure → fundamentals → news → portfolio state → risk/reward → action timing.
+
+### Evidence and decision sequence
+
+1. Establish the market phase and data freshness first. Never describe a premarket, postmarket, stale, partial, fallback, estimated, or missing quote as a completed live session.
+2. Evaluate daily-market regime and market structure before the stock: risk appetite, index/sector direction, theme phase, stock role, and any market-level veto.
+3. Evaluate trend and location: MA alignment, support/resistance, deviation from MA5, pattern and volatility. Location must be considered together with direction.
+4. Evaluate confirmation: volume ratio, turnover, expansion/contraction, capital flow and chip structure. Missing evidence is a limitation, not a positive signal.
+5. Evaluate fundamentals, announcements, news catalysts and risks with dates and source scope; do not invent facts.
+6. Resolve portfolio state before choosing an action. Empty accounts may buy when evidence and risk/reward support it; they must not be described as unable to buy, and must not use hold/reduce/sell. Existing holdings may add/hold/reduce/sell/watch/avoid/alert with explicit risk controls.
+7. Compare upside, downside, stop distance, target distance and risk/reward; then choose action timing and confidence.
+
+### Field semantics and cross-field consistency
+
+- `raw_score` is the evidence score. `adjusted_score` is the final risk-controlled score. Any adjustment must be explicit in the guardrail/calibration evidence; missing data alone must not silently change the score.
+- `sentiment_score`, `trend_prediction`, `operation_advice`, `decision_type`, `action`, localized action text, `position_actions`, core conclusion and phase decision must describe one consistent final decision.
+- `confidence_level` must be exactly one standalone label: `high`, `medium`, or `low`. Put confidence explanations in `limitations`, `risk_warning`, or `dashboard.phase_decision.confidence_reason`; do not write compound labels such as medium-low or a parenthesized sentence inside `confidence_level`.
+- `dashboard.phase_decision.entry_mode` is optional and must be `none`, `conditional`, or `immediate` when present. `conditional` means a real buy/add authorization is waiting for stated trigger conditions, so top-level `action` must still be `buy/add` and the executable buy/add contract must be complete. `none` means no entry authorization. Never upgrade `watch` into buy/add merely because an ideal price or score exists.
+- `dashboard.core_conclusion` states the one-sentence thesis, signal class, time sensitivity and separate empty/holding guidance.
+- `dashboard.data_perspective` records trend, price location, volume/turnover and chip evidence. Use an unavailable/limited description when input data is absent instead of creating values.
+- `dashboard.intelligence` separates latest news, dated risks, positive catalysts, earnings outlook and sentiment summary.
+- `dashboard.battle_plan` contains price/risk levels, position sizing rationale, entry plan, risk control and an evidence checklist.
+- `dashboard.phase_decision` must state the observed phase, action window, immediate action, concrete watch conditions, next check point, confidence rationale and data limitations.
+- `dashboard.signal_attribution` explains the four contribution dimensions and strongest bullish/bearish evidence; it must not override the final action by itself.
+- Detailed narrative fields must explain trend, short/medium outlook, technicals, MAs, volume, pattern, fundamentals, sector position, company risks/highlights, news, market sentiment and hot topics without contradicting the dashboard.
+- Separate position thesis from short-term timing. MA5 and short MA alignment are timing/location evidence; do not make MA5>MA10>MA20 a universal buy gate for medium-term or trend styles. Medium-term holdings should emphasize MA10/MA20/MA60 plus support, volatility, participation and risk/reward; trend styles should include MA20/MA60/MA120 or longer context.
+- If news is unavailable, missing, outside the allowed window, or has unknown dates, say there is no citable current-window news evidence; do not infer that no events or no risks exist. Stale fundamentals may be historical background only, not current fundamental evidence.
+
+### Executable buy/add contract
+
+- A buy/add decision is valid only when evidence supports a bounded `close_between` entry range, explicit allocation per unique ordered entry leg, positive stop loss, ordered exit legs whose allocations total approximately 1.0, and `stop < entry range < final target`.
+- A conditional entry may wait for price/volume confirmation in `phase_decision.immediate_action`. Treat it as authorization for a candidate conditional strategy: the preset entry range must be supported by net risk/reward, ATR, and trading-style evidence, while two-report confirmation, market/account-risk, and trigger-price gates are enforced independently downstream. Do not claim those downstream gates have already passed, and do not raise the score just to obtain buy/add.
+- Entry allocations are portfolio-budget requests, not permission to exceed account, single-stock, concentration, risk, or maximum-position limits enforced downstream.
+- For buy/add, declare `dashboard.battle_plan.setup.setup_type` as breakout, pullback, or trend_continuation. Match confirmation to that setup: expansion for a breakout, controlled contraction plus support for a pullback, maintained trend plus participation for continuation. Do not demand breakout volume from a pullback or treat missing evidence as confirmation.
+- Use the frozen trading-style horizon, MA and ATR values. Do not switch a medium-term position to an intraday thesis. On hold/watch, a new stop above current price or target below current price is not a disguised sell instruction; explain a defensive action explicitly instead. Entry confirmation is counted by the backend, never by repeated model calls on the same day.
+- Every buy/add must include action window, watch conditions, next check time, confidence reason and limitations. If any required price or confirmation cannot be justified, return watch/avoid instead of fabricating an executable plan.
+- Hold/watch/reduce/sell/avoid must not be padded with invented entry prices merely to fill a shape.
 """
+        else:
+            replacement = f"""
+## 结构化报告提交
+
+- 通过 `{cls.ANALYSIS_REPORT_TOOL_NAME}` 工具提交完整决策仪表盘，并填写 `report_schema_version="{cls.ANALYSIS_REPORT_TOOL_SCHEMA_VERSION}"`。
+- Tool Schema 只替代原来的大段 JSON 示例，不替代下列推理、证据和一致性契约。
+- 必须保留完整链路：市场阶段 → 大盘环境 → 市场结构 → 技术指标 → 量价/换手 → 筹码 → 基本面 → 新闻 → 持仓状态 → 风险收益 → 动作时机。
+
+### 证据与决策顺序
+
+1. 先确认市场阶段和数据新鲜度。盘前、盘后、陈旧、部分、fallback、估算或缺失数据，不得描述成已经完成的实时盘中事实。
+2. 先看大盘和市场结构，再看个股：风险偏好、指数/行业方向、题材阶段、个股角色以及大盘级否决条件都要进入判断。
+3. 判断趋势和位置：均线排列、支撑压力、MA5 乖离、形态与波动必须综合使用，不能只看涨跌方向而忽略所处位置。
+4. 判断确认信号：量比、换手、放量/缩量、资金流和筹码结构要互相印证；缺失数据只能列入限制，不能当成利好。
+5. 基本面、公告、新闻催化和风险必须注明日期与来源范围，不得编造事实。
+6. 决定动作前先识别持仓状态。空仓在证据和风险收益支持时可以买入，不得写成“空仓不能买入”，也不得对空仓使用持有/减仓/卖出；已有持仓才可使用加仓/持有/减仓/卖出/观望/回避/预警，并给出明确风控。
+7. 比较上行空间、下行风险、止损距离、目标距离和风险收益比，最后确定动作时机与置信度。
+
+### 字段语义与前后一致性
+
+- `raw_score` 是证据原始分，`adjusted_score` 是经过明确风险规则后的最终分；任何调整都必须在 guardrail/校准证据中可审计，缺数据不能暗中改分。
+- `sentiment_score`、趋势、操作建议、`decision_type`、`action`、本地化动作、分持仓动作、核心结论和阶段决策必须表达同一个最终决策。
+- `confidence_level` 必须只填写单独标签：`高`、`中` 或 `低`。置信度解释写入 `limitations`、`risk_warning` 或 `dashboard.phase_decision.confidence_reason`，不得写“中等偏低”或带括号长说明。
+- `dashboard.phase_decision.entry_mode` 是可选字段；填写时只能是 `none`、`conditional` 或 `immediate`。`conditional` 表示已有真实买入/加仓授权但等待触发条件，顶层 `action` 仍必须是 `buy/add` 且可执行买入/加仓契约完整；`none` 表示没有入场授权。不得仅因理想价或评分存在，把 `watch` 升级成买入/加仓。
+- `dashboard.core_conclusion` 写一句话结论、信号类别、时效性和空仓/持仓两套建议。
+- `dashboard.data_perspective` 写趋势、价格位置、量价/换手和筹码证据；输入缺失时明确“不可用/受限”，不得补造数值。
+- `dashboard.intelligence` 分开写最新消息、带日期的风险、正面催化、业绩展望和情绪摘要。
+- `dashboard.battle_plan` 写价格与风险点位、仓位理由、入场计划、风险控制和证据检查清单。
+- `dashboard.phase_decision` 必须写观察到的市场阶段、行动窗口、立即动作、具体观察条件、下次检查点、置信理由和数据限制。
+- `dashboard.signal_attribution` 解释技术、新闻、基本面和大盘四类贡献以及最强多空证据，但不得单独推翻最终动作。
+- 走势、短中期展望、技术面、均线、量能、形态、基本面、行业地位、公司亮点/风险、新闻、市场情绪和热点等详细字段都必须与仪表盘一致。
+- 持仓 thesis 与短线入场择时要分开。MA5 和短均线排列主要是时机/位置证据，不得把 MA5>MA10>MA20 当作中线或趋势风格的通用买入硬门槛；中线持仓应重点结合 MA10/MA20/MA60、支撑压力、波动、成交/资金和风险收益，趋势风格还应参考 MA20/MA60/MA120 或更长周期。
+- 新闻缺失、不可用、超出窗口或时间未知，只表示“当前窗口没有可引用的新闻证据”，不得推断为“没有事件/没有利空”；基本面数据陈旧只能作历史背景，不得当作当前最新基本面。
+
+### 可执行买入/加仓契约
+
+- 买入/加仓只有在证据支持时才成立：必须提供有上下界的 `close_between` 入场区间、唯一且顺序明确的入场批次及分配比例、正数止损、顺序递增且比例合计约为 1.0 的退出批次，并满足 `止损 < 入场区间 < 最终目标`。
+- 条件入场可以在 `phase_decision.immediate_action` 中写等待价格/量能确认，并表示候选条件策略授权；预设入场区间本身仍必须有净盈亏比、ATR 和交易风格证据支持。两交易日报告确认、大盘/市场、账户风险和触价门禁由下游独立执行；不得声称这些下游门禁已经通过，也不得为了获得买入/加仓而抬高评分。
+- 入场比例只是账户预算请求，不能绕过后端的总资金、单股集中度、单笔风险和最大持仓数限制。
+- 买入/加仓须在 `dashboard.battle_plan.setup.setup_type` 声明 breakout（突破）、pullback（回踩）或 trend_continuation（趋势延续）。突破看放量确认，回踩看缩量与支撑，延续看趋势与参与度；不得用突破放量条件否定合理缩量回踩，也不得把缺失数据当作确认。
+- 使用冻结风格对应的期限、均线和 ATR 数值，不得把中线仓变成日内策略。持有/观望时，不应给出现价以上止损或现价以下目标来隐含立即卖出；需要防御退出时明确表达动作和证据。确认次数由后端按不同交易日计算，同日重复调用不能累计。
+- 每个买入/加仓还必须给出行动窗口、观察条件、下次检查时间、置信理由和数据限制；任一价格或确认条件无法从证据推出时，应输出观望/回避，不得编造可执行计划。
+- 持有、观望、减仓、卖出或回避不应为了填格式而编造买入价。
+"""
+        return re.sub(
+            r"\n## 输出格式：决策仪表盘 JSON\n.*?(?=\n## 评分标准)",
+            "\n" + replacement,
+            base_prompt,
+            flags=re.DOTALL,
+        )
 
     def _has_channel_config(self, config: Config) -> bool:
         """Check if multi-channel config (channels / YAML / legacy model_list) is active."""
@@ -2946,6 +4019,290 @@ class GeminiAnalyzer:
             return content.strip()
         return str(content).strip() if content is not None else ""
 
+    def _extract_required_tool_arguments(self, response: Any, expected_name: str) -> str:
+        """Extract exactly one forced tool-call argument payload.
+
+        Standard stock analysis uses this path to avoid accepting prose or a
+        loosely formatted JSON blob when a provider/gateway supports native
+        tool calling.  The returned value is normalized JSON text so existing
+        report parsing and integrity checks keep working unchanged.
+        """
+        choices = self._get_response_field(response, "choices")
+        if not choices:
+            raise _StructuredToolExtractionError("tool_call_missing")
+
+        tool_calls: List[Any] = []
+        for choice in choices:
+            message = self._get_response_field(choice, "message")
+            choice_calls = None
+            if message is not None:
+                choice_calls = self._get_response_field(message, "tool_calls")
+            if choice_calls is None:
+                choice_calls = self._get_response_field(choice, "tool_calls")
+            if choice_calls:
+                tool_calls.extend(list(choice_calls))
+
+        if len(tool_calls) != 1:
+            raise _StructuredToolExtractionError(
+                "tool_call_missing" if not tool_calls else "tool_call_ambiguous"
+            )
+
+        tool_call = tool_calls[0]
+        function = self._get_response_field(tool_call, "function")
+        name = self._get_response_field(function, "name") if function is not None else None
+        if name != expected_name:
+            raise _StructuredToolExtractionError("tool_call_name_mismatch")
+
+        arguments = self._get_response_field(function, "arguments") if function is not None else None
+        if isinstance(arguments, dict):
+            payload = arguments
+            raw_arguments_text = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+        elif isinstance(arguments, str):
+            if not arguments.strip():
+                raise _StructuredToolExtractionError("tool_call_empty_arguments")
+            raw_arguments_text = arguments
+            try:
+                payload = json.loads(arguments)
+            except json.JSONDecodeError as exc:
+                raise _StructuredToolExtractionError(
+                    "tool_call_invalid_json",
+                    draft_text=raw_arguments_text,
+                ) from exc
+        else:
+            raise _StructuredToolExtractionError("tool_call_empty_arguments")
+
+        if not isinstance(payload, dict) or not payload:
+            raise _StructuredToolExtractionError(
+                "tool_call_empty_arguments",
+                draft_text=raw_arguments_text,
+            )
+        if payload.get("report_schema_version") != self.ANALYSIS_REPORT_TOOL_SCHEMA_VERSION:
+            raise _StructuredToolExtractionError(
+                "tool_call_schema_version_mismatch",
+                draft_text=raw_arguments_text,
+            )
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    STRUCTURED_RETRY_DRAFT_MAX_CHARS = 65536
+
+    @classmethod
+    def _combine_structured_retry_drafts(
+        cls,
+        *,
+        raw_tool_arguments: Optional[str] = None,
+        assistant_text: Optional[str] = None,
+    ) -> str:
+        """Combine all visible first-stage artifacts without carrying hidden reasoning."""
+        parts: List[str] = []
+        raw = cls._sanitize_structured_retry_draft(raw_tool_arguments)
+        visible = cls._sanitize_structured_retry_draft(assistant_text)
+        if raw:
+            parts.append("### rejected_tool_arguments\n" + raw)
+        if visible and visible != raw:
+            parts.append("### assistant_visible_draft\n" + visible)
+        return cls._sanitize_structured_retry_draft("\n\n".join(parts))
+
+    @classmethod
+    def _sanitize_structured_retry_draft(cls, text: Optional[str]) -> str:
+        """Keep only visible/auditable draft text for second-stage serialization."""
+        if not text:
+            return ""
+
+        def _drop_reasoning_content(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    key: _drop_reasoning_content(item)
+                    for key, item in value.items()
+                    if str(key).lower() != "reasoning_content"
+                }
+            if isinstance(value, list):
+                return [_drop_reasoning_content(item) for item in value]
+            return value
+
+        stripped = str(text).strip()
+        try:
+            parsed = json.loads(stripped)
+            stripped = json.dumps(
+                _drop_reasoning_content(parsed),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except Exception:
+            stripped = "\n".join(
+                line for line in stripped.splitlines()
+                if "reasoning_content" not in line.lower()
+            )
+        return redact_diagnostic_text(stripped, limit=cls.STRUCTURED_RETRY_DRAFT_MAX_CHARS).strip()
+
+    @classmethod
+    def _load_json_object_from_untrusted_draft(cls, text: Optional[str]) -> Optional[Dict[str, Any]]:
+        draft = cls._sanitize_structured_retry_draft(text)
+        if not draft:
+            return None
+        candidates = []
+        for marker in ("### rejected_tool_arguments", "### assistant_visible_draft"):
+            if marker in draft:
+                section = draft.split(marker, 1)[1]
+                next_marker = section.find("\n### ")
+                if next_marker >= 0:
+                    section = section[:next_marker]
+                candidates.append(section.strip())
+        candidates.append(draft)
+        if "{" in draft and "}" in draft:
+            candidates.append(draft[draft.find("{"): draft.rfind("}") + 1])
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                try:
+                    parsed = json.loads(repair_json(candidate))
+                except Exception:
+                    continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    @staticmethod
+    def _extract_path_value(data: Dict[str, Any], path: str) -> Any:
+        current: Any = data
+        for part in path.split("."):
+            if not isinstance(current, dict) or part not in current:
+                return None
+            current = current[part]
+        return current
+
+    @classmethod
+    def _build_structured_retry_decision_lock(cls, draft_text: Optional[str]) -> Dict[str, Any]:
+        """Extract machine-comparable core decisions from a JSON-like first-stage draft."""
+        data = cls._load_json_object_from_untrusted_draft(draft_text)
+        if not data:
+            return {}
+        paths = (
+            "raw_score",
+            "adjusted_score",
+            "sentiment_score",
+            "trend_prediction",
+            "operation_advice",
+            "decision_type",
+            "action",
+            "position_actions.empty.action",
+            "position_actions.empty.advice",
+            "position_actions.empty.stop_loss",
+            "position_actions.empty.target_price",
+            "position_actions.holding.action",
+            "position_actions.holding.advice",
+            "position_actions.holding.stop_loss",
+            "position_actions.holding.target_price",
+            "dashboard.battle_plan.sniper_points.ideal_buy",
+            "dashboard.battle_plan.sniper_points.secondary_buy",
+            "dashboard.battle_plan.sniper_points.stop_loss",
+            "dashboard.battle_plan.sniper_points.take_profit",
+            "dashboard.battle_plan.sniper_points.first_take_profit",
+            "dashboard.battle_plan.sniper_points.final_target",
+            "dashboard.battle_plan.sniper_points.entry_legs",
+            "dashboard.battle_plan.sniper_points.exit_legs",
+            "dashboard.phase_decision.action_window",
+            "dashboard.phase_decision.immediate_action",
+            "dashboard.phase_decision.watch_conditions",
+            "dashboard.phase_decision.next_check_time",
+        )
+        lock: Dict[str, Any] = {}
+        for path in paths:
+            value = cls._extract_path_value(data, path)
+            if value not in (None, "", [], {}):
+                lock[path] = value
+        return lock
+
+    @staticmethod
+    def _numeric_value(value: Any) -> Optional[float]:
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return float(value)
+        if isinstance(value, str):
+            match = re.search(r"-?\d+(?:\.\d+)?", value.replace(",", ""))
+            if match:
+                try:
+                    return float(match.group(0))
+                except ValueError:
+                    return None
+        return None
+
+    @staticmethod
+    def _path_uses_numeric_lock(path: str) -> bool:
+        return (
+            path in {"raw_score", "adjusted_score", "sentiment_score"}
+            or path.endswith(".stop_loss")
+            or path.endswith(".target_price")
+            or path.startswith("dashboard.battle_plan.sniper_points.")
+            and not path.endswith(".entry_legs")
+            and not path.endswith(".exit_legs")
+        )
+
+    @classmethod
+    def _normalize_decision_lock_value(cls, value: Any, *, path: str = "") -> Any:
+        if cls._path_uses_numeric_lock(path):
+            numeric = cls._numeric_value(value)
+            if numeric is not None:
+                return ("number", round(numeric, 6))
+        if isinstance(value, str):
+            return ("text", re.sub(r"\s+", " ", value).strip())
+        if isinstance(value, list):
+            return (
+                "list",
+                [cls._normalize_decision_lock_value(item, path=f"{path}[]") for item in value],
+            )
+        if isinstance(value, dict):
+            return (
+                "dict",
+                {
+                    str(key): cls._normalize_decision_lock_value(value[key], path=f"{path}.{key}" if path else str(key))
+                    for key in sorted(value)
+                },
+            )
+        return value
+
+    @classmethod
+    def _validate_structured_retry_decision_lock(
+        cls,
+        response_text: str,
+        decision_lock: Optional[Dict[str, Any]],
+    ) -> None:
+        """Fail closed if second-stage tool args silently change locked decisions."""
+        if not decision_lock:
+            return
+        data = cls._load_json_object_from_untrusted_draft(response_text)
+        if not data:
+            raise ValueError("structured_retry_core_drift: final response is not JSON")
+        violations: List[str] = []
+        for path, expected in decision_lock.items():
+            actual = cls._extract_path_value(data, path)
+            if actual in (None, "", [], {}):
+                violations.append(f"{path}: missing")
+                continue
+            if cls._normalize_decision_lock_value(actual, path=path) != cls._normalize_decision_lock_value(expected, path=path):
+                violations.append(f"{path}: {expected!r} -> {actual!r}")
+        if violations:
+            preview = "; ".join(violations[:5])
+            raise ValueError(f"structured_retry_core_drift: {preview}")
+
+    @staticmethod
+    def _litellm_tool_choice_for_model(
+        model: str,
+        tool_name: str,
+        *,
+        force_deepseek_non_thinking: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Return provider-aware tool choice without weakening receive-side validation."""
+        provider = (model.split("/", 1)[0] if "/" in model else model).strip().lower()
+        if provider == "deepseek" and not force_deepseek_non_thinking:
+            # DeepSeek thinking routes reject named tool_choice.  We still send
+            # exactly one tool and fail closed unless the response contains one
+            # matching tool call.
+            return None
+        return {
+            "type": "function",
+            "function": {"name": tool_name},
+        }
+
     def _extract_stream_text(self, chunk: Any) -> str:
         """Extract provider-agnostic text delta from a LiteLLM streaming chunk."""
         choices = chunk.get("choices") if isinstance(chunk, dict) else getattr(chunk, "choices", None)
@@ -3056,6 +4413,7 @@ class GeminiAnalyzer:
         stream_progress_callback: Optional[Callable[[int], None]] = None,
         response_validator: Optional[Callable[[str], None]] = None,
         audit_context: Optional[Dict[str, Any]] = None,
+        structured_tool: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str, Dict[str, Any]]:
         """Compatibility wrapper around the configured generation backend."""
         preflight_error = self.get_generation_backend_config_error()
@@ -3071,6 +4429,7 @@ class GeminiAnalyzer:
                 stream_progress_callback=stream_progress_callback,
                 response_validator=response_validator,
                 audit_context=audit_context,
+                structured_tool=structured_tool,
             )
         except GenerationError as exc:
             if not exc.fallbackable or not fallback_backend_id:
@@ -3105,6 +4464,7 @@ class GeminiAnalyzer:
                     stream_progress_callback=stream_progress_callback,
                     response_validator=response_validator,
                     audit_context=audit_context,
+                    structured_tool=structured_tool,
                 )
             except _AllModelsFailedError:
                 raise
@@ -3156,6 +4516,198 @@ class GeminiAnalyzer:
                 ) from fallback_exc
         return result.text, result.model, result.usage
 
+    def _call_official_deepseek_structured_report(
+        self,
+        prompt: str,
+        generation_config: dict,
+        *,
+        route: Any,
+        system_prompt: Optional[str],
+        response_validator: Optional[Callable[[str], None]],
+        audit_context: Optional[Dict[str, Any]],
+        structured_tool: Dict[str, Any],
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        """Generate one DeepSeek report through official Responses JSON Schema."""
+
+        # The official DeepSeek ceiling covers reasoning plus visible output.
+        # Use it from the first request instead of staging smaller budgets that
+        # can truncate an otherwise valid structured report.
+        max_tokens = DEEPSEEK_REPORT_MAX_OUTPUT_TOKENS
+        requested_temperature = generation_config.get("temperature", 0.7)
+        requested_timeout = generation_config.get("timeout")
+        timeout = float(requested_timeout) if requested_timeout not in (None, "") else None
+        effective_system_prompt = system_prompt or self.TEXT_SYSTEM_PROMPT
+        messages = [
+            {"role": "system", "content": effective_system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        schema = dict(structured_tool.get("function", {}).get("parameters") or {})
+        if not schema:
+            raise ValueError("structured tool is missing function.parameters")
+
+        def _attach_usage(
+            usage: Dict[str, Any],
+            *,
+            transport: str,
+            used_messages: List[Dict[str, Any]],
+        ) -> Dict[str, Any]:
+            if audit_context is None:
+                normalized = filter_prompt_cache_telemetry(
+                    attach_message_hmacs(usage, used_messages),
+                    self._get_runtime_config(),
+                )
+            else:
+                effective_audit_context = dict(audit_context)
+                effective_audit_context["provider"] = "deepseek"
+                effective_audit_context["transport"] = transport
+                normalized = filter_prompt_cache_telemetry(
+                    attach_legacy_message_stability_audit(
+                        usage,
+                        used_messages,
+                        effective_audit_context,
+                    ),
+                    self._get_runtime_config(),
+                )
+            normalized["provider"] = "deepseek"
+            normalized["transport"] = transport
+            return normalized
+
+        def _validate_or_fail(
+            text: str,
+            usage: Dict[str, Any],
+            *,
+            stage: str,
+        ) -> Tuple[str, str, Dict[str, Any]]:
+            try:
+                if response_validator is not None:
+                    response_validator(text)
+            except Exception as exc:
+                raise _AllModelsFailedError(
+                    (
+                        "Official DeepSeek structured output failed validation "
+                        f"at {stage}: {self._sanitize_litellm_exception_text(exc, model=route.route_model)}"
+                    ),
+                    last_response_text=text,
+                    last_model=route.route_model,
+                    last_usage=usage,
+                    last_error_kind="deepseek_structured_output",
+                ) from exc
+            return text, route.route_model, usage
+
+        client = OfficialDeepSeekStructuredClient(route)
+        try:
+            response = client.create_structured_report(
+                messages=messages,
+                schema=schema,
+                max_output_tokens=int(max_tokens),
+                temperature=float(requested_temperature),
+                timeout=timeout,
+            )
+            content = extract_responses_text(response)
+            diagnostics = responses_diagnostics(response, output_chars=len(content))
+            logger.info(
+                "[DeepSeek Responses] completion status=%s reason=%s input_tokens=%s "
+                "output_tokens=%s reasoning_tokens=%s output_chars=%s budget=%s",
+                diagnostics["status"],
+                diagnostics["incomplete_reason"],
+                diagnostics["input_tokens"],
+                diagnostics["output_tokens"],
+                diagnostics["reasoning_tokens"],
+                diagnostics["output_chars"],
+                max_tokens,
+            )
+            usage = _attach_usage(
+                normalize_deepseek_usage(response, model=route.wire_model, messages=messages),
+                transport="deepseek_responses",
+                used_messages=messages,
+            )
+            response_status = diagnostics["status"]
+            incomplete_reason = diagnostics["incomplete_reason"]
+            if response_status == "incomplete":
+                if incomplete_reason == "content_filter":
+                    raise _AllModelsFailedError(
+                        "Official DeepSeek structured output was blocked by content_filter",
+                        last_model=route.route_model,
+                        last_usage=usage,
+                        last_error_kind="content_filter",
+                    )
+                if incomplete_reason == "max_output_tokens":
+                    raise DeepSeekStructuredGenerationError("incomplete:max_output_tokens")
+                raise _AllModelsFailedError(
+                    (
+                        "Official DeepSeek structured output was incomplete for an unsupported reason: "
+                        f"{incomplete_reason or 'unknown'}"
+                    ),
+                    last_model=route.route_model,
+                    last_usage=usage,
+                    last_error_kind="transport_provider",
+                )
+            if response_status == "failed":
+                raise DeepSeekStructuredGenerationError(
+                    f"failed:{diagnostics['error_code'] or 'unknown'}"
+                )
+            if response_status not in (None, "completed"):
+                raise DeepSeekStructuredGenerationError(f"unexpected_status:{response_status}")
+            if not content:
+                raise DeepSeekStructuredGenerationError("empty_response")
+            return _validate_or_fail(content, usage, stage="responses")
+        except _AllModelsFailedError:
+            raise
+        except Exception as primary_exc:
+            logger.warning(
+                "[DeepSeek Responses] %s unavailable or empty; retrying same model once with Chat JSON fallback: %s",
+                route.route_model,
+                self._sanitize_litellm_exception_text(primary_exc, model=route.route_model),
+            )
+
+        fallback_messages = [
+            messages[0],
+            {"role": "user", "content": ensure_json_instruction(prompt)},
+        ]
+        fallback_max_tokens = DEEPSEEK_REPORT_MAX_OUTPUT_TOKENS
+        try:
+            fallback_client = OfficialDeepSeekStructuredClient(route)
+            response = fallback_client.create_json_fallback(
+                messages=fallback_messages,
+                max_tokens=int(fallback_max_tokens),
+                temperature=float(requested_temperature),
+                timeout=timeout,
+            )
+            content = extract_chat_completion_text(response)
+            finish_reason = chat_completion_finish_reason(response)
+            logger.info(
+                "[DeepSeek Chat JSON fallback] finish_reason=%s output_chars=%s budget=%s",
+                finish_reason,
+                len(content),
+                fallback_max_tokens,
+            )
+            usage = _attach_usage(
+                normalize_deepseek_usage(response, model=route.wire_model, messages=fallback_messages),
+                transport="deepseek_chat_json_fallback",
+                used_messages=fallback_messages,
+            )
+            if finish_reason in {"length", "content_filter", "insufficient_system_resource"}:
+                raise _AllModelsFailedError(
+                    f"Official DeepSeek Chat JSON fallback did not complete: {finish_reason}",
+                    last_model=route.route_model,
+                    last_usage=usage,
+                    last_error_kind=("content_filter" if finish_reason == "content_filter" else "transport_provider"),
+                )
+            if not content:
+                raise DeepSeekStructuredGenerationError("empty_response")
+            return _validate_or_fail(content, usage, stage="chat_json_fallback")
+        except _AllModelsFailedError:
+            raise
+        except Exception as fallback_exc:
+            raise _AllModelsFailedError(
+                (
+                    "Official DeepSeek structured output failed; same-model Chat JSON fallback also failed. "
+                    f"Last error: {self._sanitize_litellm_exception_text(fallback_exc, model=route.route_model)}"
+                ),
+                last_model=route.route_model,
+                last_error_kind="transport_provider",
+            ) from fallback_exc
+
     def _call_litellm_impl(
         self,
         prompt: str,
@@ -3166,6 +4718,7 @@ class GeminiAnalyzer:
         stream_progress_callback: Optional[Callable[[int], None]] = None,
         response_validator: Optional[Callable[[str], None]] = None,
         audit_context: Optional[Dict[str, Any]] = None,
+        structured_tool: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str, Dict[str, Any]]:
         """Call LLM via litellm with fallback across configured models.
 
@@ -3195,21 +4748,68 @@ class GeminiAnalyzer:
         )
         requested_temperature = generation_config.get('temperature', 0.7)
         requested_timeout = generation_config.get("timeout")
+        structured_resubmission = bool(generation_config.get("_structured_resubmission"))
+        structured_resubmission_model = str(generation_config.get("_structured_resubmission_model") or "").strip()
+        structured_retry_original_prompt = str(generation_config.get("_structured_retry_original_prompt") or "")
+        structured_retry_draft = self._sanitize_structured_retry_draft(
+            generation_config.get("_structured_retry_previous_response")
+        )
+        structured_retry_decision_lock = generation_config.get("_structured_retry_decision_lock") or {}
 
-        models_to_try = [config.litellm_model] + (config.litellm_fallback_models or [])
+        if structured_resubmission and structured_resubmission_model:
+            models_to_try = [structured_resubmission_model]
+        else:
+            models_to_try = [config.litellm_model] + (config.litellm_fallback_models or [])
         models_to_try = [m for m in models_to_try if m]
 
         use_channel_router = self._has_channel_config(config)
+
+        if structured_tool is not None and models_to_try:
+            deepseek_route = resolve_official_deepseek_structured_route(models_to_try[0], config)
+            if deepseek_route is not None:
+                if len(models_to_try) > 1:
+                    logger.info(
+                        "[DeepSeek Responses] using provider-native structured output for %s; "
+                        "configured fallback models are not used for this selected-model report request",
+                        deepseek_route.route_model,
+                    )
+                return self._call_official_deepseek_structured_report(
+                    prompt,
+                    generation_config,
+                    route=deepseek_route,
+                    system_prompt=system_prompt,
+                    response_validator=response_validator,
+                    audit_context=audit_context,
+                    structured_tool=structured_tool,
+                )
 
         last_error = None
         last_response_text: Optional[str] = None
         last_model: Optional[str] = None
         last_usage: Dict[str, Any] = {}
+        last_error_kind: Optional[str] = None
         effective_system_prompt = system_prompt or self.TEXT_SYSTEM_PROMPT
         router_model_names = set(get_configured_llm_models(config.llm_model_list))
+
+        def _validate_response_text(response_text: str) -> str:
+            if response_validator is None:
+                return response_text
+            try:
+                response_validator(response_text)
+                return response_text
+            except Exception:
+                normalized = self._normalize_single_fenced_json_response(response_text)
+                if normalized is None:
+                    raise
+                response_validator(normalized)
+                logger.warning(
+                    "[LiteLLM] normalized one validated JSON fence and discarded non-JSON envelope text"
+                )
+                return normalized
+
         for model in models_to_try:
             origins = route_deployment_origins(config.llm_model_list, model)
-            model_stream = bool(stream and not origins.has_hermes)
+            model_stream = bool(stream and structured_tool is None and not origins.has_hermes)
             recovery_model_list = config.llm_model_list
             legacy_router_model_list = getattr(self, "_legacy_router_model_list", None) or []
             if legacy_router_model_list and model == config.litellm_model and not use_channel_router:
@@ -3241,15 +4841,63 @@ class GeminiAnalyzer:
                     )
 
                 model_short = model.split("/")[-1] if "/" in model else model
-                extra = get_thinking_extra_body(model_short)
-                call_kwargs: Dict[str, Any] = {
-                    "model": model,
-                    "messages": [
+                provider_name = (model.split("/", 1)[0] if "/" in model else "").strip().lower()
+                is_deepseek_route = provider_name == "deepseek" or usage_provider == "deepseek"
+                if structured_resubmission and is_deepseek_route:
+                    # DeepSeek V4 thinking mode cannot reliably accept a forced
+                    # named tool.  Keep the first analytical pass untouched,
+                    # then use the same model in non-thinking mode only as a
+                    # deterministic Schema submission pass.
+                    extra = {"thinking": {"type": "disabled"}}
+                else:
+                    extra = get_thinking_extra_body(model_short)
+                if structured_resubmission and structured_retry_original_prompt:
+                    messages = [
+                        {"role": "system", "content": effective_system_prompt},
+                        {"role": "user", "content": structured_retry_original_prompt},
+                    ]
+                    if structured_retry_draft:
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": (
+                                    "上一阶段可见分析草稿（不含隐藏 reasoning_content，尚未验收；"
+                                    "第二阶段必须忠实结构化，不得静默重判核心结论）：\n"
+                                    f"{structured_retry_draft}"
+                                ),
+                            }
+                        )
+                    messages.append({"role": "user", "content": prompt})
+                else:
+                    messages = [
                         {"role": "system", "content": effective_system_prompt},
                         {"role": "user", "content": prompt},
-                    ],
+                    ]
+                call_kwargs: Dict[str, Any] = {
+                    "model": model,
+                    "messages": messages,
                     "max_tokens": max_tokens,
                 }
+                if structured_tool is not None:
+                    tool_name = str(structured_tool.get("function", {}).get("name") or "").strip()
+                    if not tool_name:
+                        raise ValueError("structured tool is missing function.name")
+                    call_kwargs["tools"] = [structured_tool]
+                    tool_choice = self._litellm_tool_choice_for_model(
+                        model,
+                        tool_name,
+                        force_deepseek_non_thinking=(
+                            structured_resubmission and is_deepseek_route
+                        ),
+                    )
+                    if tool_choice is not None:
+                        call_kwargs["tool_choice"] = tool_choice
+                    call_kwargs["parallel_tool_calls"] = False
+                elif response_validator is not None:
+                    # Ask compatible providers/gateways to enforce a JSON-only
+                    # response on the wire.  Unsupported endpoints are handled
+                    # by the request-scoped parameter recovery below.
+                    call_kwargs["response_format"] = {"type": "json_object"}
                 if requested_timeout not in (None, ""):
                     call_kwargs["timeout"] = requested_timeout
                 if extra:
@@ -3343,9 +4991,8 @@ class GeminiAnalyzer:
                     last_model = model
                     _stream_usage = _attach_usage_audit(_stream_usage, call_kwargs["messages"])
                     last_usage = _stream_usage
-                    if response_validator is not None:
-                        response_validator(_stream_text)
-                    return _stream_text, model, _stream_usage
+                    validated_stream_text = _validate_response_text(_stream_text)
+                    return validated_stream_text, model, _stream_usage
 
                 response = call_litellm_with_param_recovery(
                     lambda kwargs: self._dispatch_litellm_completion(
@@ -3361,7 +5008,39 @@ class GeminiAnalyzer:
                     logger=logger,
                 )
 
-                content = self._extract_completion_text(response)
+                if structured_tool is not None:
+                    tool_name = str(structured_tool.get("function", {}).get("name") or "").strip()
+                    try:
+                        content = self._extract_required_tool_arguments(response, tool_name)
+                    except Exception as tool_exc:
+                        assistant_text = self._extract_completion_text(response)
+                        draft_text = self._combine_structured_retry_drafts(
+                            raw_tool_arguments=getattr(tool_exc, "draft_text", None),
+                            assistant_text=assistant_text,
+                        )
+                        if draft_text:
+                            setattr(tool_exc, "handoff_draft_text", draft_text)
+                            usage_messages = None if audit_context is not None else call_kwargs["messages"]
+                            usage = self._normalize_usage(
+                                extract_usage_payload(response),
+                                model=usage_model or model,
+                                provider=usage_provider,
+                                messages=usage_messages,
+                            )
+                            if audit_context is not None:
+                                usage = _attach_usage_audit(usage, call_kwargs["messages"])
+                            last_response_text = draft_text
+                            last_model = model
+                            last_usage = usage
+                            logger.warning(
+                                "[LLM Tool Schema] %s returned an unaccepted visible/tool draft without a valid %s call; "
+                                "keeping it only as same-model resubmission context",
+                                model,
+                                tool_name,
+                            )
+                        raise
+                else:
+                    content = self._extract_completion_text(response)
                 if content:
                     usage_messages = None if audit_context is not None else call_kwargs["messages"]
                     usage = self._normalize_usage(
@@ -3375,15 +5054,30 @@ class GeminiAnalyzer:
                     last_response_text = content
                     last_model = model
                     last_usage = usage
-                    if response_validator is not None:
-                        response_validator(content)
-                    return (content, model, usage)
+                    if structured_resubmission and structured_retry_decision_lock:
+                        self._validate_structured_retry_decision_lock(
+                            content,
+                            structured_retry_decision_lock,
+                        )
+                    validated_content = _validate_response_text(content)
+                    return (validated_content, model, usage)
                 raise ValueError("LLM returned empty response")
 
             except Exception as e:
                 safe_error = self._sanitize_litellm_exception_text(e, config=config, model=model)
                 logger.warning("[LiteLLM] %s failed: %s", model, safe_error)
                 last_error = RuntimeError(f"{type(e).__name__}: {safe_error}")
+                # Classify this terminal attempt directly. ``last_response_text``
+                # may belong to an earlier model and must not affect retry type.
+                last_error_kind = _classify_litellm_failure(e)
+                if last_error_kind == "structured_submission" and structured_tool is not None:
+                    # Bind a structured retry to the terminal model that failed
+                    # the native-tool contract.  Do not accidentally carry a
+                    # previous model's draft across fallback boundaries.
+                    last_model = model
+                    if not getattr(e, "handoff_draft_text", None) and not getattr(e, "draft_text", None):
+                        last_response_text = None
+                        last_usage = {}
                 continue
 
         raise _AllModelsFailedError(
@@ -3391,6 +5085,7 @@ class GeminiAnalyzer:
             last_response_text=last_response_text,
             last_model=last_model,
             last_usage=last_usage,
+            last_error_kind=last_error_kind,
         )
 
     def generate_text(
@@ -3465,7 +5160,29 @@ class GeminiAnalyzer:
         code = context.get('code', 'Unknown')
         config = self._get_runtime_config()
         report_language = normalize_report_language(getattr(config, "report_language", "zh"))
-        system_prompt = self._get_analysis_system_prompt(report_language, stock_code=code)
+        requested_backend = str(
+            getattr(config, "generation_backend", LITELLM_BACKEND_ID)
+            or LITELLM_BACKEND_ID
+        ).strip().lower()
+        attempted_model = getattr(config, "litellm_model", None) or "unknown"
+        use_deepseek_responses_report = bool(
+            requested_backend == LITELLM_BACKEND_ID
+            and resolve_official_deepseek_structured_route(attempted_model, config) is not None
+        )
+        use_structured_report_tool = (
+            requested_backend == LITELLM_BACKEND_ID
+            and not use_deepseek_responses_report
+        )
+        system_prompt = self._get_analysis_system_prompt(
+            report_language,
+            stock_code=code,
+            structured_tool_output=use_structured_report_tool,
+            paper_trading_style_context=(
+                context.get("paper_trading_style_context")
+                if isinstance(context.get("paper_trading_style_context"), dict)
+                else None
+            ),
+        )
         skill_instructions, default_skill_policy, use_legacy_default_prompt = self._get_skill_prompt_sections()
         
         # 请求前增加延时（防止连续请求触发限流）
@@ -3523,7 +5240,10 @@ class GeminiAnalyzer:
                 name=name,
                 sentiment_score=50,
                 trend_prediction=localize_trend_prediction('震荡', report_language),
-                operation_advice=localize_operation_advice('持有', report_language),
+                operation_advice=_analysis_failed_label(report_language),
+                decision_type="failed",
+                action=None,
+                action_label=None,
                 confidence_level=localize_confidence_level('低', report_language),
                 analysis_summary=summary,
                 risk_warning=risk_warning,
@@ -3531,7 +5251,7 @@ class GeminiAnalyzer:
                 error_message=(
                     f"{backend_error.error_code.value}: {field}={requested_backend}"
                 ),
-                model_used=None,
+                model_used=attempted_model,
                 report_language=report_language,
             )
 
@@ -3542,7 +5262,10 @@ class GeminiAnalyzer:
                 name=name,
                 sentiment_score=50,
                 trend_prediction=localize_trend_prediction('震荡', report_language),
-                operation_advice=localize_operation_advice('持有', report_language),
+                operation_advice=_analysis_failed_label(report_language),
+                decision_type="failed",
+                action=None,
+                action_label=None,
                 confidence_level=localize_confidence_level('低', report_language),
                 analysis_summary=_localized_text(
                     report_language,
@@ -3563,7 +5286,7 @@ class GeminiAnalyzer:
                     zh='LLM API Key 未配置',
                     ko='LLM API 키가 설정되지 않았습니다',
                 ),
-                model_used=None,
+                model_used=attempted_model,
                 report_language=report_language,
             )
         
@@ -3597,9 +5320,8 @@ class GeminiAnalyzer:
                 ),
             }
             
-            config = self._get_runtime_config()
             backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
-            model_name = config.litellm_model or "unknown"
+            model_name = attempted_model
             if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
                 model_name = backend_id
                 legacy_audit_context["transport"] = backend_id
@@ -3628,31 +5350,84 @@ class GeminiAnalyzer:
 
             # 使用 litellm 调用（支持完整性校验重试）
             current_prompt = prompt
+            structured_retry_state: Dict[str, Any] = {}
             retry_count = 0
             max_retries = config.report_integrity_retry if config.report_integrity_enabled else 0
 
             while True:
                 start_time = time.time()
                 try:
+                    request_generation_config = dict(generation_config)
+                    request_generation_config["_structured_resubmission"] = retry_count > 0
+                    if retry_count > 0 and structured_retry_state:
+                        request_generation_config.update(structured_retry_state)
                     response_text, model_used, llm_usage = self._call_litellm(
                         current_prompt,
-                        generation_config,
+                        request_generation_config,
                         system_prompt=system_prompt,
                         stream=True,
                         stream_progress_callback=stream_progress_callback,
                         response_validator=self._validate_json_response,
                         audit_context=legacy_audit_context,
+                        structured_tool=(
+                            self._analysis_report_tool()
+                            if backend_id == LITELLM_BACKEND_ID
+                            else None
+                        ),
                     )
                 except _AllModelsFailedError as exc:
+                    if backend_id == LITELLM_BACKEND_ID:
+                        if (
+                            _looks_like_structured_submission_error(exc)
+                            and retry_count < max_retries
+                        ):
+                            previous_response = exc.last_response_text or ""
+                            decision_lock = self._build_structured_retry_decision_lock(
+                                previous_response
+                            )
+                            retry_model = exc.last_model or model_name
+                            current_prompt = self._build_structured_tool_retry_prompt(
+                                prompt,
+                                report_language=report_language,
+                                previous_response=previous_response,
+                                decision_lock=decision_lock,
+                                include_base_prompt=False,
+                            )
+                            structured_retry_state = {
+                                "_structured_resubmission_model": retry_model,
+                                "_structured_retry_original_prompt": prompt,
+                                "_structured_retry_previous_response": previous_response,
+                                "_structured_retry_decision_lock": decision_lock,
+                            }
+                            retry_count += 1
+                            logger.info(
+                                "[LLM Tool Schema] structured submission rejected; retrying tool-only with same model %s (%d/%d, locked=%d)",
+                                retry_model,
+                                retry_count,
+                                max_retries,
+                                len(decision_lock),
+                            )
+                            _emit_progress(
+                                min(99, 92 + retry_count * 2),
+                                f"{name}：结构化报告未通过校验，正在重新提交（{retry_count}/{max_retries}）",
+                            )
+                            continue
+                        if not _looks_like_structured_submission_error(exc):
+                            logger.warning(
+                                "[LLM Tool Schema] structured resubmission skipped because the last failure "
+                                "looks like a transport/provider error rather than a schema submission error: %s",
+                                self._sanitize_litellm_exception_text(exc, config=config, model=model_name),
+                            )
+                        raise
                     if exc.last_response_text is not None:
                         logger.warning(
-                            "[LLM JSON] %s(%s): all models returned invalid JSON, using text fallback",
+                            "[LLM JSON] %s(%s): all models returned invalid JSON/schema, using parser fallback before integrity handling",
                             name,
                             code,
                         )
                         response_text = exc.last_response_text
-                        model_used = exc.last_model
-                        llm_usage = exc.last_usage
+                        model_used = exc.last_model or model_name
+                        llm_usage = exc.last_usage or {}
                     else:
                         raise
                 elapsed = time.time() - start_time
@@ -3718,11 +5493,36 @@ class GeminiAnalyzer:
                         f"{name}：报告字段不完整，正在补全重试（{retry_count}/{max_retries}）",
                     )
                 else:
-                    self._apply_placeholder_fill(result, missing_fields)
-                    logger.warning(
-                        "[LLM完整性] 必填字段缺失 %s，已占位补全，不阻塞流程",
-                        missing_fields,
+                    execution_only_missing = bool(missing_fields) and all(
+                        _is_execution_contract_field(field) for field in missing_fields
                     )
+                    if execution_only_missing:
+                        result.error_message = (
+                            "analysis report generated, but trading plan skipped because "
+                            "execution fields are incomplete after retry: "
+                            + ",".join(missing_fields)
+                        )
+                        limitations = list(result.limitations or [])
+                        limitations.append(
+                            "交易执行字段不完整；报告仅用于阅读，不生成模拟交易计划"
+                        )
+                        result.limitations = list(dict.fromkeys(limitations))
+                        logger.warning(
+                            "[LLM完整性] 交易执行字段缺失 %s，保留报告但跳过交易计划",
+                            missing_fields,
+                        )
+                    else:
+                        self._apply_placeholder_fill(result, missing_fields)
+                        result.success = False
+                        result.error_message = (
+                            "analysis report missing required fields after retry: "
+                            + ",".join(missing_fields)
+                        )
+                        _mark_failed_result_non_actionable(result)
+                        logger.warning(
+                            "[LLM完整性] 核心必填字段缺失 %s，标记为失败尝试",
+                            missing_fields,
+                        )
                     break
 
             if should_persist_usage_telemetry(llm_usage):
@@ -3740,7 +5540,10 @@ class GeminiAnalyzer:
                 name=name,
                 sentiment_score=50,
                 trend_prediction=localize_trend_prediction('震荡', report_language),
-                operation_advice=localize_operation_advice('持有', report_language),
+                operation_advice=_analysis_failed_label(report_language),
+                decision_type="failed",
+                action=None,
+                action_label=None,
                 confidence_level=localize_confidence_level('低', report_language),
                 analysis_summary=_localized_text(
                     report_language,
@@ -3754,9 +5557,10 @@ class GeminiAnalyzer:
                     zh='分析失败，请稍后重试或手动分析',
                     ko='분석에 실패했습니다. 잠시 후 다시 시도하거나 수동으로 검토하세요.',
                 ),
+                search_performed=bool(news_context),
                 success=False,
                 error_message=safe_error,
-                model_used=None,
+                model_used=attempted_model,
                 report_language=report_language,
             )
     
@@ -3781,6 +5585,12 @@ class GeminiAnalyzer:
         code = context.get('code', 'Unknown')
         report_language = normalize_report_language(report_language)
         _, _, use_legacy_default_prompt = self._get_skill_prompt_sections()
+        paper_style_context = context.get("paper_trading_style_context")
+        has_style_contract = isinstance(paper_style_context, dict) and bool(
+            paper_style_context.get("trading_style")
+            or paper_style_context.get("settings")
+        )
+        effective_legacy_default_prompt = use_legacy_default_prompt and not has_style_contract
         
         # 优先使用上下文中的股票名称（从 realtime_quote 获取）
         stock_name = context.get('stock_name', name)
@@ -3828,6 +5638,77 @@ class GeminiAnalyzer:
 
 ---
 """
+        portfolio_context = context.get("portfolio_context")
+        if isinstance(portfolio_context, dict):
+            holding_state = str(portfolio_context.get("holding_state") or "unknown").strip() or "unknown"
+            quantity = portfolio_context.get("quantity")
+            avg_cost = portfolio_context.get("avg_cost") or portfolio_context.get("average_cost")
+            cash = portfolio_context.get("cash")
+            exposure_pct = portfolio_context.get("total_exposure_pct")
+            prompt += f"""
+## 💼 当前持仓上下文（必须用于动作语义）
+| 项目 | 数据 |
+|------|------|
+| 数据来源 | {portfolio_context.get('source', 'unknown')} |
+| 当前标的持仓状态 | {holding_state} |
+| 当前标的持仓数量 | {quantity if quantity is not None else 'N/A'} |
+| 当前标的平均成本 | {avg_cost if avg_cost is not None else 'N/A'} |
+| 可用现金 | {cash if cash is not None else 'N/A'} |
+| 账户总暴露比例 | {exposure_pct if exposure_pct is not None else 'N/A'}% |
+| 资产类别/识别来源 | {portfolio_context.get('asset_type', 'unknown')} / {portfolio_context.get('asset_type_source', 'unknown')} |
+| 当前标的有效集中度上限 | {portfolio_context.get('asset_exposure_effective_cap_pct', 'N/A')}% |
+| 当前标的剩余资金容量 | {portfolio_context.get('asset_exposure_remaining_capacity', 'N/A')} |
+| 资金与风险预算（只读） | {portfolio_context.get('sizing_context', 'N/A')} |
+
+> 动作契约：如果当前标的持仓状态为 `empty`，证据充分时可以 `buy`，但顶层 `action` 和 `position_actions.empty.action` 不得使用 `hold/reduce/sell`，也不得写“空仓不能买入”；中性结论请用 `watch`，风险结论请用 `avoid/alert`。如果当前标的持仓状态为 `holding`，必须在 `position_actions.holding` 中给出持仓风控建议，能可靠判断时给出 `stop_loss` 与 `target_price`。
+"""
+            strategy_thesis = portfolio_context.get("strategy_thesis")
+            if isinstance(strategy_thesis, dict):
+                prompt += f"""
+### 上一版生效策略 thesis（只读上下文）
+| 项目 | 数据 |
+|------|------|
+| 策略状态 | {strategy_thesis.get('state', 'N/A')} |
+| 生效动作 | {strategy_thesis.get('effective_action', 'N/A')} |
+| 最近原始动作 | {strategy_thesis.get('raw_action', 'N/A')} |
+| 生效报告 ID | {strategy_thesis.get('accepted_report_id', 'N/A')} |
+| 生效时间 | {strategy_thesis.get('accepted_at', 'N/A')} |
+| 生效买入区间 | {strategy_thesis.get('entry_low', 'N/A')} - {strategy_thesis.get('entry_high', 'N/A')} |
+| 生效止损/目标 | {strategy_thesis.get('stop_loss', 'N/A')} / {strategy_thesis.get('target_price', 'N/A')} |
+| 连续确认/反向确认 | {strategy_thesis.get('confirmation_count', 'N/A')} / {strategy_thesis.get('contradiction_count', 'N/A')} |
+
+> 你可以更新观点，但必须说明相对上一版 thesis 是“延续、增强、减弱、失效还是反转”。若要从观望/防御切换为买入，必须给出新的价格、止损、目标和证据；若只是证据不足，不要用买入。
+"""
+            pending_transition = portfolio_context.get("strategy_pending_transition")
+            if isinstance(pending_transition, dict):
+                pending_evidence = pending_transition.get("evidence")
+                if not isinstance(pending_evidence, dict):
+                    pending_evidence = {}
+                prompt += f"""
+### 尚待确认的策略转换（只读上下文）
+| 项目 | 数据 |
+|------|------|
+| 原始动作 | {pending_transition.get('raw_action', 'N/A')} |
+| 转换方向 | {pending_transition.get('previous_state', 'N/A')} -> {pending_transition.get('new_state', 'N/A')} |
+| 当前结果/原因 | {pending_transition.get('result', 'N/A')} / {pending_transition.get('reason', 'N/A')} |
+| 已确认交易日数 | {pending_transition.get('confirmation_count', 0)} |
+| 已反向确认交易日数 | {pending_transition.get('contradiction_count', 0)} |
+| 已记录确认日期 | {pending_evidence.get('confirmation_session_dates', [])} |
+| 已记录反向日期 | {pending_evidence.get('contradiction_session_dates', [])} |
+| 入场/反转所需交易日 | {pending_evidence.get('entry_confirmation_required', 'N/A')} / {pending_evidence.get('flip_confirmation_required', 'N/A')} |
+
+> 该转换尚未取得执行权。请基于当前证据独立判断，不要为了凑足确认次数而重复上一结论；后端只按不同交易日计数并决定是否授权。
+"""
+        selection_context = context.get("selection_context")
+        if isinstance(selection_context, dict):
+            prompt += f"""
+## 🧭 机会池入选证据（只读，不代表买入指令）
+```json
+{json.dumps(selection_context, ensure_ascii=False, sort_keys=True, default=str)}
+```
+
+> 请独立验证上述候选理由。主题、排名与评分只说明为何进入分析队列，不构成交易结论；若当前个股证据、市场环境或风险收益不支持，必须输出 `watch/avoid`，不得为了迎合机会池而输出 `buy/add`。
+"""
         prompt += format_market_phase_prompt_section(
             context.get("market_phase_context"),
             report_language=report_language,
@@ -3846,6 +5727,33 @@ class GeminiAnalyzer:
             prompt += market_structure_section
         if isinstance(analysis_context_pack_summary, str) and analysis_context_pack_summary:
             prompt += analysis_context_pack_summary
+        if isinstance(paper_style_context, dict):
+            style_settings = paper_style_context.get("settings") if isinstance(paper_style_context.get("settings"), dict) else {}
+            style_indicators = context.get("paper_trading_style_indicators") if isinstance(context.get("paper_trading_style_indicators"), dict) else {}
+            prompt += f"""
+## 🧭 纸面交易风格契约（必须保持时域一致）
+| 项目 | 数值 |
+|------|------|
+| 风格 | {paper_style_context.get('trading_style', 'unknown')} |
+| 策略版本 | {paper_style_context.get('policy_version', 'unknown')} |
+| 日线输入长度 | {style_settings.get('analysis_window_sessions', 'N/A')} 个完整交易日 |
+| 核心均线窗口 | {style_settings.get('core_ma_windows', 'N/A')} |
+| ATR/波动窗口 | {style_settings.get('volatility_windows', 'N/A')} |
+| 最大持有期 | {style_settings.get('max_holding_sessions', 'N/A')} 个交易日 |
+| 计划刷新间隔 | {style_settings.get('plan_refresh_cadence_sessions', 'N/A')} 个交易日 |
+| 入场腿/加仓上限 | {style_settings.get('entry_leg_limit', 'N/A')} / {style_settings.get('add_limit', 'N/A')} |
+| 风险倍率 | {style_settings.get('risk_multiplier', 'N/A')} |
+| 已观测日K数量 | {style_indicators.get('bars_observed', 'N/A')} |
+| 风格均线实际值 | {style_indicators.get('moving_averages', 'N/A')} |
+| 风格 ATR 实际值 | {style_indicators.get('volatility', 'N/A')} |
+| 冻结均线支撑/来源 | {style_indicators.get('support', 'N/A')} / {style_indicators.get('support_basis', 'N/A')} |
+| 允许报告期限 | {style_settings.get('compatible_horizons', 'N/A')} |
+| 默认持有期 | {style_settings.get('default_holding_sessions', 'N/A')} 个交易日 |
+| 价格/ATR 噪声护栏 | {style_settings.get('geometry_guard', 'N/A')} |
+
+> 价格目标、止损、分批入场/退出和证据窗口必须与上述风格一致；不得把短线目标和长线止损混用。
+> 请区分“持仓 thesis”和“入场择时”：MA5 乖离、MA5/MA10 短均线更多用于是否等待更优买点；中线风格的核心判断应结合 MA10/MA20/MA60、支撑压力、ATR/波动、量价资金和风险收益，不能把 MA5>MA10>MA20 当作所有风格的买入硬门槛。
+"""
         prompt += f"""
 
 ## 📈 技术面数据
@@ -3976,7 +5884,7 @@ class GeminiAnalyzer:
 | 资金流入靠前板块 | {top_sector_text} | 板块资金共振参考 |
 | 资金流出靠前板块 | {bottom_sector_text} | 板块风险参考 |
 
-> 资金流向只能作为价格位置的过滤器：接近压力且主力流出时不得追买；接近支撑且未放量跌破时，优先判断为持有观察、震荡或洗盘观察。
+> 资金流向只能作为价格位置的过滤器：接近压力且主力流出时不得追买；接近支撑且未放量跌破时，优先判断为持有观察、震荡或洗盘观察。资金流缺失、获取失败或对 ETF/指数不适用时，只能列入数据限制，不得当作真实流出或利空。
 """
 
         # 添加三大法人动向（台股筹码过滤器）— tw-only；仅当 institution 区块 status='ok'
@@ -4048,7 +5956,7 @@ class GeminiAnalyzer:
                 volume_change_ratio=context.get('volume_change_ratio'),
             )
             consistency_notes = trend.get('prompt_consistency_notes', [])
-            if use_legacy_default_prompt:
+            if effective_legacy_default_prompt:
                 bias_warning = "🚨 超过5%，严禁追高！" if trend.get('bias_ma5', 0) > 5 else "✅ 安全范围"
                 prompt += f"""
 ### 趋势分析预判（基于交易理念）
@@ -4162,7 +6070,7 @@ class GeminiAnalyzer:
 """
         else:
             prompt += """
-未搜索到该股票近期的相关新闻。请主要依据技术面数据进行分析。
+未搜索到该股票近期的可引用新闻。请主要依据技术面数据进行分析；这只表示当前新闻窗口无可用证据，不代表没有事件、没有利空或基本面已经更新。
 """
 
         # 注入缺失数据警告
@@ -4200,15 +6108,15 @@ class GeminiAnalyzer:
 正确的股票名称格式为“股票名称（股票代码）”，例如“贵州茅台（600519）”。
 如果上方显示的股票名称为"股票{code}"或不正确，请在分析开头**明确输出该股票的正确中文全称**。
 """
-        if use_legacy_default_prompt:
+        if effective_legacy_default_prompt:
             prompt += f"""
 
 ### 重点关注（必须明确回答）：
-1. ❓ 是否满足 MA5>MA10>MA20 多头排列？
-2. ❓ 当前乖离率是否在安全范围内（<5%）？—— 超过5%必须标注"严禁追高"
-3. ❓ 量能是否配合（缩量回调/放量突破）？
+1. ❓ 当前趋势结构是否符合所选交易风格？短线可重点看 MA5/MA10/MA20，中线/持仓需结合 MA10/MA20/MA60，趋势风格需结合更长周期
+2. ❓ 当前乖离率和价格位置是否支持入场？—— 偏离过大必须标注"严禁追高/等待回踩"
+3. ❓ 量能是否与 setup 匹配（突破看放量，回踩看缩量与支撑，趋势延续看参与度）？
 4. ❓ 筹码结构是否健康？
-5. ❓ 消息面有无重大利空？（减持、处罚、业绩变脸等）
+5. ❓ 消息面有无重大利空或当前窗口无可引用证据？（减持、处罚、业绩变脸等）
 """
         else:
             prompt += f"""
@@ -4227,6 +6135,8 @@ class GeminiAnalyzer:
 - **核心结论**：一句话说清该买/该卖/该等
 - **持仓分类建议**：空仓者怎么做 vs 持仓者怎么做
 - **具体狙击点位**：买入价、止损价、目标价（精确到分）
+- **止损/止盈契约**：入场价、止损价、`take_profit` 和可选 `exit_legs` 必须属于同一交易周期；`take_profit` 必须表示最终目标，不得把第一止盈位写成完整目标；若第一目标只是短线触达位而最终目标更远，必须填写 `first_take_profit`、`final_target` 和 `exit_legs`，并让 `exit_legs.allocation_fraction` 合计等于 1.0、目标价严格递增
+- **风险收益约束**：若按入场中位价计算，完整止盈或分批止盈加权后的收益相对止损风险无法达到系统最低盈亏比，必须改为 `watch/avoid` 或明确“等待更优入场/更远目标确认”，不得为了通过校验编造价格
 - **检查清单**：每项用 ✅/⚠️/❌ 标记
 - **消息面时间合规**：`latest_news`、`risk_alerts`、`positive_catalysts` 不得包含超出近{news_window_days}日或时间未知的信息
 - **技术面一致性**：严禁把“空头排列”和“多头排列”等互斥结论同时当作有效依据；若基本面/事件面与技术面冲突，必须明确写“事件先行、技术待确认”或“基本面偏多，但技术面尚未确认”
@@ -4382,6 +6292,24 @@ class GeminiAnalyzer:
                     lines.append("- dashboard.intelligence.risk_alerts: risk alert list (can be empty)")
                 elif f == "dashboard.battle_plan.sniper_points.stop_loss":
                     lines.append("- dashboard.battle_plan.sniper_points.stop_loss: stop-loss level")
+                elif f == "dashboard.battle_plan.sniper_points.take_profit":
+                    lines.append("- dashboard.battle_plan.sniper_points.take_profit: final take-profit target")
+                elif f == "dashboard.battle_plan.sniper_points.final_target":
+                    lines.append("- dashboard.battle_plan.sniper_points.final_target: final target matching the last exit leg")
+                elif f == "dashboard.battle_plan.sniper_points.entry_leg_schema_version":
+                    lines.append("- dashboard.battle_plan.sniper_points.entry_leg_schema_version: entry-legs-v1")
+                elif f == "dashboard.battle_plan.sniper_points.entry_legs":
+                    lines.append("- dashboard.battle_plan.sniper_points.entry_legs: at least one executable entry leg with price_rules and allocation")
+                elif f == "dashboard.battle_plan.sniper_points.exit_leg_schema_version":
+                    lines.append("- dashboard.battle_plan.sniper_points.exit_leg_schema_version: exit-legs-v1")
+                elif f == "dashboard.battle_plan.sniper_points.exit_legs":
+                    lines.append("- dashboard.battle_plan.sniper_points.exit_legs: target legs whose allocation sums to 1.0")
+                elif f == "dashboard.battle_plan.sniper_points.stop_target_order":
+                    lines.append("- buy/add price order: stop_loss must be below the final take-profit target")
+                elif f == "dashboard.battle_plan.sniper_points.entry_stop_target_order":
+                    lines.append("- buy/add price order: stop_loss < entry range < final target")
+                elif f == "dashboard.battle_plan.sniper_points.final_target_exit_mismatch":
+                    lines.append("- final_target/take_profit must equal the last exit leg target")
                 elif f == "dashboard.phase_decision.phase_context":
                     lines.append("- dashboard.phase_decision.phase_context: public market phase summary subset")
                 elif f == "dashboard.phase_decision.action_window":
@@ -4412,6 +6340,24 @@ class GeminiAnalyzer:
                 lines.append("- dashboard.intelligence.risk_alerts: 风险警报列表（可为空数组）")
             elif f == "dashboard.battle_plan.sniper_points.stop_loss":
                 lines.append("- dashboard.battle_plan.sniper_points.stop_loss: 止损价")
+            elif f == "dashboard.battle_plan.sniper_points.take_profit":
+                lines.append("- dashboard.battle_plan.sniper_points.take_profit: 最终止盈目标")
+            elif f == "dashboard.battle_plan.sniper_points.final_target":
+                lines.append("- dashboard.battle_plan.sniper_points.final_target: 与最后一个退出批次一致的最终目标")
+            elif f == "dashboard.battle_plan.sniper_points.entry_leg_schema_version":
+                lines.append("- dashboard.battle_plan.sniper_points.entry_leg_schema_version: entry-legs-v1")
+            elif f == "dashboard.battle_plan.sniper_points.entry_legs":
+                lines.append("- dashboard.battle_plan.sniper_points.entry_legs: 至少一个带 price_rules 和 allocation 的可执行入场批次")
+            elif f == "dashboard.battle_plan.sniper_points.exit_leg_schema_version":
+                lines.append("- dashboard.battle_plan.sniper_points.exit_leg_schema_version: exit-legs-v1")
+            elif f == "dashboard.battle_plan.sniper_points.exit_legs":
+                lines.append("- dashboard.battle_plan.sniper_points.exit_legs: allocation 合计为 1.0 的止盈/退出批次")
+            elif f == "dashboard.battle_plan.sniper_points.stop_target_order":
+                lines.append("- 买入/加仓价格关系：stop_loss 必须低于最终止盈目标")
+            elif f == "dashboard.battle_plan.sniper_points.entry_stop_target_order":
+                lines.append("- 买入/加仓价格关系：stop_loss < 入场区间 < 最终目标")
+            elif f == "dashboard.battle_plan.sniper_points.final_target_exit_mismatch":
+                lines.append("- final_target/take_profit 必须等于最后一个退出批次目标")
             elif f == "dashboard.phase_decision.phase_context":
                 lines.append("- dashboard.phase_decision.phase_context: 公开低敏市场阶段摘要子集")
             elif f == "dashboard.phase_decision.action_window":
@@ -4435,19 +6381,85 @@ class GeminiAnalyzer:
         missing_fields: List[str],
         report_language: str = "zh",
     ) -> str:
-        """Build retry prompt using the previous response as the complement baseline."""
+        """Build compact retry prompt without replaying the full prior response."""
         complement = self._build_integrity_complement_prompt(missing_fields, report_language=report_language)
-        previous_output = previous_response.strip()
+        preview = redact_diagnostic_text(previous_response, limit=1200).strip()
         if normalize_report_language(report_language) in ("en", "ko"):
-            prefix = "### The previous output is below. Complete the missing fields based on that output and return the full JSON again. Do not omit existing fields:"
+            prefix = (
+                "### Retry instruction\n"
+                "The previous submission failed validation. Keep the original analysis context and reasoning chain, "
+                "fix the fields listed below, and submit the full dashboard again in the required structured format. "
+                "Do not invent prices or risks merely to pass validation.\n"
+                "Previous response preview for continuity:"
+            )
         else:
-            prefix = "### 上一次输出如下，请在该输出基础上补齐缺失字段，并重新输出完整 JSON。不要省略已有字段："
+            prefix = (
+                "### 重试指令\n"
+                "上一次提交未通过校验。请保留原始分析上下文和完整推理链，只修复下列字段，"
+                "并按当前要求的结构化格式重新提交完整决策仪表盘。不得为了通过校验编造价格或风险。\n"
+                "上一次响应摘要如下，仅用于保持上下文："
+            )
         return "\n\n".join([
             base_prompt,
             prefix,
-            previous_output,
+            preview,
             complement,
         ])
+
+    def _build_structured_tool_retry_prompt(
+        self,
+        base_prompt: str,
+        *,
+        report_language: str,
+        previous_response: Optional[str] = None,
+        decision_lock: Optional[Dict[str, Any]] = None,
+        include_base_prompt: bool = True,
+    ) -> str:
+        """Retry a rejected native-tool submission without accepting free text."""
+        previous_response = self._sanitize_structured_retry_draft(previous_response)
+        lock_keys = sorted((decision_lock or {}).keys())
+        lock_summary = ""
+        if lock_keys:
+            lock_summary = "\nLocked first-stage decision fields: " + ", ".join(lock_keys)
+        if normalize_report_language(report_language) == "en":
+            instruction = (
+                "### Structured resubmission\n"
+                "The previous tool submission was rejected by the receive-side schema. "
+                "Do not re-run or replace the market analysis. Treat the previous visible assistant "
+                "draft as the authoritative analytical conclusion and use the original evidence only "
+                "to fill missing schema fields or correct impossible type/schema violations. "
+                "Call submit_analysis_report exactly once again. "
+                "Include every required field with the declared type, preserve the decision logic, "
+                "and do not invent prices or facts to satisfy validation. If an already stated core "
+                "decision, score, action, entry, stop-loss, or target cannot be represented faithfully, "
+                "fail instead of silently changing it."
+                f"{lock_summary}"
+            )
+            if previous_response:
+                instruction += (
+                    "\n\nThe previous assistant message below is only an analytical draft because it did "
+                    "not contain the required tool call. It is not an accepted report, but its visible "
+                    "decision content must be preserved during serialization.\n"
+                    f"{previous_response}"
+                )
+        else:
+            instruction = (
+                "### 结构化重新提交\n"
+                "上一次工具参数未通过接收端 Schema。不要重新做一遍市场判断，也不要替换原判断。"
+                "请把上一轮可见助手草稿视为权威分析结论，只允许参考原始证据补齐缺失 Schema 字段"
+                "或修正不可能通过的类型/结构错误；并且只调用一次 submit_analysis_report。"
+                "所有必填字段必须使用声明的类型，保持原有决策逻辑，不得为了通过校验编造价格或事实。"
+                "如果已经出现的核心决策、评分、动作、买点、止损或目标无法被忠实表达，应失败，"
+                "不得静默改写。"
+                f"{lock_summary}"
+            )
+            if previous_response:
+                instruction += (
+                    "\n\n下面的上一轮助手消息只视为分析草稿，因为它没有包含必需的工具调用；"
+                    "它不是已接受报告，但其中可见的决策内容在结构化提交时必须保持一致。\n"
+                    f"{previous_response}"
+                )
+        return "\n\n".join([base_prompt, instruction]) if include_base_prompt else instruction
 
     def _apply_placeholder_fill(self, result: AnalysisResult, missing_fields: List[str]) -> None:
         """Delegate to module-level apply_placeholder_fill."""
@@ -4490,6 +6502,40 @@ class GeminiAnalyzer:
             raise
         return stripped, data
 
+    def _normalize_single_fenced_json_response(self, response_text: str) -> Optional[str]:
+        """Recover one JSON fence from provider-added, non-JSON envelope text.
+
+        This is intentionally narrower than the public parser contract.  It is
+        used only immediately after the original response validator rejects a
+        provider response, and the extracted body is validated again before it
+        can be returned or persisted.
+        """
+
+        text = response_text or ""
+        fence_pattern = re.compile(
+            r"```[ \t]*(?P<lang>[A-Za-z0-9_-]*)[ \t]*\n?(?P<body>.*?)```",
+            flags=re.DOTALL,
+        )
+        matches = list(fence_pattern.finditer(text))
+        if len(matches) != 1:
+            return None
+
+        match = matches[0]
+        fence_lang = (match.group("lang") or "").strip().lower()
+        if fence_lang not in {"", "json"}:
+            return None
+
+        outside = (text[:match.start()] + text[match.end():]).strip()
+        if "```" in outside or "{" in outside or "}" in outside:
+            return None
+
+        json_text = match.group("body").strip()
+        try:
+            self._load_analysis_json_candidate(json_text)
+        except Exception:
+            return None
+        return json_text
+
     def _load_analysis_json_candidate(self, json_str: str) -> Dict[str, Any]:
         """Parse one already-selected JSON candidate, repairing common LLM JSON drift."""
         try:
@@ -4529,26 +6575,42 @@ class GeminiAnalyzer:
                 return True
         return False
 
-    def _validate_analysis_minimal_contract(self, data: Dict[str, Any]) -> None:
-        try:
-            AnalysisReportSchema.model_validate(data)
-        except Exception as exc:
-            logger.warning(
-                "AnalysisReportSchema validation failed; continuing with raw parser contract: %s",
-                str(exc)[:200],
+    def _validate_analysis_minimal_contract(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        # Normalize an explicit confidence label with a parenthesized explanation.
+        # Do not infer missing/ambiguous confidence: it affects downstream gates.
+        raw_confidence = data.get("confidence_level")
+        if isinstance(raw_confidence, str) and not _is_valid_trading_confidence_level(raw_confidence):
+            match = re.fullmatch(
+                r"(高|中等|中|低|high|medium|mid|low)(?:\s*[（(][^\r\n]*[）)])?",
+                raw_confidence.strip(), re.IGNORECASE,
             )
-        minimal_keys = {
+            if match:
+                data = dict(data)
+                label = match.group(1).lower()
+                data['confidence_level'] = {'中等': '中', 'mid': 'medium'}.get(label, label)
+                limitations = data.get('limitations')
+                limitations = list(limitations) if isinstance(limitations, list) else ([limitations] if limitations else [])
+                data['limitations'] = limitations + [f"confidence_detail: {raw_confidence}"]
+        decision_keys = {
             "sentiment_score",
             "trend_prediction",
             "operation_advice",
-            "analysis_summary",
-            "dashboard",
+            "decision_type",
         }
-        if not any(key in data for key in minimal_keys):
+        if not any(key in data for key in decision_keys):
             raise self._generation_validation_error(
                 GenerationErrorCode.SCHEMA_VALIDATION_FAILED,
                 reason="minimal_contract_failed",
-                message="analysis JSON does not contain any minimal parser field",
+                message="analysis JSON does not contain a decision field",
+            )
+        if "dashboard" in data and not isinstance(data.get("dashboard"), dict):
+            data["dashboard"] = None
+        native_missing = _native_tool_core_contract_missing_fields(data)
+        if native_missing:
+            raise self._generation_validation_error(
+                GenerationErrorCode.SCHEMA_VALIDATION_FAILED,
+                reason="native_tool_core_contract_failed",
+                message="missing or invalid trading core fields: " + ",".join(native_missing),
             )
         if "sentiment_score" in data:
             try:
@@ -4559,6 +6621,15 @@ class GeminiAnalyzer:
                     reason="parser_contract_failed",
                     message="sentiment_score must be integer-compatible",
                 ) from exc
+        try:
+            schema = AnalysisReportSchema.model_validate(data)
+        except Exception as exc:
+            raise self._generation_validation_error(
+                GenerationErrorCode.SCHEMA_VALIDATION_FAILED,
+                reason="schema_validation_failed",
+                message=str(exc)[:200],
+            ) from exc
+        return schema.model_dump(exclude_none=True)
 
     def _generation_validation_error(
         self,
@@ -4602,7 +6673,7 @@ class GeminiAnalyzer:
             )
             try:
                 _json_str, data = self._extract_analysis_json_object(response_text)
-                self._validate_analysis_minimal_contract(data)
+                data = self._validate_analysis_minimal_contract(data)
             except Exception as exc:
                 logger.warning("无法从响应中提取唯一有效 JSON，标记为解析失败: %s", exc)
                 return self._parse_text_response(response_text, code, name)
@@ -4620,15 +6691,18 @@ class GeminiAnalyzer:
             normalize_report_signal_attribution(dashboard)
 
             # 优先使用 AI 返回的股票名称（如果原名称无效或包含代码）
-            ai_stock_name = data.get('stock_name')
+            ai_stock_name = _report_display_text(data.get('stock_name'))
             if ai_stock_name and (name.startswith('股票') or name == code or 'Unknown' in name):
                 name = ai_stock_name
 
             # 解析所有字段，使用默认值防止缺失
             # 解析 decision_type，如果没有则根据 operation_advice 推断
-            decision_type = data.get('decision_type', '')
+            decision_type = _report_display_text(data.get('decision_type'))
             if not decision_type:
-                op = data.get('operation_advice', localize_operation_advice('持有', report_language))
+                op = _report_display_text(
+                    data.get('operation_advice'),
+                    localize_operation_advice('持有', report_language),
+                )
                 decision_type = infer_decision_type_from_advice(op, default='hold')
 
             explicit_action = data.get("action")
@@ -4640,50 +6714,82 @@ class GeminiAnalyzer:
                 name=name,
                 # 核心指标
                 sentiment_score=int(data.get('sentiment_score', 50)),
-                trend_prediction=data.get('trend_prediction', localize_trend_prediction('震荡', report_language)),
-                operation_advice=data.get('operation_advice', localize_operation_advice('持有', report_language)),
+                trend_prediction=_report_display_text(
+                    data.get('trend_prediction'),
+                    localize_trend_prediction('震荡', report_language),
+                ),
+                operation_advice=_report_display_text(
+                    data.get('operation_advice'),
+                    localize_operation_advice('持有', report_language),
+                ),
                 decision_type=decision_type,
                 confidence_level=localize_confidence_level(
                     data.get('confidence_level', localize_confidence_level('中', report_language)),
                     report_language,
                 ),
                 report_language=report_language,
+                report_schema_version=data.get("report_schema_version"),
+                raw_score=data.get("raw_score", data.get("sentiment_score")),
+                adjusted_score=data.get("adjusted_score"),
+                guardrail=data.get("guardrail") if isinstance(data.get("guardrail"), dict) else None,
+                limitations=(
+                    [str(item) for item in data.get("limitations", []) if str(item or "").strip()]
+                    if isinstance(data.get("limitations"), list)
+                    else []
+                ),
+                position_actions=(
+                    data.get("position_actions")
+                    if isinstance(data.get("position_actions"), dict)
+                    else None
+                ),
                 # 决策仪表盘
                 dashboard=dashboard,
                 # 走势分析
-                trend_analysis=data.get('trend_analysis', ''),
-                short_term_outlook=data.get('short_term_outlook', ''),
-                medium_term_outlook=data.get('medium_term_outlook', ''),
+                trend_analysis=_report_display_text(data.get('trend_analysis')),
+                short_term_outlook=_report_display_text(data.get('short_term_outlook')),
+                medium_term_outlook=_report_display_text(data.get('medium_term_outlook')),
                 # 技术面
-                technical_analysis=data.get('technical_analysis', ''),
-                ma_analysis=data.get('ma_analysis', ''),
-                volume_analysis=data.get('volume_analysis', ''),
-                pattern_analysis=data.get('pattern_analysis', ''),
+                technical_analysis=_report_display_text(data.get('technical_analysis')),
+                ma_analysis=_report_display_text(data.get('ma_analysis')),
+                volume_analysis=_report_display_text(data.get('volume_analysis')),
+                pattern_analysis=_report_display_text(data.get('pattern_analysis')),
                 # 基本面
-                fundamental_analysis=data.get('fundamental_analysis', ''),
-                sector_position=data.get('sector_position', ''),
-                company_highlights=data.get('company_highlights', ''),
+                fundamental_analysis=_report_display_text(data.get('fundamental_analysis')),
+                sector_position=_report_display_text(data.get('sector_position')),
+                company_highlights=_report_display_text(data.get('company_highlights')),
                 # 情绪面/消息面
-                news_summary=data.get('news_summary', ''),
-                market_sentiment=data.get('market_sentiment', ''),
-                hot_topics=data.get('hot_topics', ''),
+                news_summary=_report_display_text(data.get('news_summary')),
+                market_sentiment=_report_display_text(data.get('market_sentiment')),
+                hot_topics=_report_display_text(data.get('hot_topics')),
                 # 综合
-                analysis_summary=data.get('analysis_summary', _localized_text(
+                analysis_summary=_report_display_text(data.get('analysis_summary'), _localized_text(
                     report_language, en='Analysis completed', zh='分析完成', ko='분석 완료')),
-                key_points=data.get('key_points', ''),
-                risk_warning=data.get('risk_warning', ''),
-                buy_reason=data.get('buy_reason', ''),
+                key_points=_report_display_text(data.get('key_points')),
+                risk_warning=_report_display_text(data.get('risk_warning')),
+                buy_reason=_report_display_text(data.get('buy_reason')),
                 # 元数据
-                search_performed=data.get('search_performed', False),
-                data_sources=data.get('data_sources', _localized_text(
+                search_performed=data.get('search_performed') if isinstance(data.get('search_performed'), bool) else False,
+                data_sources=_report_display_text(data.get('data_sources'), _localized_text(
                     report_language, en='Technical data', zh='技术面数据', ko='기술적 데이터')),
                 success=True,
             )
-            return populate_decision_action_fields(
+            normalized_explicit_action = normalize_decision_action(explicit_action)
+            parsed_result = populate_decision_action_fields(
                 result,
                 explicit_action=explicit_action,
-                align_with_score=False,
+                align_with_score=True,
             )
+            if (
+                data.get("report_schema_version") == self.ANALYSIS_REPORT_TOOL_SCHEMA_VERSION
+                and normalized_explicit_action not in {"buy", "add"}
+                and normalize_decision_action(getattr(parsed_result, "action", None)) in {"buy", "add"}
+            ):
+                parsed_result = populate_decision_action_fields(
+                    parsed_result,
+                    explicit_action=normalized_explicit_action,
+                    align_with_score=False,
+                )
+            return parsed_result
                 
         except json.JSONDecodeError as e:
             logger.warning(f"JSON 解析失败: {e}，标记为解析失败")
@@ -4762,7 +6868,7 @@ class GeminiAnalyzer:
         # 尝试识别关键词来判断情绪
         sentiment_score = 50
         trend = localize_trend_prediction('震荡', report_language)
-        advice = localize_operation_advice('持有', report_language)
+        advice = _analysis_failed_label(report_language)
         
         text_lower = response_text.lower()
         
@@ -4813,10 +6919,10 @@ class GeminiAnalyzer:
             ),
             raw_response=response_text,
             success=False,
-            error_message='LLM response is not valid JSON; analysis result will not be persisted',
+            error_message='LLM response is not valid JSON/schema; failed attempt will be persisted without a trading action',
             report_language=report_language,
         )
-        return populate_decision_action_fields(result, align_with_score=False)
+        return _mark_failed_result_non_actionable(result)
     
     def batch_analyze(
         self, 

@@ -13,6 +13,8 @@ interface StockBarProps {
   selectedRecordId?: number;
   onItemClick: (recordId: number) => void;
   onDeleteStock?: (stockCode: string) => Promise<void> | void;
+  onAnalyzeStocks?: (stockCodes: string[]) => Promise<void> | void;
+  isAnalyzing?: boolean;
   isDeleting?: boolean;
   className?: string;
 }
@@ -28,6 +30,8 @@ export const StockBar: React.FC<StockBarProps> = ({
   selectedRecordId,
   onItemClick,
   onDeleteStock,
+  onAnalyzeStocks,
+  isAnalyzing = false,
   isDeleting = false,
   className = '',
 }) => {
@@ -39,6 +43,7 @@ export const StockBar: React.FC<StockBarProps> = ({
 
   const deletableItems = items;
   const selectedCount = [...selectedCodes].filter((code) => deletableItems.some((item) => item.stockCode === code)).length;
+  const selectedAnalyzableCodes = [...selectedCodes].filter((code) => code && !isMarketReview(code));
   const allVisibleSelected = deletableItems.length > 0 && selectedCount === deletableItems.length;
   const someVisibleSelected = selectedCount > 0 && !allVisibleSelected;
 
@@ -73,6 +78,11 @@ export const StockBar: React.FC<StockBarProps> = ({
     setSelectedCodes(new Set());
   }, [onDeleteStock, selectedCodes]);
 
+  const handleAnalyzeSelected = useCallback(async () => {
+    if (!onAnalyzeStocks || selectedAnalyzableCodes.length === 0) return;
+    await onAnalyzeStocks(selectedAnalyzableCodes);
+  }, [onAnalyzeStocks, selectedAnalyzableCodes]);
+
   return (
     <aside className={`glass-card overflow-hidden flex flex-col ${className}`}>
       <ScrollArea
@@ -101,7 +111,7 @@ export const StockBar: React.FC<StockBarProps> = ({
             }
           />
 
-          {items.length > 0 && onDeleteStock && (
+          {items.length > 0 && (onDeleteStock || onAnalyzeStocks) && (
             <div className="flex items-center gap-2">
               <label
                 className="flex flex-1 cursor-pointer items-center gap-2 rounded-lg px-2 py-1"
@@ -113,22 +123,36 @@ export const StockBar: React.FC<StockBarProps> = ({
                   type="checkbox"
                   checked={allVisibleSelected}
                   onChange={toggleSelectAll}
-                  disabled={isDeleting}
+                  disabled={isDeleting || isAnalyzing}
                   aria-label={t('history.selectAllStockAria')}
                   className="h-3.5 w-3.5 cursor-pointer bg-transparent accent-primary focus:ring-primary/30 disabled:opacity-50"
                 />
                 <span className="text-[11px] text-muted-text select-none">{t('common.selectAllCurrent')}</span>
               </label>
-              <Button
-                variant="danger-subtle"
-                size="xsm"
-                onClick={() => void handleDeleteSelected()}
-                disabled={selectedCount === 0 || isDeleting}
-                isLoading={isDeleting}
-                className="disabled:!border-transparent disabled:!bg-transparent"
-              >
-                {isDeleting ? t('common.deleting') : t('common.delete')}
-              </Button>
+              {onAnalyzeStocks ? (
+                <Button
+                  variant="home-action-ai"
+                  size="xsm"
+                  onClick={() => void handleAnalyzeSelected()}
+                  disabled={selectedAnalyzableCodes.length === 0 || isAnalyzing || isDeleting}
+                  isLoading={isAnalyzing}
+                  loadingText={t('history.analyzingSelected')}
+                >
+                  {t('history.analyzeSelected')}
+                </Button>
+              ) : null}
+              {onDeleteStock ? (
+                <Button
+                  variant="danger-subtle"
+                  size="xsm"
+                  onClick={() => void handleDeleteSelected()}
+                  disabled={selectedCount === 0 || isDeleting || isAnalyzing}
+                  isLoading={isDeleting}
+                  className="disabled:!border-transparent disabled:!bg-transparent"
+                >
+                  {isDeleting ? t('common.deleting') : t('common.delete')}
+                </Button>
+              ) : null}
             </div>
           )}
         </div>
@@ -159,13 +183,13 @@ export const StockBar: React.FC<StockBarProps> = ({
 
               return (
                 <div key={`${code}-${item.id}`} className="flex items-start gap-2 group">
-                  {onDeleteStock && (
+                  {(onDeleteStock || onAnalyzeStocks) && (
                     <div className="pt-5">
                       <input
                         type="checkbox"
                         checked={isChecked}
                         onChange={() => toggleCode(code)}
-                        disabled={isDeleting}
+                        disabled={isDeleting || isAnalyzing}
                         className="h-3.5 w-3.5 cursor-pointer rounded border-subtle-hover bg-transparent accent-primary focus:ring-primary/30 disabled:opacity-50"
                       />
                     </div>

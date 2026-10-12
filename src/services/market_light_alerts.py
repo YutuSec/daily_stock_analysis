@@ -88,7 +88,7 @@ def make_market_light_payload(
     trading_day_check_enabled = bool(getattr(config, "trading_day_check_enabled", True))
     market_is_open = True
     if trading_day_check_enabled:
-        market_is_open = region in get_open_markets_today()
+        market_is_open = region in get_open_markets_today(markets={region})
 
     display_target = MARKET_REGION_LABELS.get(region, region)
     rule = MarketLightAlert(

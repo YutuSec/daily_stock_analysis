@@ -56,6 +56,7 @@ httpx[socks]                # HTTP client with SOCKS proxy support; optional Ope
 dingtalk-stream >= 0.24.3    # DingTalk Stream SDK
 # Database
 # SQLite is built into Python and does not need an extra package
+psycopg[binary]>=3.2,<4      # PostgreSQL driver for durable multi-container deployments
 
 # Discord bot
 discord.py>=2.0.0              # Discord bot development library

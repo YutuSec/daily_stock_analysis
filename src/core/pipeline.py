@@ -12,6 +12,8 @@ A股自选股智能分析系统 - 核心分析流水线
 """
 
 import logging
+import math
+import re
 import threading
 import time
 import uuid
@@ -24,19 +26,27 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 import pandas as pd
 
 from src.config import FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT, get_config, Config
-from src.storage import get_db
+from src.storage import (
+    REPORT_EXECUTION_INTENT_PAPER_CANDIDATE,
+    REPORT_EXECUTION_INTENT_RESEARCH_ONLY,
+    REPORT_EXECUTION_SCOPE_PRIMARY,
+    get_db,
+    normalize_report_execution_intent,
+)
 from data_provider import DataFetcherManager
 from data_provider.base import is_bse_code, normalize_stock_code
 from data_provider.realtime_types import ChipDistribution
 from src.analyzer import (
     GeminiAnalyzer,
     AnalysisResult,
+    apply_placeholder_fill,
     fill_price_position_if_needed,
     normalize_chip_structure_availability,
     normalize_index_etf_checklist,
     populate_decision_action_fields,
     stabilize_decision_with_structure,
 )
+from src.schemas.decision_action import apply_position_aware_result_contract
 from src.notification import NotificationService, NotificationChannel
 from src.report_language import (
     get_placeholder_text,
@@ -66,6 +76,7 @@ from src.services.analysis_context_builder import (
     PipelineAnalysisArtifacts,
 )
 from src.services.market_structure_service import MarketStructureService
+from src.services.paper_trading_service import resolve_paper_trading_style_context
 from src.services.run_diagnostics import (
     activate_run_diagnostic_context,
     current_diagnostic_snapshot,
@@ -98,6 +109,12 @@ logger = logging.getLogger(__name__)
 # double-check 初始化 _single_stock_notify_lock 仍然线程安全。
 _SINGLE_STOCK_NOTIFY_LOCK_INIT_GUARD = threading.Lock()
 _DAILY_MARKET_CONTEXT_SERVICE_LOCK_INIT_GUARD = threading.Lock()
+# 普通分析沿用原契约：报告可作为主账户模拟计划的来源。
+_DEFAULT_PIPELINE_EXECUTION_INTENT = {
+    "execution_intent": REPORT_EXECUTION_INTENT_PAPER_CANDIDATE,
+    "execution_scope": REPORT_EXECUTION_SCOPE_PRIMARY,
+    "intent_source": "analysis_pipeline",
+}
 
 
 def _symbol_scope_lookup_values(code: str, market: str) -> List[str]:
@@ -188,8 +205,11 @@ class StockAnalysisPipeline:
         analysis_skills: Optional[List[str]] = None,
         analysis_phase: str = "auto",
         portfolio_context: Optional[Dict[str, Any]] = None,
+        selection_context: Optional[Dict[str, Any]] = None,
         daily_market_context_enabled: Optional[bool] = None,
         daily_market_context_allow_generate: bool = True,
+        execution_intent: Optional[Dict[str, Any]] = None,
+        trading_style_override: Optional[str] = None,
     ):
         """
         初始化调度器
@@ -197,6 +217,11 @@ class StockAnalysisPipeline:
         Args:
             config: 配置对象（可选，默认使用全局配置）
             max_workers: 最大并发线程数（可选，默认从配置读取）
+            execution_intent: 后端可信的报告执行用途；默认是主账户可执行候选，
+                research_only 报告不读取账户持仓、不生成决策信号或模拟计划
+            trading_style_override: 本次分析的基础交易风格（如机会池候选冻结的筛选风格）；
+                未传时，模拟盘同会话重分析沿用源计划冻结的风格，其余沿用 PAPER_TRADING_STYLE。
+                PAPER_TRADING_STYLE_OVERRIDES 的精确覆盖仍然优先，无效值被忽略
         """
         self.config = config or get_config()
         self.max_workers = max_workers or self.config.max_workers
@@ -211,6 +236,26 @@ class StockAnalysisPipeline:
         self.analysis_skills = list(analysis_skills) if analysis_skills is not None else None
         self.analysis_phase = analysis_phase or "auto"
         self.portfolio_context = dict(portfolio_context) if isinstance(portfolio_context, dict) else None
+        self.selection_context = dict(selection_context) if isinstance(selection_context, dict) else None
+        self.execution_intent = normalize_report_execution_intent(
+            execution_intent if execution_intent is not None else _DEFAULT_PIPELINE_EXECUTION_INTENT
+        )
+        if self._is_research_only_analysis() and self.portfolio_context is not None:
+            raise ValueError("research_only analysis must stay account-agnostic without portfolio_context")
+        paper_control = (
+            self.portfolio_context.get("paper_trading")
+            if isinstance(self.portfolio_context, dict)
+            else None
+        )
+        self.trading_style_override = (
+            str(trading_style_override or "").strip()
+            or (
+                str(paper_control.get("trading_style") or "").strip()
+                if isinstance(paper_control, dict)
+                else ""
+            )
+            or None
+        )
         self.daily_market_context_enabled = (
             bool(getattr(self.config, "daily_market_context_enabled", True))
             if daily_market_context_enabled is None
@@ -312,6 +357,46 @@ class StockAnalysisPipeline:
                 },
             )
 
+    def _record_analysis_attempt(
+        self,
+        *,
+        query_id: str,
+        code: str,
+        stock_name: Optional[str],
+        report_type: ReportType,
+        result: Optional[AnalysisResult],
+        status: str,
+        error_message: Optional[Any] = None,
+        analysis_history_id: Optional[int] = None,
+    ) -> None:
+        """Persist attempt visibility separately from successful report history."""
+
+        model_used = (
+            getattr(result, "model_used", None)
+            if result is not None
+            else getattr(self.config, "litellm_model", None)
+        )
+        if not model_used:
+            model_used = getattr(self.config, "agent_litellm_model", None)
+        error_text = str(
+            error_message
+            or (getattr(result, "error_message", None) if result is not None else "")
+            or ""
+        ).strip()
+        try:
+            self.db.save_analysis_attempt(
+                query_id=query_id,
+                code=code,
+                name=stock_name or getattr(result, "name", None) if result is not None else stock_name,
+                report_type=report_type.value,
+                model_used=str(model_used or "").strip() or None,
+                status=status,
+                error_message=error_text or None,
+                analysis_history_id=analysis_history_id,
+            )
+        except Exception as exc:
+            logger.debug("analysis attempt recording failed for %s: %s", code, exc)
+
     def fetch_and_save_stock_data(
         self, 
         code: str,
@@ -345,14 +430,29 @@ class StockAnalysisPipeline:
 
             # 断点续传检查：如果最新可复用交易日的数据已存在，则跳过
             if not force_refresh and self.db.has_today_data(code, target_date):
+                style_context = self._paper_trading_style_context(code)
+                if self._has_style_history_window(code, target_date, style_context):
+                    logger.info(
+                        f"{stock_name}({code}) {target_date} 数据已存在且满足风格窗口，跳过获取（断点续传）"
+                    )
+                    return True, None
                 logger.info(
-                    f"{stock_name}({code}) {target_date} 数据已存在，跳过获取（断点续传）"
+                    f"{stock_name}({code}) {target_date} 数据已存在但风格窗口不足，继续回补历史"
                 )
-                return True, None
 
             # 从数据源获取数据
             logger.info(f"{stock_name}({code}) 开始从数据源获取数据...")
-            df, source_name = self.fetcher_manager.get_daily_data(code, days=30)
+            style_context = self._paper_trading_style_context(code)
+            fetch_days = int(
+                style_context.get("settings", {}).get("analysis_window_sessions")
+                or 30
+            )
+            df, source_name = self.fetcher_manager.get_daily_data(
+                code,
+                days=fetch_days,
+                end_date=target_date.isoformat(),
+                current_time=current_time,
+            )
 
             if df is None or df.empty:
                 return False, "获取数据为空"
@@ -367,6 +467,34 @@ class StockAnalysisPipeline:
             error_msg = f"获取/保存数据失败: {str(e)}"
             logger.error(f"{stock_name}({code}) {error_msg}")
             return False, error_msg
+
+    def _has_style_history_window(
+        self,
+        code: str,
+        target_date,
+        paper_trading_style_context: Optional[Dict[str, Any]],
+    ) -> bool:
+        settings = (
+            paper_trading_style_context.get("settings")
+            if isinstance(paper_trading_style_context, dict)
+            else {}
+        )
+        try:
+            required = max(1, int(settings.get("analysis_window_sessions") or 30))
+        except (TypeError, ValueError):
+            required = 30
+        try:
+            start_date = target_date - timedelta(days=self._style_history_calendar_days(required))
+            rows = self.db.get_data_range(code, start_date, target_date)
+        except Exception as exc:
+            logger.debug("[%s] Style window availability check failed: %s", code, exc)
+            return False
+        # Ambiguous legacy Akshare volumes must be refreshed, not reused as
+        # shares beside new canonical rows. No destructive cache migration.
+        from data_provider.volume_units import cached_volume_unit_known
+        return bool(rows and len(rows) >= required and all(
+            cached_volume_unit_known(getattr(row, 'data_source', None)) for row in rows
+        ))
     
     def analyze_stock(
         self,
@@ -397,10 +525,15 @@ class StockAnalysisPipeline:
         """
         stock_name = code
         try:
-            portfolio_context = getattr(self, "portfolio_context", None)
-            if not isinstance(portfolio_context, dict):
-                portfolio_context = None
+            portfolio_context = self._effective_portfolio_context_for_stock(code)
+            raw_selection_context = getattr(self, "selection_context", None)
+            selection_context = (
+                dict(raw_selection_context)
+                if isinstance(raw_selection_context, dict)
+                else None
+            )
             market = get_market_for_stock(normalize_stock_code(code))
+            paper_trading_style_context = self._paper_trading_style_context(code, market=market)
             market_phase_context = build_market_phase_context(
                 market=market,
                 current_time=current_time,
@@ -529,18 +662,35 @@ class StockAnalysisPipeline:
 
             # Step 3: 趋势分析（基于交易理念）— 在 Agent 分支之前执行，供两条路径共用
             trend_result: Optional[TrendAnalysisResult] = None
+            style_indicator_snapshot: Optional[Dict[str, Any]] = None
             try:
                 from src.services.history_loader import get_frozen_target_date
                 _mkt = get_market_for_stock(normalize_stock_code(code))
                 frozen = get_frozen_target_date()
                 end_date = frozen if frozen else get_market_now(_mkt).date()
-                start_date = end_date - timedelta(days=89)  # ~60 trading days for MA60
+                style_window_sessions = int(
+                    paper_trading_style_context.get("settings", {}).get("analysis_window_sessions")
+                    or 60
+                )
+                start_date = end_date - timedelta(days=self._style_history_calendar_days(style_window_sessions))
                 historical_bars = self.db.get_data_range(code, start_date, end_date)
                 if historical_bars:
                     df = pd.DataFrame([bar.to_dict() for bar in historical_bars])
                     # Issue #234: Augment with realtime for intraday MA calculation
                     if self.config.enable_realtime_quote and realtime_quote:
-                        df = self._augment_historical_with_realtime(df, realtime_quote, code)
+                        df = self._augment_historical_with_realtime(
+                            df, realtime_quote, code,
+                            market_phase_context=market_phase_context_dict,
+                        )
+                    style_indicator_snapshot = self._style_indicator_snapshot(
+                        df,
+                        paper_trading_style_context,
+                        expected_bar_date=(
+                            market_phase_context_dict.get('session_date')
+                            if market_phase_context_dict.get('phase') == 'intraday'
+                            else market_phase_context_dict.get('effective_daily_bar_date')
+                        ),
+                    )
                     trend_result = self.trend_analyzer.analyze(df, code)
                     logger.info(f"{stock_name}({code}) 趋势分析: {trend_result.trend_status.value}, "
                               f"买入信号={trend_result.buy_signal.value}, 评分={trend_result.signal_score}")
@@ -563,7 +713,10 @@ class StockAnalysisPipeline:
                     market_phase_summary=market_phase_summary,
                     daily_market_context=daily_market_context,
                     portfolio_context=portfolio_context,
+                    selection_context=selection_context,
                     market_structure_context=market_structure_context,
+                    paper_trading_style_context=paper_trading_style_context,
+                    style_indicator_snapshot=style_indicator_snapshot,
                 )
 
             # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
@@ -635,7 +788,10 @@ class StockAnalysisPipeline:
 
             # Step 5: 获取分析上下文（技术面数据）
             self._emit_progress(58, f"{stock_name}：正在整理分析上下文")
-            context = self._get_analysis_context_with_market_fallback(code)
+            context = self._get_analysis_context_with_market_fallback(
+                code,
+                paper_trading_style_context=paper_trading_style_context,
+            )
 
             if context is None:
                 logger.warning(f"{stock_name}({code}) 无法获取历史行情数据，将仅基于新闻和实时行情分析")
@@ -661,6 +817,8 @@ class StockAnalysisPipeline:
                 fundamental_context,
                 market_phase_context=market_phase_context_dict,
                 portfolio_context=portfolio_context,
+                paper_trading_style_context=paper_trading_style_context,
+                style_indicator_snapshot=style_indicator_snapshot,
             )
             enhanced_context["market_phase_context"] = market_phase_context_dict
             self._attach_daily_market_context(
@@ -670,6 +828,8 @@ class StockAnalysisPipeline:
             )
             if portfolio_context is not None:
                 enhanced_context["portfolio_context"] = dict(portfolio_context)
+            if selection_context is not None:
+                enhanced_context["selection_context"] = dict(selection_context)
             if isinstance(market_structure_context, dict):
                 enhanced_context["market_structure_context"] = market_structure_context
             
@@ -761,7 +921,7 @@ class StockAnalysisPipeline:
                 result.change_pct = realtime_data.get('change_pct')
 
             # Step 7.6: chip_structure fallback (Issue #589) and unavailable collapse
-            if result:
+            if result and result.success:
                 is_index_etf = bool(enhanced_context.get("is_index_etf", False))
                 normalize_chip_structure_availability(
                     result,
@@ -771,7 +931,7 @@ class StockAnalysisPipeline:
                 normalize_index_etf_checklist(result, is_index_etf=is_index_etf)
 
             # Step 7.7: price_position fallback
-            if result:
+            if result and result.success:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
                 action_source_advice = getattr(result, "operation_advice", None)
                 stabilize_decision_with_structure(result, trend_result, fundamental_context)
@@ -802,13 +962,14 @@ class StockAnalysisPipeline:
                     result.market_structure_context = market_structure_context
                 result.market_phase_summary = market_phase_summary
                 result.analysis_context_pack_overview = analysis_context_pack_overview
+                self._freeze_holding_state(result, portfolio_context)
                 self._refresh_decision_action_for_final_result(
                     result,
                     report_type=report_type.value,
                     previous_operation_advice=action_source_advice,
                 )
 
-            # Step 8: 保存分析历史记录
+            # Step 8: 仅成功报告进入分析历史；失败/降级尝试写 analysis_attempts。
             if result and result.success:
                 try:
                     self._emit_progress(97, f"{stock_name}：正在保存分析报告")
@@ -828,7 +989,8 @@ class StockAnalysisPipeline:
                         report_type=report_type.value,
                         news_content=news_context,
                         context_snapshot=context_snapshot,
-                        save_snapshot=self.save_context_snapshot
+                        save_snapshot=self.save_context_snapshot,
+                        execution_intent=self._report_execution_intent(),
                     )
                     valid_saved_history_id = (
                         isinstance(saved_history_id, int)
@@ -842,7 +1004,7 @@ class StockAnalysisPipeline:
                             saved_history_id if valid_saved_history_id else None
                         ),
                     )
-                    if valid_saved_history_id:
+                    if valid_saved_history_id and result.success:
                         self._extract_decision_signal_after_history_save(
                             result=result,
                             query_id=query_id,
@@ -851,6 +1013,16 @@ class StockAnalysisPipeline:
                             context_snapshot=context_snapshot,
                             portfolio_context=portfolio_context,
                         )
+                    self._record_analysis_attempt(
+                        query_id=query_id,
+                        code=code,
+                        stock_name=stock_name,
+                        report_type=report_type,
+                        result=result,
+                        status="completed" if valid_saved_history_id else "degraded",
+                        error_message=None if valid_saved_history_id else "analysis report was generated but history save failed",
+                        analysis_history_id=saved_history_id if valid_saved_history_id else None,
+                    )
                 except Exception as e:
                     record_history_run(
                         report_saved=False,
@@ -858,12 +1030,40 @@ class StockAnalysisPipeline:
                         error_message=e,
                     )
                     logger.warning(f"{stock_name}({code}) 保存分析历史失败: {e}")
+                    self._record_analysis_attempt(
+                        query_id=query_id,
+                        code=code,
+                        stock_name=stock_name,
+                        report_type=report_type,
+                        result=result,
+                        status="degraded",
+                        error_message=e,
+                    )
+            elif result:
+                self._record_analysis_attempt(
+                    query_id=query_id,
+                    code=code,
+                    stock_name=stock_name,
+                    report_type=report_type,
+                    result=result,
+                    status="failed",
+                    error_message=getattr(result, "error_message", None),
+                )
 
             return result
 
         except Exception as e:
             logger.error(f"{stock_name}({code}) 分析失败: {e}")
             logger.exception(f"{stock_name}({code}) 详细错误信息:")
+            self._record_analysis_attempt(
+                query_id=query_id,
+                code=code,
+                stock_name=stock_name,
+                report_type=report_type,
+                result=None,
+                status="failed",
+                error_message=e,
+            )
             return None
     
     def _enhance_context(
@@ -876,6 +1076,8 @@ class StockAnalysisPipeline:
         fundamental_context: Optional[Dict[str, Any]] = None,
         market_phase_context: Optional[Dict[str, Any]] = None,
         portfolio_context: Optional[Dict[str, Any]] = None,
+        paper_trading_style_context: Optional[Dict[str, Any]] = None,
+        style_indicator_snapshot: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         增强分析上下文
@@ -903,6 +1105,10 @@ class StockAnalysisPipeline:
             enhanced['stock_name'] = realtime_quote.name
         if isinstance(portfolio_context, dict):
             enhanced["portfolio_context"] = dict(portfolio_context)
+        if isinstance(paper_trading_style_context, dict):
+            enhanced["paper_trading_style_context"] = dict(paper_trading_style_context)
+        if isinstance(style_indicator_snapshot, dict):
+            enhanced["paper_trading_style_indicators"] = dict(style_indicator_snapshot)
 
         # 将运行时搜索窗口透传给 analyzer，避免与全局配置重新读取产生窗口不一致
         enhanced['news_window_days'] = getattr(self.search_service, "news_window_days", 3)
@@ -965,7 +1171,11 @@ class StockAnalysisPipeline:
 
         # Issue #234：盘中分析使用实时 OHLC 与趋势 MA 覆盖 today。
         # 防护条件：trend_result.ma5 > 0 表示 MA 计算已成功且数据量充足。
-        if realtime_quote and trend_result and trend_result.ma5 > 0:
+        intraday_context = not isinstance(market_phase_context, dict) or (
+            market_phase_context.get('phase') == 'intraday'
+        )
+        if (realtime_quote and trend_result and trend_result.ma5 > 0 and intraday_context
+                and getattr(realtime_quote, 'is_stale', False) is not True):
             price = getattr(realtime_quote, 'price', None)
             if price is not None and price > 0:
                 yesterday_close = None
@@ -975,6 +1185,11 @@ class StockAnalysisPipeline:
                 market_today = get_market_now(
                     get_market_for_stock(normalize_stock_code(enhanced.get('code', '')))
                 ).date().isoformat()
+                # When appending a new intraday bar, the previous cached latest
+                # bar becomes the comparison row (not the old second-last row).
+                if str(orig_today.get('date', ''))[:10] < market_today and orig_today.get('date'):
+                    enhanced['yesterday'] = dict(orig_today)
+                    yesterday_close = orig_today.get('close')
                 source = getattr(realtime_quote, 'source', None)
                 source_name = getattr(source, 'value', source)
                 source_name = str(source_name) if source_name is not None else 'unknown'
@@ -1001,6 +1216,7 @@ class StockAnalysisPipeline:
                     'data_source': f"realtime:{source_name}",
                     'realtime_source': source_name,
                     'is_estimated': True,
+                    'volume_unit': 'shares',
                 }
                 estimated_fields = [
                     'close', 'open', 'high', 'low', 'ma5', 'ma10', 'ma20',
@@ -1063,6 +1279,8 @@ class StockAnalysisPipeline:
                                 )
                         except (TypeError, ValueError):
                             pass
+
+        self._validate_daily_comparison(enhanced)
 
         # ETF/index flag for analyzer prompt (Fixes #274)
         enhanced['is_index_etf'] = SearchService.is_index_or_etf(
@@ -1269,11 +1487,15 @@ class StockAnalysisPipeline:
             target = self._resolve_resume_target_date(code)
         start = target - timedelta(days=int(min_days * 1.8))
         bars = self.db.get_data_range(code, start, target)
-        if bars and len(bars) >= min(min_days, 200):
+        if bars and len(bars) >= int(min_days):
             logger.debug("[%s] Agent history: %d bars in DB, sufficient", code, len(bars))
             return
         try:
-            df, source = self.fetcher_manager.get_daily_data(code, days=min_days)
+            df, source = self.fetcher_manager.get_daily_data(
+                code,
+                days=min_days,
+                end_date=target.isoformat(),
+            )
             if df is not None and not df.empty:
                 self.db.save_daily_data(df, code, source)
                 logger.info("[%s] Prefetched %d rows of history for agent (source: %s)", code, len(df), source)
@@ -1295,7 +1517,10 @@ class StockAnalysisPipeline:
         market_phase_summary: Optional[Dict[str, Any]] = None,
         daily_market_context: Optional[DailyMarketContext] = None,
         portfolio_context: Optional[Dict[str, Any]] = None,
+        selection_context: Optional[Dict[str, Any]] = None,
         market_structure_context: Optional[Dict[str, Any]] = None,
+        paper_trading_style_context: Optional[Dict[str, Any]] = None,
+        style_indicator_snapshot: Optional[Dict[str, Any]] = None,
     ) -> Optional[AnalysisResult]:
         """
         使用 Agent 模式分析单只股票。
@@ -1324,12 +1549,18 @@ class StockAnalysisPipeline:
             }
             if isinstance(portfolio_context, dict):
                 initial_context["portfolio_context"] = dict(portfolio_context)
+            if isinstance(selection_context, dict):
+                initial_context["selection_context"] = dict(selection_context)
             if self.analysis_skills is not None:
                 initial_context["skills"] = self.analysis_skills
             if market_phase_context is not None:
                 initial_context["market_phase_context"] = market_phase_context
             if isinstance(market_structure_context, dict):
                 initial_context["market_structure_context"] = market_structure_context
+            if isinstance(paper_trading_style_context, dict):
+                initial_context["paper_trading_style_context"] = dict(paper_trading_style_context)
+            if isinstance(style_indicator_snapshot, dict):
+                initial_context["paper_trading_style_indicators"] = dict(style_indicator_snapshot)
             self._attach_daily_market_context(
                 initial_context,
                 daily_market_context,
@@ -1374,9 +1605,23 @@ class StockAnalysisPipeline:
                 logger.info(f"[{code}] Agent mode: local intelligence evidence injected into news_context")
 
             # Issue #1066: ensure deep history is in DB before agent tools run
-            self._ensure_agent_history(code)
+            agent_history_days = int(
+                paper_trading_style_context.get("settings", {}).get("analysis_window_sessions")
+                if isinstance(paper_trading_style_context, dict)
+                else 240
+            )
+            self._ensure_agent_history(code, min_days=max(240, agent_history_days))
 
-            analysis_context = self._load_agent_analysis_context(code, stock_name)
+            analysis_context = self._load_agent_analysis_context(
+                code,
+                stock_name,
+                paper_trading_style_context=paper_trading_style_context,
+                target_date=self._coerce_daily_market_context_date(
+                    market_phase_context.get("effective_daily_bar_date")
+                    if isinstance(market_phase_context, dict)
+                    else None
+                ),
+            )
             market = get_market_for_stock(normalize_stock_code(code))
             (
                 analysis_context_pack_summary,
@@ -1392,6 +1637,8 @@ class StockAnalysisPipeline:
                     query_id=query_id,
                     base_context=analysis_context,
                     portfolio_context=portfolio_context,
+                    paper_trading_style_context=paper_trading_style_context,
+                    style_indicator_snapshot=style_indicator_snapshot,
                 ),
                 report_language=report_language,
                 code=code,
@@ -1450,9 +1697,9 @@ class StockAnalysisPipeline:
             )
             if result:
                 result.query_id = query_id
-            # Agent weak integrity: placeholder fill only, no LLM retry
+            # Agent weak integrity: mark incomplete output as failed attempt.
             if result and getattr(self.config, "report_integrity_enabled", False):
-                from src.analyzer import check_content_integrity, apply_placeholder_fill
+                from src.analyzer import check_content_integrity
 
                 pass_integrity, missing = check_content_integrity(
                     result,
@@ -1460,13 +1707,33 @@ class StockAnalysisPipeline:
                 )
                 if not pass_integrity:
                     apply_placeholder_fill(result, missing)
-                    logger.info(
-                        "[LLM完整性] integrity_mode=agent_weak 必填字段缺失 %s，已占位补全",
-                        missing,
+                    pass_integrity, missing_after_fill = check_content_integrity(
+                        result,
+                        require_phase_decision=isinstance(market_phase_summary, dict),
                     )
+                    if not pass_integrity:
+                        result.success = False
+                        result.error_message = (
+                            "agent analysis report missing required fields: "
+                            + ",".join(missing_after_fill)
+                        )
+                        result.operation_advice = "分析失败"
+                        result.action = None
+                        result.action_label = None
+                        result.decision_type = "failed"
+                        logger.info(
+                            "[LLM完整性] integrity_mode=agent_weak 必填字段缺失 %s，占位补齐后仍不完整 %s，标记为失败尝试",
+                            missing,
+                            missing_after_fill,
+                        )
+                    else:
+                        logger.info(
+                            "[LLM完整性] integrity_mode=agent_weak 必填字段缺失 %s，已使用安全占位补齐",
+                            missing,
+                        )
             # chip_structure fallback (Issue #589), before save_analysis_history
             is_index_etf = bool(initial_context.get("is_index_etf", False))
-            if result and (chip_data is not None or is_index_etf):
+            if result and result.success and (chip_data is not None or is_index_etf):
                 normalize_chip_structure_availability(
                     result,
                     chip_data,
@@ -1475,7 +1742,7 @@ class StockAnalysisPipeline:
                 normalize_index_etf_checklist(result, is_index_etf=is_index_etf)
 
             # price_position fallback (same as non-agent path Step 7.7)
-            if result:
+            if result and result.success:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
                 realtime_data = initial_context.get("realtime_quote", {})
                 if isinstance(realtime_data, dict):
@@ -1510,6 +1777,7 @@ class StockAnalysisPipeline:
                     result.market_structure_context = market_structure_context
                 result.market_phase_summary = market_phase_summary
                 result.analysis_context_pack_overview = analysis_context_pack_overview
+                self._freeze_holding_state(result, portfolio_context)
                 self._refresh_decision_action_for_final_result(
                     result,
                     report_type=report_type.value,
@@ -1541,7 +1809,7 @@ class StockAnalysisPipeline:
                 except Exception as e:
                     logger.warning(f"[{code}] Agent 模式保存新闻情报失败: {e}")
 
-            # 保存分析历史记录
+            # 仅成功 Agent 报告进入分析历史；失败/降级尝试写 analysis_attempts。
             if result and result.success:
                 try:
                     agent_context_snapshot = self._build_context_snapshot(
@@ -1564,6 +1832,7 @@ class StockAnalysisPipeline:
                         news_content=None,
                         context_snapshot=agent_context_snapshot,
                         save_snapshot=self.save_context_snapshot,
+                        execution_intent=self._report_execution_intent(),
                     )
                     valid_saved_history_id = (
                         isinstance(saved_history_id, int)
@@ -1577,7 +1846,7 @@ class StockAnalysisPipeline:
                             saved_history_id if valid_saved_history_id else None
                         ),
                     )
-                    if valid_saved_history_id:
+                    if valid_saved_history_id and result.success:
                         self._extract_decision_signal_after_history_save(
                             result=result,
                             query_id=query_id,
@@ -1590,6 +1859,16 @@ class StockAnalysisPipeline:
                     if latest_diagnostic_snapshot is not None:
                         agent_context_snapshot["diagnostics"] = latest_diagnostic_snapshot
                         result.diagnostic_context_snapshot = agent_context_snapshot
+                    self._record_analysis_attempt(
+                        query_id=query_id,
+                        code=code,
+                        stock_name=resolved_stock_name,
+                        report_type=report_type,
+                        result=result,
+                        status="completed" if valid_saved_history_id else "degraded",
+                        error_message=None if valid_saved_history_id else "agent analysis report was generated but history save failed",
+                        analysis_history_id=saved_history_id if valid_saved_history_id else None,
+                    )
                 except Exception as e:
                     record_history_run(
                         report_saved=False,
@@ -1597,18 +1876,57 @@ class StockAnalysisPipeline:
                         error_message=e,
                     )
                     logger.warning(f"[{code}] 保存 Agent 分析历史失败: {e}")
+                    self._record_analysis_attempt(
+                        query_id=query_id,
+                        code=code,
+                        stock_name=resolved_stock_name,
+                        report_type=report_type,
+                        result=result,
+                        status="degraded",
+                        error_message=e,
+                    )
+            elif result:
+                self._record_analysis_attempt(
+                    query_id=query_id,
+                    code=code,
+                    stock_name=resolved_stock_name,
+                    report_type=report_type,
+                    result=result,
+                    status="failed",
+                    error_message=getattr(result, "error_message", None),
+                )
 
             return result
 
         except Exception as e:
             logger.error(f"[{code}] Agent 分析失败: {e}")
             logger.exception(f"[{code}] Agent 详细错误信息:")
+            self._record_analysis_attempt(
+                query_id=query_id,
+                code=code,
+                stock_name=stock_name,
+                report_type=report_type,
+                result=None,
+                status="failed",
+                error_message=e,
+            )
             return None
 
-    def _load_agent_analysis_context(self, code: str, stock_name: str) -> Dict[str, Any]:
+    def _load_agent_analysis_context(
+        self,
+        code: str,
+        stock_name: str,
+        *,
+        paper_trading_style_context: Optional[Dict[str, Any]] = None,
+        target_date: Optional[date] = None,
+    ) -> Dict[str, Any]:
         """Load daily-bar context for Agent pack summaries without blocking analysis."""
         try:
-            context = self._get_analysis_context_with_market_fallback(code)
+            context = self._get_analysis_context_with_market_fallback(
+                code,
+                paper_trading_style_context=paper_trading_style_context,
+                target_date=target_date,
+            )
         except Exception as exc:
             logger.warning(
                 "[%s] Agent analysis context load failed; daily_bars will be marked missing: %s",
@@ -1632,21 +1950,41 @@ class StockAnalysisPipeline:
             "yesterday": {},
         }
 
-    def _get_analysis_context_with_market_fallback(self, code: str) -> Optional[Dict[str, Any]]:
+    def _get_analysis_context_with_market_fallback(
+        self,
+        code: str,
+        *,
+        paper_trading_style_context: Optional[Dict[str, Any]] = None,
+        target_date: Optional[date] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Load analysis context, fetching JP/KR/TW daily bars when DB has no context."""
-        context = self.db.get_analysis_context(code)
-        if isinstance(context, dict) and context:
-            return context
-
+        from src.services.history_loader import get_frozen_target_date
         market = get_market_for_stock(normalize_stock_code(code))
-        if market not in {"jp", "kr", "tw"}:
+        target_date = target_date or get_frozen_target_date() or get_effective_trading_date(market)
+        context = self.db.get_analysis_context(code)
+        if isinstance(context, dict) and context and str(context.get('date', ''))[:10] == target_date.isoformat():
+            return context
+        if not market:
             return context
 
         try:
-            df, source_name = self.fetcher_manager.get_daily_data(code, days=60)
+            style_settings = (
+                paper_trading_style_context.get("settings", {})
+                if isinstance(paper_trading_style_context, dict)
+                else {}
+            )
+            fetch_days = int(style_settings.get("analysis_window_sessions") or 60)
+            df, source_name = self.fetcher_manager.get_daily_data(
+                code, days=fetch_days, end_date=target_date.isoformat()
+            )
         except Exception as exc:
-            logger.warning("[%s] JP/KR daily fallback fetch failed: %s", code, exc)
-            return context
+            logger.warning(
+                "[%s] Daily history refresh failed for target %s; stale cached context will not be used as current: %s",
+                code,
+                target_date,
+                exc,
+            )
+            return None
 
         if df is None or df.empty:
             logger.warning("[%s] JP/KR daily fallback returned empty data", code)
@@ -1655,12 +1993,115 @@ class StockAnalysisPipeline:
         try:
             self.db.save_daily_data(df, code, source_name)
             refreshed = self.db.get_analysis_context(code)
-            if isinstance(refreshed, dict) and refreshed:
+            if (
+                isinstance(refreshed, dict)
+                and refreshed
+                and str(refreshed.get('date', ''))[:10] == target_date.isoformat()
+            ):
                 return refreshed
         except Exception as exc:
             logger.warning("[%s] JP/KR daily fallback persistence failed: %s", code, exc)
 
         return self._build_analysis_context_from_daily_df(code, df)
+
+    def _paper_trading_style_context(
+        self,
+        code: str,
+        *,
+        market: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        resolved_market = market or get_market_for_stock(normalize_stock_code(code))
+        return resolve_paper_trading_style_context(
+            self.config,
+            market=resolved_market,
+            stock_code=normalize_stock_code(code),
+            base_style_override=getattr(self, "trading_style_override", None),
+        )
+
+    @staticmethod
+    def _style_history_calendar_days(window_sessions: int) -> int:
+        sessions = max(1, int(window_sessions or 1))
+        return max(30, int(math.ceil(sessions * 1.8)))
+
+    def _style_indicator_snapshot(
+        self,
+        df: pd.DataFrame,
+        paper_trading_style_context: Optional[Dict[str, Any]],
+        *, expected_bar_date: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if df is None or df.empty or not isinstance(paper_trading_style_context, dict):
+            return None
+        settings = paper_trading_style_context.get("settings")
+        if not isinstance(settings, dict):
+            return None
+        frame = df.copy()
+        frame.columns = [str(column).lower() for column in frame.columns]
+        if "date" in frame.columns:
+            frame['date'] = pd.to_datetime(frame['date'], errors='coerce').dt.normalize()
+            frame = frame.dropna(subset=['date']).sort_values('date').drop_duplicates('date', keep='last')
+        if frame.empty:
+            return None
+        if "close" not in frame.columns:
+            return None
+        closes = pd.to_numeric(frame["close"], errors="coerce")
+        closes = closes.where((closes > 0) & (closes < float('inf'))).dropna()
+        if closes.empty:
+            return None
+        latest_close_valid = frame.index[-1] in closes.index
+        ma_values: Dict[str, float] = {}
+        for raw_window in settings.get("core_ma_windows") or []:
+            try:
+                window = max(1, int(raw_window))
+            except (TypeError, ValueError):
+                continue
+            if len(closes) >= window:
+                ma_values[f"ma{window}"] = float(closes.tail(window).mean())
+        volatility_values: Dict[str, float] = {}
+        if {"high", "low"}.issubset(frame.columns):
+            high = pd.to_numeric(frame["high"], errors="coerce")
+            low = pd.to_numeric(frame["low"], errors="coerce")
+            close = pd.to_numeric(frame["close"], errors="coerce")
+            previous_close = close.shift(1)
+            true_range = pd.concat(
+                [
+                    (high - low).abs(),
+                    (high - previous_close).abs(),
+                    (low - previous_close).abs(),
+                ],
+                axis=1,
+            ).max(axis=1).dropna()
+            for raw_window in settings.get("volatility_windows") or []:
+                try:
+                    window = max(1, int(raw_window))
+                except (TypeError, ValueError):
+                    continue
+                if len(true_range) >= window:
+                    volatility_values[f"atr{window}"] = float(true_range.tail(window).mean())
+        return {
+            "trading_style": paper_trading_style_context.get("trading_style"),
+            "policy_version": paper_trading_style_context.get("policy_version"),
+            "analysis_window_sessions": settings.get("analysis_window_sessions"),
+            "core_ma_windows": list(settings.get("core_ma_windows") or []),
+            "volatility_windows": list(settings.get("volatility_windows") or []),
+            "bars_observed": int(len(closes)),
+            "history_sufficient": (
+                len(closes) >= int(settings.get("analysis_window_sessions") or 0)
+                and latest_close_valid
+                and (not expected_bar_date or (
+                    'date' in frame and str(frame.iloc[-1]['date'])[:10] == str(expected_bar_date)[:10]
+                ))
+            ),
+            "latest_bar_date": str(frame.iloc[-1].get('date', ''))[:10],
+            "expected_bar_date": expected_bar_date,
+            "moving_averages": ma_values,
+            "volatility": volatility_values,
+            "support": max(
+                (value for value in ma_values.values() if value <= float(closes.iloc[-1])),
+                default=None,
+            ),
+            "support_basis": "nearest_frozen_style_ma_at_or_below_close",
+            "source": "pipeline.style_indicator_snapshot",
+        }
 
     def _build_analysis_context_from_daily_df(self, code: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         if df is None or df.empty:
@@ -1991,13 +2432,31 @@ class StockAnalysisPipeline:
         previous_advice = str(previous_operation_advice or "").strip()
         current_advice = str(getattr(result, "operation_advice", None) or "").strip()
         explicit_action = current_advice if previous_advice != current_advice else None
-        return populate_decision_action_fields(
+        populate_decision_action_fields(
             result,
             explicit_action=explicit_action,
             report_type=report_type,
             use_existing_action=(previous_advice == current_advice),
-            align_with_score=(previous_advice == current_advice),
+            align_with_score=True,
         )
+        return apply_position_aware_result_contract(result, report_type=report_type)
+
+    @staticmethod
+    def _freeze_holding_state(
+        result: AnalysisResult,
+        portfolio_context: Optional[Dict[str, Any]],
+    ) -> None:
+        """Persist only the report-time holding state, never account details."""
+
+        state = "unknown"
+        if isinstance(portfolio_context, dict):
+            try:
+                quantity = float(portfolio_context.get("quantity"))
+                if math.isfinite(quantity):
+                    state = "holding" if abs(quantity) > 0 else "empty"
+            except (TypeError, ValueError):
+                pass
+        result.holding_state = state
 
     @staticmethod
     def _agent_dashboard_value(
@@ -2349,7 +2808,8 @@ class StockAnalysisPipeline:
             return "震荡整理 ↔️"
 
     def _augment_historical_with_realtime(
-        self, df: pd.DataFrame, realtime_quote: Any, code: str
+        self, df: pd.DataFrame, realtime_quote: Any, code: str,
+        *, market_phase_context: Optional[Dict[str, Any]] = None,
     ) -> pd.DataFrame:
         """
         使用当日实时行情补齐历史 OHLCV，用于盘中 MA 计算。
@@ -2358,6 +2818,12 @@ class StockAnalysisPipeline:
         if df is None or df.empty or 'close' not in df.columns:
             return df
         if realtime_quote is None:
+            return df
+        # Completed daily bars are authoritative after close/on non-trading days.
+        # A retrieval timestamp is not evidence of a new daily session.
+        if isinstance(market_phase_context, dict) and market_phase_context.get('phase') != 'intraday':
+            return df
+        if getattr(realtime_quote, 'is_stale', False) is True:
             return df
         price = getattr(realtime_quote, 'price', None)
         if price is None or not (isinstance(price, (int, float)) and price > 0):
@@ -2369,7 +2835,7 @@ class StockAnalysisPipeline:
         )
         if not enable_realtime_tech:
             return df
-        market = get_market_for_stock(code)
+        market = get_market_for_stock(normalize_stock_code(code))
         market_today = get_market_now(market).date()
         if market and not is_market_open(market, market_today):
             return df
@@ -2385,7 +2851,7 @@ class StockAnalysisPipeline:
         ) or yesterday_close
         high_p = getattr(realtime_quote, 'high', None) or price
         low_p = getattr(realtime_quote, 'low', None) or price
-        vol = getattr(realtime_quote, 'volume', None) or 0
+        vol = getattr(realtime_quote, 'volume', None)
         amt = getattr(realtime_quote, 'amount', None)
         pct = getattr(realtime_quote, 'change_pct', None)
 
@@ -2400,7 +2866,7 @@ class StockAnalysisPipeline:
                 df.loc[idx, 'high'] = high_p
             if low_p is not None:
                 df.loc[idx, 'low'] = low_p
-            if vol:
+            if vol is not None:
                 df.loc[idx, 'volume'] = vol
             if amt is not None:
                 df.loc[idx, 'amount'] = amt
@@ -2421,7 +2887,37 @@ class StockAnalysisPipeline:
             }
             new_df = pd.DataFrame([new_row])
             df = pd.concat([df, new_df], ignore_index=True)
+        # Provider frames use Timestamp; cached rows use date. Keep the appended
+        # session comparable to every historical row for downstream sorting.
+        df['date'] = pd.to_datetime(df['date']).dt.date
         return df
+
+    @staticmethod
+    def _validate_daily_comparison(context: Dict[str, Any]) -> None:
+        """Never label an arbitrary older cached bar as the previous session."""
+        today, previous = context.get('today') or {}, context.get('yesterday') or {}
+        if not today or not previous:
+            return
+        from src.core import trading_calendar as calendar
+        try:
+            market = get_market_for_stock(normalize_stock_code(context.get('code', '')))
+            exchange = calendar.MARKET_EXCHANGE.get(market)
+            if not calendar._XCALS_AVAILABLE or not exchange:
+                raise ValueError('calendar_unavailable')
+            cal = calendar.xcals.get_calendar(exchange)
+            current = pd.Timestamp(str(today.get('date'))[:10])
+            if not cal.is_session(current):
+                raise ValueError('bar_not_trading_session')
+            expected = cal.previous_session(current).date().isoformat()
+            if str(previous.get('date'))[:10] != expected:
+                raise ValueError('previous_session_missing')
+        except Exception as exc:
+            context.pop('volume_change_ratio', None)
+            context.pop('price_change_ratio', None)
+            context['daily_comparison_status'] = 'unavailable'
+            context['daily_comparison_reason'] = str(exc)
+            return
+        context['daily_comparison_status'] = 'ok'
 
     def _build_context_snapshot(
         self,
@@ -2460,6 +2956,72 @@ class StockAnalysisPipeline:
             snapshot["skills"] = list(self.analysis_skills)
         return snapshot
 
+    def _report_execution_intent(self) -> Dict[str, Any]:
+        intent = getattr(self, "execution_intent", None)
+        if isinstance(intent, dict):
+            return intent
+        return normalize_report_execution_intent(_DEFAULT_PIPELINE_EXECUTION_INTENT)
+
+    def _is_research_only_analysis(self) -> bool:
+        return (
+            self._report_execution_intent()["execution_intent"]
+            == REPORT_EXECUTION_INTENT_RESEARCH_ONLY
+        )
+
+    def _effective_portfolio_context_for_stock(self, code: str) -> Optional[Dict[str, Any]]:
+        """Prefer an explicit portfolio context; otherwise use the model's paper ledger.
+
+        Research-only analysis is account-agnostic and never reads a paper ledger.
+        """
+
+        if self._is_research_only_analysis():
+            return None
+        portfolio_context = getattr(self, "portfolio_context", None)
+        if isinstance(portfolio_context, dict):
+            control_metadata = portfolio_context.get("paper_trading")
+            has_frozen_holding = (
+                portfolio_context.get("quantity") is not None
+                or portfolio_context.get("holding_state") in {"holding", "empty"}
+                or portfolio_context.get("source") in {"paper_trading", "portfolio"}
+            )
+            if isinstance(control_metadata, dict) and not has_frozen_holding:
+                inferred = self._paper_portfolio_context_for_stock(code)
+                if isinstance(inferred, dict):
+                    return {
+                        **inferred,
+                        "disable_cross_model_fallback": bool(
+                            portfolio_context.get("disable_cross_model_fallback", True)
+                        ),
+                        "paper_trading": dict(control_metadata),
+                    }
+            return portfolio_context
+        return self._paper_portfolio_context_for_stock(code)
+
+    def _paper_portfolio_context_for_stock(self, code: str) -> Optional[Dict[str, Any]]:
+        """Use the current model's paper ledger as scheduled holding context."""
+
+        if not getattr(self.config, "paper_trading_enabled", False):
+            return None
+        model = str(getattr(self.config, "litellm_model", "") or "").strip()
+        if not model:
+            return None
+        try:
+            from src.services.paper_trading_service import PaperTradingService
+
+            return PaperTradingService.from_config(self.config).analysis_context_for_stock(
+                source_model=model,
+                stock_code=code,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Paper holding context unavailable: model=%s stock=%s error=%s",
+                model,
+                code,
+                exc,
+                exc_info=True,
+            )
+            return None
+
     def _extract_decision_signal_after_history_save(
         self,
         *,
@@ -2477,6 +3039,12 @@ class StockAnalysisPipeline:
             and not isinstance(source_report_id, bool)
             and source_report_id > 0
         )
+        if self._is_research_only_analysis():
+            logger.info(
+                "Research-only report skips DecisionSignal and paper reconcile: report_id=%s",
+                source_report_id,
+            )
+            return
 
         try:
             diagnostic_context = get_current_diagnostic_context()
@@ -2499,6 +3067,37 @@ class StockAnalysisPipeline:
                 summary = summarize_decision_signal(signal_result.get("item"))
                 if summary:
                     setattr(result, "decision_signal_summary", summary)
+                if getattr(self.config, "paper_trading_enabled", False):
+                    signal_item = signal_result.get("item")
+                    signal_id = (
+                        signal_item.get("id")
+                        if isinstance(signal_item, dict)
+                        else getattr(signal_item, "id", None)
+                    )
+                    try:
+                        from src.services.paper_trading_service import PaperTradingService
+
+                        paper_result = PaperTradingService.from_config(self.config).reconcile_report_execution_plan(
+                            source_report_id,
+                            decision_signal_id=(
+                                signal_id
+                                if isinstance(signal_id, int) and not isinstance(signal_id, bool)
+                                else None
+                            ),
+                        )
+                        logger.info(
+                            "Paper execution plan ready: report_id=%s created=%s executable=%s",
+                            source_report_id,
+                            paper_result.get("created"),
+                            paper_result.get("item", {}).get("executable"),
+                        )
+                    except Exception as paper_exc:
+                        logger.warning(
+                            "Paper execution plan skipped: report_id=%s error=%s",
+                            source_report_id,
+                            paper_exc,
+                            exc_info=True,
+                        )
         except Exception as exc:
             logger.warning(
                 "Decision signal extraction skipped after history save: query_id=%s stock_code=%s error=%s",
@@ -2654,7 +3253,17 @@ class StockAnalysisPipeline:
         news_result_count: Optional[int],
         query_id: str,
         portfolio_context: Optional[Dict[str, Any]] = None,
+        paper_trading_style_context: Optional[Dict[str, Any]] = None,
+        style_indicator_snapshot: Optional[Dict[str, Any]] = None,
     ) -> PipelineAnalysisArtifacts:
+        metadata = {
+            "query_id": query_id,
+            "trigger_source": self.query_source,
+        }
+        if isinstance(paper_trading_style_context, dict):
+            metadata["paper_trading_style_context"] = dict(paper_trading_style_context)
+        if isinstance(style_indicator_snapshot, dict):
+            metadata["paper_trading_style_indicators"] = dict(style_indicator_snapshot)
         return PipelineAnalysisArtifacts(
             code=code,
             stock_name=stock_name,
@@ -2668,10 +3277,7 @@ class StockAnalysisPipeline:
             fundamental_context=fundamental_context,
             news_context=news_context,
             news_result_count=news_result_count,
-            metadata={
-                "query_id": query_id,
-                "trigger_source": self.query_source,
-            },
+            metadata=metadata,
             portfolio_context=dict(portfolio_context) if isinstance(portfolio_context, dict) else None,
         )
 
@@ -2687,6 +3293,8 @@ class StockAnalysisPipeline:
         query_id: str,
         base_context: Optional[Dict[str, Any]] = None,
         portfolio_context: Optional[Dict[str, Any]] = None,
+        paper_trading_style_context: Optional[Dict[str, Any]] = None,
+        style_indicator_snapshot: Optional[Dict[str, Any]] = None,
     ) -> PipelineAnalysisArtifacts:
         context_candidate = base_context
         if not isinstance(context_candidate, dict):
@@ -2705,6 +3313,14 @@ class StockAnalysisPipeline:
                 "yesterday": {},
             }
 
+        metadata = {
+            "query_id": query_id,
+            "trigger_source": self.query_source,
+        }
+        if isinstance(paper_trading_style_context, dict):
+            metadata["paper_trading_style_context"] = dict(paper_trading_style_context)
+        if isinstance(style_indicator_snapshot, dict):
+            metadata["paper_trading_style_indicators"] = dict(style_indicator_snapshot)
         return PipelineAnalysisArtifacts(
             code=code,
             stock_name=stock_name,
@@ -2718,10 +3334,7 @@ class StockAnalysisPipeline:
             fundamental_context=fundamental_context,
             news_context=initial_context.get("news_context"),
             news_result_count=None,
-            metadata={
-                "query_id": query_id,
-                "trigger_source": self.query_source,
-            },
+            metadata=metadata,
             portfolio_context=dict(portfolio_context) if isinstance(portfolio_context, dict) else None,
         )
 
@@ -2762,6 +3375,54 @@ class StockAnalysisPipeline:
         P4 stores only the separately rendered public overview at snapshot top level.
         """
         sanitized = dict(context)
+        portfolio_context = sanitized.get("portfolio_context")
+        if isinstance(portfolio_context, dict) and portfolio_context.get("source") == "paper_trading":
+            allowed = {
+                "source",
+                "source_model",
+                "market",
+                "stock_code",
+                "stock_name",
+                "quantity",
+                "total_quantity",
+                "available_quantity",
+                "frozen_quantity",
+                "avg_cost",
+                "weighted_average_price",
+                "total_cost",
+                "lot_count",
+                "holding_state",
+                "sync_origin",
+                "sync_status",
+                "capital_account_id",
+                "cash",
+                "book_equity",
+                "exposure",
+                "total_exposure_pct",
+                "symbol_concentration_pct",
+                "opened_on",
+                "earliest_opened_on",
+                "latest_opened_on",
+                "stop_loss",
+                "target_price",
+                "stop_loss_lots",
+                "target_price_lots",
+                "currency",
+                "latest_price",
+                "observed_at",
+                "market_value",
+                "mark_source",
+                "mark_stale",
+                "valuation_complete",
+                "unrealized_pnl",
+                "unrealized_return_pct",
+                "context_frozen_at",
+            }
+            sanitized["paper_holding_context"] = {
+                key: portfolio_context.get(key)
+                for key in sorted(allowed)
+                if key in portfolio_context
+            }
         sanitized.pop("market_phase_context", None)
         sanitized.pop("portfolio_context", None)
         sanitized.pop("analysis_context_pack", None)
@@ -2956,6 +3617,7 @@ class StockAnalysisPipeline:
         send_notification: bool = True,
         merge_notification: bool = False,
         current_time: Optional[datetime] = None,
+        save_local_report: bool = True,
     ) -> List[AnalysisResult]:
         """
         运行完整的分析流程
@@ -2972,6 +3634,7 @@ class StockAnalysisPipeline:
             send_notification: 是否发送推送通知
             merge_notification: 是否合并推送（跳过本次推送，由 main 层合并个股+大盘后统一发送，Issue #190）
             current_time: 本轮运行冻结的参考时间；为空时在 run 内生成
+            save_local_report: 是否由流水线保存默认日报文件
 
         Returns:
             分析结果列表
@@ -3109,7 +3772,7 @@ class StockAnalysisPipeline:
         logger.info(f"成功: {success_count}, 失败: {fail_count}, 耗时: {elapsed_time:.2f} 秒")
         
         # 保存报告到本地文件（无论是否推送通知都保存）
-        if results and not dry_run:
+        if results and not dry_run and save_local_report:
             self._save_local_report(results, report_type)
 
         # 发送通知（单股推送模式下跳过汇总推送，避免重复）
@@ -3230,7 +3893,16 @@ class StockAnalysisPipeline:
         """保存分析报告到本地文件（与通知推送解耦）"""
         try:
             report = self._generate_aggregate_report(results, report_type)
-            filepath = self.notifier.save_report_to_file(report)
+            filename = None
+            suffix = str(
+                getattr(self.config, "report_filename_suffix", "") or ""
+            ).strip()
+            if suffix:
+                safe_suffix = re.sub(r"[^A-Za-z0-9._-]+", "_", suffix).strip("._-")
+                safe_suffix = safe_suffix or "model"
+                date_str = datetime.now().strftime("%Y%m%d")
+                filename = f"report_{date_str}_{safe_suffix}.md"
+            filepath = self.notifier.save_report_to_file(report, filename)
             logger.info(f"决策仪表盘日报已保存: {filepath}")
         except Exception as e:
             logger.error(f"保存本地报告失败: {e}")

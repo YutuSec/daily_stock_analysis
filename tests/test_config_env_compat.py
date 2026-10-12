@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Tests for backward-compatible config env aliases and TickFlow loading."""
 
+import logging
 import os
 import tempfile
 import unittest
@@ -162,6 +163,84 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         self.assertEqual(config.generation_backend_max_concurrency, 2)
         self.assertEqual(config.local_cli_backend_max_concurrency, 1)
         self.assertEqual(config.agent_generation_backend, "codex_cli")
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_market_opportunity_defaults_to_off_and_parses_limits(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "MARKET_OPPORTUNITY_MODE": " observe ",
+                "MARKET_OPPORTUNITY_MAX_THEMES": "4",
+                "MARKET_OPPORTUNITY_MAX_CANDIDATES_PER_THEME": "2",
+                "MARKET_OPPORTUNITY_MAX_TOTAL_CANDIDATES": "6",
+                "MARKET_OPPORTUNITY_MAX_OBSERVATION_CANDIDATES": "30",
+                "MARKET_OPPORTUNITY_MAX_LLM_CALLS_PER_RUN": "12",
+                "MARKET_OPPORTUNITY_MIN_20D_AVG_AMOUNT_CNY": "200000000",
+                "MARKET_OPPORTUNITY_BLACKLIST": " 688001.SH, 高风险主题 ",
+                "MARKET_OPPORTUNITY_OBSERVE_GATE_DAYS": "5",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.market_opportunity_mode, "observe")
+        self.assertEqual(config.market_opportunity_max_themes, 4)
+        self.assertEqual(config.market_opportunity_max_candidates_per_theme, 2)
+        self.assertEqual(config.market_opportunity_max_total_candidates, 6)
+        self.assertEqual(config.market_opportunity_max_observation_candidates, 30)
+        self.assertEqual(config.market_opportunity_max_llm_calls_per_run, 12)
+        self.assertEqual(config.market_opportunity_min_20d_avg_amount_cny, 200000000)
+        self.assertEqual(config.market_opportunity_blacklist, ["688001.sh", "高风险主题"])
+        self.assertEqual(config.market_opportunity_observe_gate_days, 5)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_market_opportunity_invalid_mode_fails_closed_to_off(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "MARKET_OPPORTUNITY_MODE": "paper-now",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.market_opportunity_mode, "off")
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_market_opportunity_run_time_keeps_inline_run_for_empty_or_invalid_values(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        cases = {
+            " 20:30 ": "20:30",
+            "00:05": "00:05",
+            "": "",
+            "8:00": "",
+            "24:00": "",
+            "20:30:00": "",
+            "evening": "",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                with patch.dict(
+                    os.environ,
+                    {"STOCK_LIST": "600519", "MARKET_OPPORTUNITY_RUN_TIME": raw},
+                    clear=True,
+                ), self.assertLogs("src.config", level="WARNING") as captured:
+                    config = Config._load_from_env()
+                    logging.getLogger("src.config").warning("sentinel")
+
+                self.assertEqual(config.market_opportunity_run_time, expected)
+                rejected = any("MARKET_OPPORTUNITY_RUN_TIME" in line for line in captured.output)
+                self.assertEqual(rejected, bool(raw.strip()) and not expected)
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])

@@ -9,7 +9,7 @@ import threading
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -218,6 +218,24 @@ class TestPipelineSingleStockNotify(unittest.TestCase):
         self.assertFalse(result.success)
         pipeline.notifier.generate_brief_report.assert_not_called()
         pipeline.notifier.send.assert_not_called()
+
+    @patch("src.core.pipeline.datetime")
+    def test_save_local_report_uses_safe_model_suffix(self, datetime_mock):
+        datetime_mock.now.return_value.strftime.return_value = "20260820"
+        pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.config = SimpleNamespace(
+            report_filename_suffix="anthropic/claude-sonnet-5"
+        )
+        pipeline.notifier = MagicMock()
+        pipeline.notifier.save_report_to_file.return_value = "/tmp/report.md"
+        pipeline._generate_aggregate_report = MagicMock(return_value="report")
+
+        pipeline._save_local_report([_make_result("600519")], ReportType.SIMPLE)
+
+        pipeline.notifier.save_report_to_file.assert_called_once_with(
+            "report",
+            "report_20260820_anthropic_claude-sonnet-5.md",
+        )
 
 
 if __name__ == "__main__":

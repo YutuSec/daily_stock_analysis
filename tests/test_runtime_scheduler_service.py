@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -86,6 +87,14 @@ class _SynchronousThread(_NoopThread):
             self.target()
 
 
+class _DailyTaskSynchronousThread(_NoopThread):
+    """Run only the finite daily worker; keep the scheduler loop dormant."""
+
+    def start(self):
+        if str(self.kwargs.get("name") or "").startswith("scheduler-daily-analysis") and self.target is not None:
+            self.target()
+
+
 class RuntimeSchedulerServiceTestCase(unittest.TestCase):
     def test_run_analysis_args_include_workers(self) -> None:
         config = SimpleNamespace(
@@ -109,6 +118,107 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
         self.assertEqual(len(seen_args), 1)
         self.assertTrue(hasattr(seen_args[0], "workers"))
         self.assertIsNone(seen_args[0].workers)
+
+    def test_status_includes_shared_authoritative_task_states(self) -> None:
+        config = SimpleNamespace(
+            schedule_enabled=True,
+            schedule_time="18:00",
+            schedule_times=["18:00"],
+        )
+        shared = {
+            "available": True,
+            "fresh": True,
+            "tasks": {
+                "paper_trading_intraday_monitor": {
+                    "heartbeat": {"fresh": True, "status": "alive"},
+                    "lease": {"active": True, "owner_id": "owner-a"},
+                }
+            },
+        }
+        service = RuntimeSchedulerService(config_provider=lambda: config)
+        with patch.dict(sys.modules, {
+            "src.services.scheduler_heartbeat": SimpleNamespace(scheduler_task_states=lambda: shared)
+        }):
+            status = service.status()
+
+        self.assertEqual(status["shared_scheduler"], shared)
+        self.assertIn("paper_trading_intraday_monitor", status["shared_scheduler_tasks"])
+
+    def test_status_preserves_idle_enabled_shared_task_heartbeat(self) -> None:
+        config = SimpleNamespace(
+            schedule_enabled=True,
+            schedule_time="18:00",
+            schedule_times=["15:10"],
+        )
+        shared = {
+            "available": True,
+            "fresh": True,
+            "tasks": {
+                "daily_analysis:15:10": {
+                    "heartbeat": {
+                        "fresh": True,
+                        "status": "idle",
+                        "owner_kind": "runtime_scheduler",
+                        "owner_id": "owner-idle",
+                        "details": {"enabled": True, "running": False},
+                    }
+                }
+            },
+        }
+        service = RuntimeSchedulerService(config_provider=lambda: config)
+        with patch.dict(sys.modules, {
+            "src.services.scheduler_heartbeat": SimpleNamespace(scheduler_task_states=lambda: shared)
+        }):
+            status = service.status()
+
+        task = status["shared_scheduler_tasks"]["daily_analysis:15:10"]["heartbeat"]
+        self.assertEqual(task["status"], "idle")
+        self.assertTrue(task["fresh"])
+        self.assertTrue(task["details"]["enabled"])
+        self.assertFalse(task["details"]["running"])
+
+    def test_scheduler_task_bucket_claim_is_atomic_across_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, {
+            "DATABASE_PATH": str(Path(tmpdir) / "scheduler-lease.db"),
+        }, clear=False):
+            os.environ.pop("DSA_SCHEDULER_OWNER_ID", None)
+            from src.config import Config
+            from src.storage import DatabaseManager
+            from src.services.scheduler_heartbeat import (
+                claim_scheduler_task_bucket,
+                finish_scheduler_task_lease,
+                scheduler_task_states,
+            )
+
+            Config.reset_instance()
+            DatabaseManager.reset_instance()
+            bucket = datetime(2026, 8, 29, 1, 30)
+
+            def claim(owner_kind: str):
+                return claim_scheduler_task_bucket(
+                    task_name="paper_trading_intraday_monitor",
+                    bucket_started_at=bucket,
+                    lease_seconds=300,
+                    owner_kind=owner_kind,
+                )
+
+            try:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    results = list(pool.map(claim, ["owner-a", "owner-b"]))
+                self.assertEqual(sum(1 for item in results if item["claimed"]), 1)
+                winner = next(item for item in results if item["claimed"])
+                finish_scheduler_task_lease(lease_key=winner["lease_key"], status="succeeded")
+                replay = claim("owner-c")
+                self.assertFalse(replay["claimed"])
+                states = scheduler_task_states()
+                self.assertIn("paper_trading_intraday_monitor", states["tasks"])
+                self.assertEqual(
+                    states["tasks"]["paper_trading_intraday_monitor"]["lease"]["status"],
+                    "succeeded",
+                )
+            finally:
+                DatabaseManager.reset_instance()
+                Config.reset_instance()
 
     def test_run_analysis_args_preserve_startup_schedule_flags(self) -> None:
         config = SimpleNamespace(
@@ -160,7 +270,7 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
         service._reload_config = lambda: config
 
         with patch("main.run_full_analysis", return_value=False) as run_full_analysis:
-            service._run_analysis_once()
+            self.assertFalse(service._run_analysis_once())
 
         run_full_analysis.assert_called_once()
         self.assertTrue(run_full_analysis.call_args.kwargs["raise_errors"])
@@ -281,8 +391,8 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
 
         with patch.dict(sys.modules, {"schedule": fake_schedule}), patch(
             "src.services.runtime_scheduler.threading.Thread",
-            _NoopThread,
-        ):
+            _DailyTaskSynchronousThread,
+        ), patch("src.scheduler.Scheduler._claim_shared_lease", return_value={"claimed": True}):
             service.reconcile_from_config()
             old_jobs = fake_schedule.get_jobs()
             self.assertEqual([job.at_time for job in old_jobs], ["09:20"])
@@ -317,8 +427,8 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
 
         with patch.dict(sys.modules, {"schedule": fake_schedule}), patch(
             "src.services.runtime_scheduler.threading.Thread",
-            _NoopThread,
-        ):
+            _DailyTaskSynchronousThread,
+        ), patch("src.scheduler.Scheduler._claim_shared_lease", return_value={"claimed": True}):
             service.reconcile_from_config(run_immediately=True)
             config.schedule_times = ["15:10"]
             service.reconcile_from_config()
@@ -344,12 +454,14 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
                 interval_seconds: int,
                 run_immediately: bool,
                 name: str | None = None,
+                **kwargs,
             ) -> None:
                 self.background_tasks.append({
                     "task": task,
                     "interval_seconds": interval_seconds,
                     "run_immediately": run_immediately,
                     "name": name,
+                    **kwargs,
                 })
 
             def run(self) -> None:
@@ -396,12 +508,42 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
 
         scheduler = service._scheduler
         self.assertIsNotNone(scheduler)
-        self.assertEqual(len(scheduler.background_tasks), 1)  # type: ignore[attr-defined]
-        self.assertEqual(scheduler.background_tasks[0]["name"], "agent_event_monitor")  # type: ignore[index]
-        self.assertEqual(scheduler.background_tasks[0]["interval_seconds"], 7 * 60)  # type: ignore[index]
-        self.assertEqual(scheduler.background_tasks[0]["run_immediately"], True)  # type: ignore[index]
-        scheduler.background_tasks[0]["task"]()  # type: ignore[index]
+        event_tasks = [
+            task for task in scheduler.background_tasks  # type: ignore[attr-defined]
+            if task["name"] == "agent_event_monitor"
+        ]
+        paper_tasks = [
+            task for task in scheduler.background_tasks  # type: ignore[attr-defined]
+            if task["name"] == "paper_trading_intraday_monitor"
+        ]
+        self.assertEqual(len(event_tasks), 1)
+        self.assertEqual(len(paper_tasks), 1)
+        self.assertEqual(event_tasks[0]["interval_seconds"], 7 * 60)
+        self.assertEqual(event_tasks[0]["run_immediately"], True)
+        self.assertEqual(paper_tasks[0]["interval_seconds"], 5 * 60)
+        self.assertEqual(paper_tasks[0]["run_immediately"], False)
+        event_tasks[0]["task"]()
         fake_worker.run_once.assert_called_once()
+        with patch("main._build_paper_trading_service") as build_service:
+            paper_tasks[0]["task"]()
+        build_service.assert_not_called()
+        evening_tasks = [
+            task for task in scheduler.background_tasks  # type: ignore[attr-defined]
+            if task["name"] == "market_opportunity_evening_run"
+        ]
+        self.assertEqual(len(evening_tasks), 1)
+        self.assertEqual(evening_tasks[0]["interval_seconds"], 5 * 60)
+        self.assertEqual(evening_tasks[0]["run_immediately"], False)
+        self.assertEqual(evening_tasks[0]["active_time_start"], "15:00:00")
+        self.assertEqual(evening_tasks[0]["active_time_end"], "23:59:59")
+        self.assertEqual(evening_tasks[0]["active_timezone"], "Asia/Shanghai")
+        self.assertEqual(evening_tasks[0]["lease_task_name"], "market_opportunity_evening_run")
+        # Registered unconditionally; the reloaded config keeps it dormant
+        # until MARKET_OPPORTUNITY_RUN_TIME is set.
+        self.assertEqual(
+            evening_tasks[0]["task"](),
+            {"status": "skipped", "reason": "evening_run_disabled"},
+        )
 
     def test_rebuild_reuses_event_monitor_without_immediate_rerun(self) -> None:
         schedulers = []
@@ -425,12 +567,14 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
                 interval_seconds: int,
                 run_immediately: bool,
                 name: str | None = None,
+                **kwargs,
             ) -> None:
                 self.background_tasks.append({
                     "task": task,
                     "interval_seconds": interval_seconds,
                     "run_immediately": run_immediately,
                     "name": name,
+                    **kwargs,
                 })
 
             def run(self) -> None:

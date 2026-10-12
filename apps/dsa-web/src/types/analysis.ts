@@ -22,6 +22,20 @@ export interface AnalysisRequest {
   notify?: boolean;
   skills?: string[];
   reportLanguage?: ReportLanguage;
+  model?: string;
+  models?: string[];
+}
+
+export interface AnalysisModelInfo {
+  model: string;
+  isDefault: boolean;
+}
+
+export interface AnalysisModelsResponse {
+  models: AnalysisModelInfo[];
+  defaultModel?: string;
+  comparisonAvailable: boolean;
+  supportedMarkets?: string[];
 }
 
 export interface MarketReviewRequest {
@@ -107,6 +121,8 @@ export interface ReportSummary {
   operationAdvice: string;
   action?: DecisionAction | null;
   actionLabel?: string | null;
+  analysisStatus?: 'success' | 'failed' | 'degraded';
+  errorMessage?: string | null;
   trendPrediction: string;
   sentimentScore: number;
   sentimentLabel?: SentimentLabel;
@@ -423,6 +439,7 @@ export interface TaskAccepted {
   status: 'pending' | 'processing';
   message?: string;
   analysisPhase?: AnalysisPhase;
+  model?: string;
 }
 
 export interface BatchTaskAcceptedItem {
@@ -432,12 +449,14 @@ export interface BatchTaskAcceptedItem {
   status: 'pending' | 'processing';
   message?: string;
   analysisPhase?: AnalysisPhase;
+  model?: string;
 }
 
 export interface BatchDuplicateTaskItem {
   stockCode: string;
   existingTaskId: string;
   message: string;
+  model?: string;
 }
 
 export interface BatchTaskAcceptedResponse {
@@ -465,6 +484,7 @@ export interface TaskStatus {
   selectionSource?: string;
   analysisPhase?: AnalysisPhase | null;
   skills?: string[];
+  model?: string;
 }
 
 /** Task details used by task list and SSE events */
@@ -485,6 +505,7 @@ export interface TaskInfo {
   selectionSource?: string;
   analysisPhase?: AnalysisPhase;
   skills?: string[];
+  model?: string;
 }
 
 /** Task list response */
@@ -518,6 +539,8 @@ export interface HistoryItem {
   operationAdvice?: string;
   action?: DecisionAction | null;
   actionLabel?: string | null;
+  analysisStatus?: 'success' | 'failed' | 'degraded';
+  errorMessage?: string | null;
   currentPrice?: number;
   changePct?: number;
   volumeRatio?: number;
@@ -560,6 +583,7 @@ export interface NewsIntelResponse {
 export interface HistoryFilters {
   stockCode?: string;
   reportType?: ReportType;
+  modelUsed?: string;
   startDate?: string;
   endDate?: string;
 }
@@ -581,6 +605,10 @@ export interface StockBarItem {
   operationAdvice?: string;
   action?: DecisionAction | null;
   actionLabel?: string | null;
+  analysisStatus?: 'completed' | 'failed' | 'degraded' | 'stale_success';
+  latestAttemptTime?: string | null;
+  latestAttemptError?: string | null;
+  lastSuccessTime?: string | null;
   analysisCount: number;
   lastAnalysisTime?: string;
   modelUsed?: string;

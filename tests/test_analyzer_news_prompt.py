@@ -105,7 +105,7 @@ class AnalyzerNewsPromptTestCase(unittest.TestCase):
         self.assertNotIn("专注于趋势交易", prompt)
         self.assertNotIn("多头排列：MA5 > MA10 > MA20", prompt)
 
-    def test_analysis_prompt_keeps_injected_default_policy_for_implicit_default_run(self) -> None:
+    def test_analysis_prompt_keeps_compatible_default_policy_for_implicit_default_run(self) -> None:
         with patch.object(GeminiAnalyzer, "_init_litellm", return_value=None):
             analyzer = GeminiAnalyzer(
                 skill_instructions="### 技能 1: 默认多头趋势",
@@ -116,8 +116,11 @@ class AnalyzerNewsPromptTestCase(unittest.TestCase):
         prompt = analyzer._get_analysis_system_prompt("zh", stock_code="600519")
 
         self.assertIn("专注于趋势交易", prompt)
-        self.assertIn("多头排列必须条件", prompt)
-        self.assertIn("多头排列：MA5 > MA10 > MA20", prompt)
+        self.assertIn("默认技能基线（无显式风格时适用）", prompt)
+        self.assertIn("MA5/MA10/MA20 多头排列是短周期趋势参考", prompt)
+        self.assertNotIn("多头排列必须条件", prompt)
+        self.assertNotIn("多头排列：MA5 > MA10 > MA20", prompt)
+        self.assertIn("`confidence_level` 必须只填写单独标签", prompt)
 
     def test_analysis_prompt_requires_phase_decision_in_main_and_legacy_modes(self) -> None:
         for legacy in (False, True):
@@ -146,6 +149,22 @@ class AnalyzerNewsPromptTestCase(unittest.TestCase):
         self.assertIn("不得仅因为单日涨跌", prompt)
         self.assertIn("支撑/压力位", prompt)
         self.assertIn("洗盘观察", prompt)
+
+    def test_analysis_prompt_requires_a_single_json_output_envelope(self) -> None:
+        expected_markers = {
+            "zh": ("整个回复必须且只能是一个 JSON 对象", "JSON 对象前后不得添加"),
+            "en": ("entire response must be exactly one JSON object", "Do not add Markdown fences"),
+            "ko": ("전체 응답은 정확히 하나의 JSON 객체", "Markdown 코드 펜스"),
+        }
+
+        with patch.object(GeminiAnalyzer, "_init_litellm", return_value=None):
+            analyzer = GeminiAnalyzer()
+
+        for language, markers in expected_markers.items():
+            with self.subTest(language=language):
+                prompt = analyzer._get_analysis_system_prompt(language, stock_code="600519")
+                for marker in markers:
+                    self.assertIn(marker, prompt)
 
     def test_analysis_prompt_score_scale_splits_reduce_and_sell_bands(self) -> None:
         for legacy in (False, True):

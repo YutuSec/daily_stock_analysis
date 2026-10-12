@@ -160,7 +160,8 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
         self.assertEqual(context["yesterday"]["close"], 2810.0)
         self.assertEqual(context["price_change_ratio"], -0.59)
         self.assertEqual(context["ma_status"], "短期向好")
-        pipeline.fetcher_manager.get_daily_data.assert_called_once_with("7203.T", days=60)
+        from unittest.mock import ANY
+        pipeline.fetcher_manager.get_daily_data.assert_called_once_with("7203.T", days=60, end_date=ANY)
         pipeline.db.save_daily_data.assert_called_once_with(daily_df, "7203.T", "YfinanceFetcher")
 
     def test_process_single_stock_propagates_current_time_to_analyze_stock(self):
@@ -260,6 +261,120 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
         self.assertNotIn("portfolio_context", snapshot["enhanced_context"])
         self.assertNotIn("daily_market_context_summary", snapshot["enhanced_context"])
         self.assertNotIn("avg_cost", str(snapshot))
+
+    def test_context_snapshot_keeps_safe_paper_holding_metadata(self):
+        pipeline = _make_pipeline(agent_mode=False, save_context_snapshot=True)
+
+        snapshot = pipeline._build_context_snapshot(
+            enhanced_context={
+                "code": "600519",
+                "portfolio_context": {
+                    "source": "paper_trading",
+                    "source_model": "model-a",
+                    "quantity": 1500,
+                    "total_quantity": 1500,
+                    "avg_cost": 39.33,
+                    "weighted_average_price": 39.33,
+                    "total_cost": 58995,
+                    "lot_count": 3,
+                    "sync_origin": "portfolio_import",
+                    "sync_status": "synced_from_portfolio",
+                    "capital_account_id": 3,
+                    "cash": 40930,
+                    "book_equity": 99925,
+                    "exposure": 58995,
+                    "symbol_concentration_pct": 59.04,
+                    "total_exposure_pct": 59.04,
+                    "opened_on": "2026-08-24",
+                    "stop_loss": 35,
+                    "target_price": 42,
+                    "stop_loss_lots": [{"position_id": 11, "quantity": 500, "stop_loss": 35}],
+                    "market_value": 58920,
+                    "unrealized_pnl": -75,
+                    "valuation_complete": True,
+                    "api_key": "must-not-persist",
+                },
+            },
+            news_content=None,
+            realtime_quote=None,
+            chip_data=None,
+        )
+
+        self.assertNotIn("portfolio_context", snapshot["enhanced_context"])
+        self.assertEqual(snapshot["enhanced_context"]["paper_holding_context"]["source_model"], "model-a")
+        self.assertEqual(snapshot["enhanced_context"]["paper_holding_context"]["sync_status"], "synced_from_portfolio")
+        self.assertEqual(snapshot["enhanced_context"]["paper_holding_context"]["quantity"], 1500)
+        self.assertEqual(snapshot["enhanced_context"]["paper_holding_context"]["lot_count"], 3)
+        self.assertEqual(snapshot["enhanced_context"]["paper_holding_context"]["cash"], 40930)
+        self.assertEqual(snapshot["enhanced_context"]["paper_holding_context"]["symbol_concentration_pct"], 59.04)
+        self.assertNotIn("api_key", str(snapshot))
+
+    def test_effective_portfolio_context_prefers_explicit_context(self):
+        pipeline = _make_pipeline(agent_mode=False, save_context_snapshot=True)
+        explicit_context = {"source": "portfolio", "quantity": 88}
+        pipeline.portfolio_context = explicit_context
+
+        with patch.object(
+            pipeline,
+            "_paper_portfolio_context_for_stock",
+            return_value={"source": "paper_trading", "quantity": 10},
+        ) as paper_context:
+            result = pipeline._effective_portfolio_context_for_stock("600519")
+
+        self.assertIs(result, explicit_context)
+        paper_context.assert_not_called()
+
+    def test_effective_portfolio_context_uses_paper_ledger_when_no_explicit_context(self):
+        pipeline = _make_pipeline(agent_mode=False, save_context_snapshot=True)
+        paper_context_value = {
+            "source": "paper_trading",
+            "source_model": "model-a",
+            "holding_state": "empty",
+            "cash": 80000,
+        }
+
+        with patch.object(
+            pipeline,
+            "_paper_portfolio_context_for_stock",
+            return_value=paper_context_value,
+        ) as paper_context:
+            result = pipeline._effective_portfolio_context_for_stock("600519")
+
+        self.assertEqual(result, paper_context_value)
+        paper_context.assert_called_once_with("600519")
+
+    def test_effective_portfolio_context_merges_reanalysis_controls_into_paper_holding(self):
+        pipeline = _make_pipeline(agent_mode=False, save_context_snapshot=True)
+        pipeline.portfolio_context = {
+            "disable_cross_model_fallback": True,
+            "paper_trading": {
+                "same_session_reanalysis": True,
+                "source_plan_id": 19,
+                "trigger_type": "opening_confirmation_deviation",
+            },
+        }
+        paper_context_value = {
+            "source": "paper_trading",
+            "source_model": "model-a",
+            "holding_state": "holding",
+            "quantity": 1000,
+            "lot_count": 2,
+        }
+
+        with patch.object(
+            pipeline,
+            "_paper_portfolio_context_for_stock",
+            return_value=paper_context_value,
+        ) as paper_context:
+            result = pipeline._effective_portfolio_context_for_stock("002714")
+
+        self.assertEqual(result["source"], "paper_trading")
+        self.assertEqual(result["source_model"], "model-a")
+        self.assertEqual(result["holding_state"], "holding")
+        self.assertEqual(result["quantity"], 1000)
+        self.assertTrue(result["disable_cross_model_fallback"])
+        self.assertEqual(result["paper_trading"]["source_plan_id"], 19)
+        paper_context.assert_called_once_with("002714")
 
     def test_agent_analysis_artifacts_helper_maps_initial_context_zero_fetch(self):
         pipeline = _make_pipeline(agent_mode=True, save_context_snapshot=True)
@@ -564,9 +679,9 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
         pipeline.db.get_analysis_context.return_value = {
             "code": "600519",
             "stock_name": "贵州茅台",
-            "date": "2026-06-02",
-            "today": {"date": "2026-06-02", "close": 6.67, "volume": 1000.0},
-            "yesterday": {"date": "2026-06-01", "close": 6.78, "volume": 900.0},
+            "date": "2026-03-26",
+            "today": {"date": "2026-03-26", "close": 6.67, "volume": 1000.0},
+            "yesterday": {"date": "2026-03-25", "close": 6.78, "volume": 900.0},
         }
 
         from src.agent.executor import AgentResult
@@ -600,7 +715,7 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
             )
 
         self.assertIsNotNone(result)
-        pipeline._ensure_agent_history.assert_called_once_with("600519")
+        pipeline._ensure_agent_history.assert_called_once_with("600519", min_days=240)
         pipeline.db.get_analysis_context.assert_called_with("600519")
 
         run_context = executor.run.call_args.kwargs["context"]

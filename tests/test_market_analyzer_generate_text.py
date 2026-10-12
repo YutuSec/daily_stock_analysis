@@ -2048,6 +2048,106 @@ class TestAnalyzerGenerateText:
         assert "补全重试" in progress_updates[2][1]
         assert "解析 JSON" in progress_updates[3][1]
 
+    def test_analyze_official_deepseek_integrity_retry_stays_on_responses_schema(self):
+        from src.analyzer import GeminiAnalyzer
+        from src.config import Config
+
+        analyzer = self._make_analyzer()
+        analyzer._config_override = Config(
+            generation_backend="litellm",
+            litellm_model="deepseek/deepseek-v4-pro",
+            litellm_fallback_models=["anthropic/claude-sonnet-5"],
+            llm_model_list=[],
+            deepseek_api_keys=["test-deepseek-key"],
+            gemini_request_delay=0,
+            llm_temperature=0.7,
+            report_language="zh",
+            report_integrity_enabled=True,
+            report_integrity_retry=1,
+        )
+        analyzer._router = None
+        analyzer._legacy_router_model_list = []
+        analyzer._dispatch_litellm_completion = MagicMock()
+
+        def _payload(summary, *, include_stop_loss=True):
+            sniper_points = {
+                "ideal_buy": 10.0,
+                "secondary_buy": 9.8,
+                "take_profit": 12.0,
+            }
+            if include_stop_loss:
+                sniper_points["stop_loss"] = 9.5
+            return {
+                "report_schema_version": GeminiAnalyzer.ANALYSIS_REPORT_TOOL_SCHEMA_VERSION,
+                "stock_name": "测试标的",
+                "raw_score": 72,
+                "adjusted_score": 72,
+                "sentiment_score": 72,
+                "trend_prediction": "看多",
+                "operation_advice": "买入",
+                "decision_type": "buy",
+                "action": "buy",
+                "confidence_level": "中",
+                "position_actions": {
+                    "empty": {"action": "buy", "advice": "轻仓试多"},
+                    "holding": {
+                        "action": "hold",
+                        "advice": "持有观察",
+                        "stop_loss": 9.5,
+                        "target_price": 12.0,
+                    },
+                },
+                "dashboard": {
+                    "battle_plan": {"sniper_points": sniper_points},
+                    "phase_decision": {
+                        "action_window": "next_session",
+                        "immediate_action": "等待确认",
+                        "watch_conditions": ["放量突破 10.10"],
+                        "next_check_time": "09:35",
+                    },
+                },
+                "analysis_summary": summary,
+            }
+
+        first_response = SimpleNamespace(
+            output_text=json.dumps(_payload("缺少执行字段", include_stop_loss=False), ensure_ascii=False),
+            usage={"input_tokens": 10, "output_tokens": 20, "total_tokens": 30},
+        )
+        second_response = SimpleNamespace(
+            output_text=json.dumps(_payload("补全后结果"), ensure_ascii=False),
+            usage={"input_tokens": 11, "output_tokens": 22, "total_tokens": 33},
+        )
+
+        with patch.object(analyzer, "get_generation_backend_config_error", return_value=None), \
+             patch.object(analyzer, "_get_analysis_system_prompt", return_value="system"), \
+             patch.object(analyzer, "_get_skill_prompt_sections", return_value=(None, None, True)), \
+             patch.object(analyzer, "_format_prompt", return_value="prompt"), \
+             patch.object(analyzer, "_build_market_snapshot", return_value={}), \
+             patch.object(
+                 analyzer,
+                 "_check_content_integrity",
+                 side_effect=[
+                     (False, ["dashboard.battle_plan.sniper_points.stop_loss"]),
+                     (True, []),
+                 ],
+             ), \
+             patch.object(analyzer, "_build_integrity_retry_prompt", return_value="retry prompt"), \
+             patch(
+                 "src.analyzer.OfficialDeepSeekStructuredClient.create_structured_report",
+                 side_effect=[first_response, second_response],
+             ) as create_responses, \
+             patch("src.analyzer.OfficialDeepSeekStructuredClient.create_json_fallback") as create_fallback, \
+             patch("src.analyzer.persist_llm_usage"):
+            result = analyzer.analyze({"code": "600519", "stock_name": "测试标的"})
+
+        assert result.success is True
+        assert result.analysis_summary == "补全后结果"
+        assert create_responses.call_count == 2
+        assert create_responses.call_args_list[0].kwargs["messages"][1]["content"] == "prompt"
+        assert create_responses.call_args_list[1].kwargs["messages"][1]["content"] == "retry prompt"
+        create_fallback.assert_not_called()
+        analyzer._dispatch_litellm_completion.assert_not_called()
+
     def test_analyze_persists_provider_usage_from_private_stream_hidden_usage_best_effort(self):
         analyzer = self._make_analyzer()
         analyzer._config_override = SimpleNamespace(
@@ -2072,25 +2172,28 @@ class TestAnalyzerGenerateText:
             analysis_summary="分析结果",
         )
 
-        def stream_response():
-            yield SimpleNamespace(
-                choices=[SimpleNamespace(delta=SimpleNamespace(content='{"sentiment_score":80}'))],
-                usage=None,
-            )
-            yield SimpleNamespace(
-                choices=[SimpleNamespace(delta=SimpleNamespace(content=""))],
-                usage=None,
-                _hidden_params={
-                    "usage": SimpleNamespace(prompt_tokens=11, completion_tokens=2, total_tokens=13)
-                },
-            )
+        tool_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[
+                SimpleNamespace(function=SimpleNamespace(
+                    name="submit_analysis_report",
+                    arguments=json.dumps({
+                        "report_schema_version": "analysis-report-tool-v1",
+                        "sentiment_score": 80,
+                    }),
+                ))
+            ]))],
+            usage=None,
+            _hidden_params={
+                "usage": SimpleNamespace(prompt_tokens=11, completion_tokens=2, total_tokens=13)
+            },
+        )
 
         with patch.object(analyzer, "is_available", return_value=True), \
              patch.object(analyzer, "_get_analysis_system_prompt", return_value="system"), \
              patch.object(analyzer, "_get_skill_prompt_sections", return_value=("RSI skill raw", "Default skill policy", False)), \
              patch.object(analyzer, "_format_prompt", return_value="prompt"), \
              patch.object(analyzer, "_validate_json_response"), \
-             patch.object(analyzer, "_dispatch_litellm_completion", return_value=stream_response()), \
+             patch.object(analyzer, "_dispatch_litellm_completion", return_value=tool_response), \
              patch.object(analyzer, "_parse_response", return_value=parsed_result), \
              patch.object(analyzer, "_build_market_snapshot", return_value={}), \
              patch("src.analyzer.persist_llm_usage") as mock_usage:
@@ -2138,11 +2241,18 @@ class TestAnalyzerGenerateText:
             analysis_summary="分析结果",
         )
 
-        def stream_response():
-            yield SimpleNamespace(
-                choices=[SimpleNamespace(delta=SimpleNamespace(content='{"sentiment_score":80}'))],
-                usage=SimpleNamespace(prompt_tokens=42, completion_tokens=3, total_tokens=45),
-            )
+        tool_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[
+                SimpleNamespace(function=SimpleNamespace(
+                    name="submit_analysis_report",
+                    arguments=json.dumps({
+                        "report_schema_version": "analysis-report-tool-v1",
+                        "sentiment_score": 80,
+                    }),
+                ))
+            ]))],
+            usage=SimpleNamespace(prompt_tokens=42, completion_tokens=3, total_tokens=45),
+        )
 
         context = {
             "code": "600519",
@@ -2166,13 +2276,48 @@ class TestAnalyzerGenerateText:
                 "region": "cn",
                 "trade_date": "2026-06-19",
             },
+            "portfolio_context": {
+                "source": "paper_trading",
+                "holding_state": "empty",
+                "quantity": 0,
+                "strategy_thesis": {
+                    "state": "risk_off",
+                    "effective_action": "avoid",
+                    "raw_action": "buy",
+                    "accepted_report_id": 40,
+                    "confirmation_count": 1,
+                    "contradiction_count": 0,
+                },
+                "strategy_pending_transition": {
+                    "raw_action": "buy",
+                    "previous_state": "risk_off",
+                    "new_state": "candidate",
+                    "result": "observed",
+                    "reason": "awaiting_entry_confirmation",
+                    "confirmation_count": 1,
+                    "contradiction_count": 0,
+                    "evidence": {
+                        "confirmation_session_dates": ["2026-06-19"],
+                        "contradiction_session_dates": [],
+                        "entry_confirmation_required": 1,
+                        "flip_confirmation_required": 2,
+                    },
+                },
+            },
+            "selection_context": {
+                "source": "market_opportunity",
+                "candidate_id": 9,
+                "primary_theme": "半导体",
+                "score": 82.5,
+                "as_of": "2026-06-19",
+            },
         }
 
         with patch.object(analyzer, "is_available", return_value=True), \
              patch.object(analyzer, "_get_analysis_system_prompt", return_value="system"), \
              patch.object(analyzer, "_get_skill_prompt_sections", return_value=("RSI skill raw", "Default skill policy", False)), \
              patch.object(analyzer, "_validate_json_response"), \
-             patch.object(analyzer, "_dispatch_litellm_completion", return_value=stream_response()), \
+             patch.object(analyzer, "_dispatch_litellm_completion", return_value=tool_response) as mock_completion, \
              patch.object(analyzer, "_parse_response", return_value=parsed_result), \
              patch.object(analyzer, "_build_market_snapshot", return_value={}), \
              patch("src.analyzer.persist_llm_usage") as mock_usage:
@@ -2183,6 +2328,15 @@ class TestAnalyzerGenerateText:
             )
 
         assert result.analysis_summary == "分析结果"
+        submitted_messages = mock_completion.call_args.args[1]["messages"]
+        submitted_prompt = "\n".join(str(item.get("content") or "") for item in submitted_messages)
+        assert "上一版生效策略 thesis" in submitted_prompt
+        assert "尚待确认的策略转换" in submitted_prompt
+        assert "awaiting_entry_confirmation" in submitted_prompt
+        assert "2026-06-19" in submitted_prompt
+        assert "机会池入选证据（只读，不代表买入指令）" in submitted_prompt
+        assert '"primary_theme": "半导体"' in submitted_prompt
+        assert "不得为了迎合机会池" in submitted_prompt
         mock_usage.assert_called_once()
         usage_arg, _ = mock_usage.call_args[0]
         markers = {
@@ -2288,6 +2442,41 @@ class TestAnalyzerGenerateText:
         assert "fallback" in model_used
         assert valid_json == text
 
+    def test_provider_envelope_with_one_json_fence_is_normalized_before_validation(self):
+        analyzer = self._make_analyzer()
+        analyzer._config_override = SimpleNamespace(
+            litellm_model="anthropic/claude-model",
+            litellm_fallback_models=[],
+            llm_model_list=[],
+        )
+
+        import json as _json
+
+        valid_json = _json.dumps({"sentiment_score": 70, "trend_prediction": "看多"})
+        wrapped = f"# 股票名称核对\n```json\n{valid_json}\n```\n结论摘要"
+
+        def fake_dispatch(model, call_kwargs, **kwargs):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=wrapped))],
+                usage=None,
+            )
+
+        with patch.object(analyzer, "_dispatch_litellm_completion", side_effect=fake_dispatch):
+            text, model_used, _usage = analyzer._call_litellm(
+                "test prompt",
+                {"max_tokens": 128, "temperature": 0.7},
+                response_validator=analyzer._validate_json_response,
+            )
+
+        assert model_used == "anthropic/claude-model"
+        assert text == valid_json
+
+    def test_provider_envelope_normalizer_rejects_competing_json_outside_fence(self):
+        analyzer = self._make_analyzer()
+        wrapped = 'prefix {"other": true}\n```json\n{"sentiment_score": 70}\n```'
+
+        assert analyzer._normalize_single_fenced_json_response(wrapped) is None
+
     def test_all_models_invalid_json_raises_all_models_failed_error(self):
         """When all models return non-JSON, _AllModelsFailedError is raised with last_response_text."""
         analyzer = self._make_analyzer()
@@ -2316,13 +2505,7 @@ class TestAnalyzerGenerateText:
         assert exc_info.value.last_response_text == "这不是 JSON 格式的响应"
 
     def test_analyze_all_models_invalid_json_goes_through_post_processing(self):
-        """When all models return non-JSON, analyze() must still run integrity
-        checks, placeholder fill, and persist_llm_usage — no early return.
-
-        With report_integrity_retry=1, the retry loop runs once (re-prompting
-        with complement instructions); when that also yields invalid JSON the
-        exhausted-retries path fires placeholder fill.
-        """
+        """Native tool failure must fail closed without parser/placeholder bypass."""
         from src.analyzer import AnalysisResult, _AllModelsFailedError
 
         analyzer = self._make_analyzer()
@@ -2376,27 +2559,17 @@ class TestAnalyzerGenerateText:
                 news_context="some news",
             )
 
-        # _call_litellm called twice: initial + 1 retry
+        # One bounded retry is allowed, but it must stay on the native tool
+        # path and must not parse/persist the rejected payload.
         assert mock_call.call_count == 2
-
-        # _parse_response called twice (initial + retry)
-        assert mock_parse.call_count == 2
-        mock_parse.assert_called_with("这不是 JSON，而是纯文本分析结果", "600519", "贵州茅台")
-
-        # Placeholder fill was applied after retry exhaustion
-        mock_fill.assert_called_once()
-        assert "dashboard.core_conclusion.one_sentence" in mock_fill.call_args[0][1]
-
-        # persist_llm_usage was called with the last model and usage
-        mock_usage.assert_called_once()
-        usage_args = mock_usage.call_args
-        assert usage_args[0][0] == {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
-        assert usage_args[0][1] == "provider/fallback-model"
-        assert usage_args[1]["call_type"] == "analysis"
-        assert usage_args[1]["stock_code"] == "600519"
-
-        # Result is success=False (text fallback), but all fields exist
+        assert mock_call.call_args_list[0].args[1]["_structured_resubmission"] is False
+        assert mock_call.call_args_list[1].args[1]["_structured_resubmission"] is True
+        mock_parse.assert_not_called()
+        mock_fill.assert_not_called()
+        mock_usage.assert_not_called()
         assert result.success is False
+        assert result.action is None
+        assert result.decision_type == "failed"
         assert result.code == "600519"
         assert result.search_performed is True
 
@@ -3228,6 +3401,17 @@ Sector text.
         assert "| 1 | 机器人概念 | +4.20% |" in table_block
         assert payload["sectors"]["top"][0]["name"] == "半导体"
         assert payload["concepts"]["top"][0]["name"] == "机器人概念"
+
+    def test_derived_csrc_rank_keeps_identity_and_discloses_measurement(self):
+        from src.market_analyzer import MarketOverview
+        ma = self._make_market_analyzer_with_mock_generate_text(return_value="复盘结果")
+        row = {"name": "医药制造业", "code": "csrc_C27", "source": "csrc_tencent",
+               "aggregation": "equal_weight_member_return", "change_pct": 2.0, "as_of": "2026-09-14"}
+        overview = MarketOverview(date="2026-09-14", top_sectors=[row])
+        assert "not official index returns" in ma._build_review_prompt(overview, [])
+        assert "不是官方行业指数" in ma._build_sector_block(overview)
+        payload = ma.build_market_review_payload(overview, [], "复盘结果")
+        assert payload["sectors"]["top"][0] == row
 
     def test_us_english_indices_do_not_label_turnover_as_cny(self):
         from src.core.market_profile import US_PROFILE

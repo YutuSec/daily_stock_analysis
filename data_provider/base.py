@@ -17,9 +17,12 @@
 import logging
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from contextvars import copy_context
+from copy import deepcopy
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Callable, Optional, List, Tuple, Dict, Any
 
 import pandas as pd
@@ -30,7 +33,7 @@ from src.services.market_symbol_utils import is_suffix_market_symbol
 from src.services.run_diagnostics import record_provider_run, record_provider_run_started
 from .fundamental_adapter import AkshareFundamentalAdapter
 from .yfinance_fundamental_adapter import YfinanceFundamentalAdapter
-from .realtime_types import CircuitBreaker
+from .realtime_types import CircuitBreaker, UnifiedAuctionSnapshot
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -150,6 +153,36 @@ def normalize_stock_code(stock_code: str) -> str:
 
 
 ETF_PREFIXES = ("51", "52", "56", "58", "15", "16", "18")
+CN_INDEX_DAILY_CODES = {
+    "SH000001": "000001.SH",
+    "SS000001": "000001.SH",
+    "000001.SH": "000001.SH",
+    "SH000300": "000300.SH",
+    "SS000300": "000300.SH",
+    "000300.SH": "000300.SH",
+    "SH000016": "000016.SH",
+    "SS000016": "000016.SH",
+    "000016.SH": "000016.SH",
+    "SH000688": "000688.SH",
+    "SS000688": "000688.SH",
+    "000688.SH": "000688.SH",
+    "SZ399001": "399001.SZ",
+    "399001.SZ": "399001.SZ",
+    "SZ399006": "399006.SZ",
+    "399006.SZ": "399006.SZ",
+}
+
+
+def preserve_cn_index_daily_code(stock_code: str) -> Optional[str]:
+    """Preserve explicit CN index identity before generic A-share normalization."""
+    raw = (stock_code or "").strip()
+    if not raw:
+        return None
+    upper = raw.upper().replace(".", "")
+    dotted = raw.upper()
+    if dotted in CN_INDEX_DAILY_CODES:
+        return CN_INDEX_DAILY_CODES[dotted]
+    return CN_INDEX_DAILY_CODES.get(upper)
 
 
 def _is_us_market(code: str) -> bool:
@@ -413,12 +446,39 @@ class BaseFetcher(ABC):
         """
         return None
 
+    def get_full_board_rankings(
+        self,
+        *,
+        market: str = "cn",
+        board_type: str = "industry",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        获取同一来源/分类的完整板块排名快照。
+
+        Returns:
+            Dict with source, taxonomy, as_of, themes and coverage fields.
+        """
+        return None
+
     def get_concept_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
         """
         获取概念/题材涨跌榜。
 
         Returns:
             Tuple: (领涨概念列表, 领跌概念列表)
+        """
+        return None
+
+    def get_board_constituents(
+        self,
+        board_name: str,
+        board_type: str = "concept",
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        获取 A 股行业/概念板块成分股。
+
+        Returns:
+            List[Dict]: 每个元素至少包含 code/name/exchange/market/source 字段。
         """
         return None
 
@@ -507,6 +567,8 @@ class BaseFetcher(ABC):
             
             # Step 4: 计算技术指标
             df = self._calculate_indicators(df)
+            # All adapter normalization paths must return shares, not lots.
+            df.attrs['volume_unit'] = 'shares'
 
             elapsed = time.time() - request_start
             logger.info(
@@ -831,6 +893,149 @@ class DataFetcherManager:
         """Reset daily source health state for tests/admin diagnostics."""
         cls._daily_source_health.reset()
 
+    @staticmethod
+    def _coerce_daily_bar_date(value: Any) -> Optional[date]:
+        """Best-effort scalar conversion for provider daily-bar dates."""
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        try:
+            parsed = pd.to_datetime(value, errors="coerce")
+        except Exception:
+            return None
+        if pd.isna(parsed):
+            return None
+        if hasattr(parsed, "date"):
+            return parsed.date()
+        return None
+
+    @classmethod
+    def _resolve_completed_daily_bar_date(
+        cls,
+        market: str,
+        *,
+        end_date: Optional[str],
+        current_time: Optional[datetime],
+    ) -> Optional[date]:
+        """Resolve the completed daily bar date that a returned frame must cover."""
+        explicit_end = cls._coerce_daily_bar_date(end_date)
+        try:
+            from src.core.trading_calendar import get_effective_trading_date
+
+            current_completed = get_effective_trading_date(
+                market,
+                current_time=current_time,
+            )
+            if explicit_end is None:
+                return current_completed
+            # Treat an explicit date as an as-of date at end-of-day in the
+            # market timezone: weekend/holiday dates resolve to the previous
+            # session, and future dates are capped by the current/replay clock.
+            explicit_completed = get_effective_trading_date(
+                market,
+                current_time=datetime.combine(explicit_end, datetime.max.time()),
+            )
+            return min(explicit_completed, current_completed)
+        except Exception as exc:
+            logger.warning(
+                "[日线新鲜度] 无法解析 %s 有效完成交易日，保守要求缺失: %s",
+                market,
+                exc,
+            )
+            return explicit_end
+
+    @classmethod
+    def _filter_daily_frame_to_completed_bar(
+        cls,
+        df: pd.DataFrame,
+        expected_date: Optional[date],
+    ) -> Tuple[Optional[pd.DataFrame], Optional[date], Optional[str]]:
+        """
+        Keep only rows up to the expected completed bar and require exact coverage.
+
+        Unknown dates and frames whose latest usable row is older than the
+        expected completed bar are rejected so the manager can try the next
+        provider instead of mixing stale daily bars with current realtime data.
+        """
+        if df is None or df.empty or expected_date is None:
+            return df, None, None
+
+        if "date" in df.columns:
+            parsed = pd.to_datetime(df["date"], errors="coerce")
+            if parsed.isna().all():
+                return None, None, f"daily data date unknown; expected {expected_date.isoformat()}"
+            row_dates = parsed.dt.date
+            usable_mask = parsed.notna() & (row_dates <= expected_date)
+            filtered = df.loc[usable_mask].copy()
+            usable_dates = row_dates[usable_mask]
+        else:
+            if not isinstance(df.index, pd.DatetimeIndex) and not (
+                getattr(df.index, "dtype", None) is not None
+                and getattr(df.index.dtype, "kind", "") in {"O", "U", "S"}
+            ):
+                return None, None, f"daily data date unknown; expected {expected_date.isoformat()}"
+            parsed_index = pd.to_datetime(df.index, errors="coerce")
+            parsed_series = pd.Series(parsed_index, index=df.index)
+            if parsed_series.isna().all():
+                return None, None, f"daily data date unknown; expected {expected_date.isoformat()}"
+            row_dates = parsed_series.dt.date
+            usable_mask = parsed_series.notna() & (row_dates <= expected_date)
+            filtered = df.loc[usable_mask].copy()
+            usable_dates = row_dates[usable_mask]
+
+        if filtered.empty or usable_dates.empty:
+            return None, None, f"daily data has no completed bar on or before {expected_date.isoformat()}"
+
+        latest_date = max(usable_dates)
+        if latest_date != expected_date:
+            return (
+                None,
+                latest_date,
+                f"stale daily data latest={latest_date.isoformat()} expected={expected_date.isoformat()}",
+            )
+        return filtered, latest_date, None
+
+    @staticmethod
+    def _validate_required_daily_fields(
+        df: pd.DataFrame,
+        required_fields: Optional[List[str]],
+        required_tail_rows: int,
+    ) -> Optional[str]:
+        """Validate caller-requested daily fields before accepting a provider frame."""
+        fields = [str(field).strip() for field in (required_fields or []) if str(field).strip()]
+        if not fields:
+            return None
+        if df is None or df.empty:
+            return "required daily fields unavailable on empty frame"
+
+        try:
+            tail_rows = int(required_tail_rows)
+        except (TypeError, ValueError):
+            tail_rows = 20
+        sample = df.tail(tail_rows) if tail_rows > 0 else df
+        if sample.empty:
+            return "required daily fields unavailable on empty tail window"
+
+        for field in fields:
+            if field not in sample.columns:
+                return f"required daily field {field} missing"
+            values = pd.to_numeric(sample[field], errors="coerce")
+            numeric = values.astype(float)
+            finite_mask = values.notna() & np.isfinite(numeric)
+            if not bool(finite_mask.all()):
+                return f"required daily field {field} has non-finite tail values"
+            if bool((numeric < 0).any()):
+                return f"required daily field {field} has negative tail values"
+        return None
+
     def _get_cached_stock_name(self, stock_code: str) -> Optional[str]:
         self._ensure_concurrency_guards()
         with self._stock_name_cache_lock:
@@ -924,17 +1129,28 @@ class DataFetcherManager:
             pass
 
     def _get_fundamental_cache_key(self, stock_code: str, budget_seconds: Optional[float] = None) -> str:
-        """生成基本面缓存 key（包含预算分桶以避免低预算结果污染高预算请求）。"""
+        """Isolate budgets and market-date boundaries, including the completed bar date."""
+        from src.core.trading_calendar import get_effective_trading_date, get_market_now
+        from src.services.history_loader import get_frozen_target_date
+
         normalized_code = normalize_stock_code(stock_code)
+        frozen_as_of = get_frozen_target_date()
+        if frozen_as_of is not None:
+            date_key = f"frozen={frozen_as_of.isoformat()}"
+        else:
+            market = _market_tag(normalized_code)
+            market_now = get_market_now(market)
+            completed = get_effective_trading_date(market, current_time=market_now)
+            date_key = f"live={market_now.date().isoformat()}|completed={completed.isoformat()}"
         if budget_seconds is None:
-            return f"{normalized_code}|budget=default"
+            return f"{normalized_code}|{date_key}|budget=default"
         try:
             budget = max(0.0, float(budget_seconds))
         except (TypeError, ValueError):
             budget = 0.0
         # 100ms bucket to balance cache reuse and scenario isolation.
         budget_bucket = int(round(budget * 10))
-        return f"{normalized_code}|budget={budget_bucket}"
+        return f"{normalized_code}|{date_key}|budget={budget_bucket}"
 
     def _prune_fundamental_cache(self, ttl_seconds: int, max_entries: int) -> None:
         """Prune expired and overflow fundamental cache items."""
@@ -1238,13 +1454,177 @@ class DataFetcherManager:
             self._fetchers.append(fetcher)
             self._fetchers.sort(key=lambda f: f.priority)
             self._refresh_fetcher_indexes_locked()
+
+    def get_index_daily_data(
+        self,
+        symbol: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 30,
+        current_time: Optional[datetime] = None,
+    ) -> Tuple[pd.DataFrame, str]:
+        """Fetch daily bars for explicitly identified CN indices."""
+        index_code = preserve_cn_index_daily_code(symbol)
+        if index_code is None:
+            raise DataFetchError(f"unsupported CN index code: {symbol}")
+
+        fetchers = [
+            fetcher
+            for fetcher in self._filter_fetchers_by_capability(
+                self._get_fetchers_snapshot(),
+                capability="index_daily_data",
+            )
+            if callable(getattr(fetcher, "get_index_daily_data", None))
+        ]
+        total_fetchers = len(fetchers)
+        if total_fetchers == 0:
+            error_summary = f"指数 {index_code} 获取失败:\n暂无可用数据源"
+            logger.error("[指数日线终止] %s 获取失败: %s", index_code, error_summary)
+            raise DataFetchError(error_summary)
+
+        expected_daily_bar_date = self._resolve_completed_daily_bar_date(
+            "cn",
+            end_date=end_date,
+            current_time=current_time,
+        )
+        if end_date is None and expected_daily_bar_date is not None:
+            end_date = expected_daily_bar_date.isoformat()
+
+        errors: List[str] = []
+        request_start = time.time()
+        for attempt, fetcher in enumerate(fetchers, start=1):
+            if not self._is_daily_source_available(fetcher, "cn"):
+                errors.append(self._daily_source_unavailable_error(fetcher))
+                continue
+            attempt_start = time.time()
+            fallback_to = fetchers[attempt].name if attempt < total_fetchers else None
+            try:
+                logger.info(
+                    "[指数日线尝试 %s/%s] [%s] 获取 %s...",
+                    attempt,
+                    total_fetchers,
+                    fetcher.name,
+                    index_code,
+                )
+                record_provider_run_started(
+                    data_type="index_daily_data",
+                    provider=fetcher.name,
+                    operation="get_index_daily_data",
+                )
+                df = self._call_fetcher_method(
+                    fetcher,
+                    "get_index_daily_data",
+                    symbol=index_code,
+                    start_date=start_date,
+                    end_date=end_date,
+                    days=days,
+                )
+                if df is not None and not df.empty:
+                    fresh_df, latest_date, freshness_error = self._filter_daily_frame_to_completed_bar(
+                        df,
+                        expected_daily_bar_date,
+                    )
+                    if freshness_error:
+                        duration_ms = int((time.time() - attempt_start) * 1000)
+                        record_provider_run(
+                            data_type="index_daily_data",
+                            provider=fetcher.name,
+                            operation="get_index_daily_data",
+                            success=False,
+                            latency_ms=duration_ms,
+                            error_type="stale_daily_data",
+                            error_message=freshness_error,
+                            fallback_to=fallback_to,
+                            record_count=len(df),
+                        )
+                        logger.warning(
+                            "[指数日线过期 %s/%s] [%s] %s: %s",
+                            attempt,
+                            total_fetchers,
+                            fetcher.name,
+                            index_code,
+                            freshness_error,
+                        )
+                        self._record_daily_source_failure(fetcher, "cn", freshness_error)
+                        errors.append(f"[{fetcher.name}] (StaleDailyData) {freshness_error}")
+                        continue
+
+                    df = fresh_df if fresh_df is not None else df
+                    duration_ms = int((time.time() - attempt_start) * 1000)
+                    record_provider_run(
+                        data_type="index_daily_data",
+                        provider=fetcher.name,
+                        operation="get_index_daily_data",
+                        success=True,
+                        latency_ms=duration_ms,
+                        record_count=len(df),
+                    )
+                    elapsed = time.time() - request_start
+                    logger.info(
+                        "[指数日线完成] %s 使用 [%s] 获取成功: rows=%s, latest=%s, elapsed=%.2fs",
+                        index_code,
+                        fetcher.name,
+                        len(df),
+                        latest_date,
+                        elapsed,
+                    )
+                    self._record_daily_source_success(fetcher, "cn")
+                    return df, fetcher.name
+
+                duration_ms = int((time.time() - attempt_start) * 1000)
+                record_provider_run(
+                    data_type="index_daily_data",
+                    provider=fetcher.name,
+                    operation="get_index_daily_data",
+                    success=False,
+                    latency_ms=duration_ms,
+                    error_type="empty",
+                    error_message="empty result",
+                    fallback_to=fallback_to,
+                    record_count=0,
+                )
+                if df is not None and df.empty:
+                    self._record_daily_source_success(fetcher, "cn")
+            except Exception as exc:
+                error_type, error_reason = summarize_exception(exc)
+                duration_ms = int((time.time() - attempt_start) * 1000)
+                record_provider_run(
+                    data_type="index_daily_data",
+                    provider=fetcher.name,
+                    operation="get_index_daily_data",
+                    success=False,
+                    latency_ms=duration_ms,
+                    error_type=error_type,
+                    error_message=error_reason,
+                    fallback_to=fallback_to,
+                )
+                logger.warning(
+                    "[指数日线失败 %s/%s] [%s] %s: error_type=%s, reason=%s",
+                    attempt,
+                    total_fetchers,
+                    fetcher.name,
+                    index_code,
+                    error_type,
+                    error_reason,
+                )
+                self._record_daily_source_failure(fetcher, "cn", error_reason)
+                errors.append(f"[{fetcher.name}] ({error_type}) {error_reason}")
+                continue
+
+        error_summary = f"所有数据源获取指数 {index_code} 失败:\n" + "\n".join(errors)
+        elapsed = time.time() - request_start
+        logger.error("[指数日线终止] %s 获取失败: elapsed=%.2fs\n%s", index_code, elapsed, error_summary)
+        raise DataFetchError(error_summary)
     
     def get_daily_data(
         self, 
         stock_code: str,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-        days: int = 30
+        days: int = 30,
+        current_time: Optional[datetime] = None,
+        required_fields: Optional[List[str]] = None,
+        required_tail_rows: int = 20,
     ) -> Tuple[pd.DataFrame, str]:
         """
         获取日线数据（自动切换数据源）
@@ -1261,6 +1641,9 @@ class DataFetcherManager:
             start_date: 开始日期
             end_date: 结束日期
             days: 获取天数
+            current_time: 可选市场时钟，用于无 end_date 时解析有效完成交易日
+            required_fields: 调用方要求 provider 必须提供的字段；默认不启用
+            required_tail_rows: required_fields 校验最近多少行；默认 20
             
         Returns:
             Tuple[DataFrame, str]: (数据, 成功的数据源名称)
@@ -1270,8 +1653,10 @@ class DataFetcherManager:
         """
         from .us_index_mapping import is_us_index_code, is_us_stock_code
 
-        # Normalize code (strip SH/SZ prefix etc.)
-        stock_code = normalize_stock_code(stock_code)
+        # Normalize code (strip SH/SZ prefix etc.), while preserving explicit
+        # CN index identities used as benchmarks.  A bare six-digit code still
+        # follows the historical stock/ETF path.
+        stock_code = preserve_cn_index_daily_code(stock_code) or normalize_stock_code(stock_code)
 
         fetchers = self._get_fetchers_snapshot()
         errors = []
@@ -1288,6 +1673,13 @@ class DataFetcherManager:
         is_kr = (not is_us) and (not is_hk) and _is_kr_market(stock_code)
         is_tw = (not is_us) and (not is_hk) and _is_tw_market(stock_code)
         market = "us" if is_us else "hk" if is_hk else "jp" if is_jp else "kr" if is_kr else "tw" if is_tw else "cn"
+        expected_daily_bar_date = self._resolve_completed_daily_bar_date(
+            market,
+            end_date=end_date,
+            current_time=current_time,
+        )
+        if end_date is None and expected_daily_bar_date is not None:
+            end_date = expected_daily_bar_date.isoformat()
         if market != "cn":
             fetchers = self._filter_daily_fetchers_for_market(fetchers, market)
         fetchers = self._filter_fetchers_by_capability(fetchers, capability="daily_data")
@@ -1346,6 +1738,63 @@ class DataFetcherManager:
                             days=days,
                         )
                         if df is not None and not df.empty:
+                            fresh_df, latest_date, freshness_error = self._filter_daily_frame_to_completed_bar(
+                                df,
+                                expected_daily_bar_date,
+                            )
+                            if freshness_error:
+                                duration_ms = int((time.time() - attempt_start) * 1000)
+                                record_provider_run(
+                                    data_type="daily_data",
+                                    provider=fetcher.name,
+                                    operation="get_daily_data",
+                                    success=False,
+                                    latency_ms=duration_ms,
+                                    error_type="stale_daily_data",
+                                    error_message=freshness_error,
+                                    fallback_to=fallback_to,
+                                    record_count=len(df),
+                                )
+                                logger.warning(
+                                    "[数据源过期 %s/%s] [%s] %s: %s",
+                                    attempt,
+                                    total_fetchers,
+                                    fetcher.name,
+                                    stock_code,
+                                    freshness_error,
+                                )
+                                self._record_daily_source_failure(fetcher, market, freshness_error)
+                                errors.append(f"[{fetcher.name}] (StaleDailyData) {freshness_error}")
+                                continue
+                            df = fresh_df if fresh_df is not None else df
+                            quality_error = self._validate_required_daily_fields(
+                                df,
+                                required_fields,
+                                required_tail_rows,
+                            )
+                            if quality_error:
+                                duration_ms = int((time.time() - attempt_start) * 1000)
+                                record_provider_run(
+                                    data_type="daily_data",
+                                    provider=fetcher.name,
+                                    operation="get_daily_data",
+                                    success=False,
+                                    latency_ms=duration_ms,
+                                    error_type="required_field_quality",
+                                    error_message=quality_error,
+                                    fallback_to=fallback_to,
+                                    record_count=len(df),
+                                )
+                                logger.warning(
+                                    "[数据源字段不足 %s/%s] [%s] %s: %s",
+                                    attempt,
+                                    total_fetchers,
+                                    fetcher.name,
+                                    stock_code,
+                                    quality_error,
+                                )
+                                errors.append(f"[{fetcher.name}] (RequiredFieldQuality) {quality_error}")
+                                continue
                             duration_ms = int((time.time() - attempt_start) * 1000)
                             record_provider_run(
                                 data_type="daily_data",
@@ -1358,7 +1807,7 @@ class DataFetcherManager:
                             elapsed = time.time() - request_start
                             logger.info(
                                 f"[数据源完成] {stock_code} 使用 [{fetcher.name}] 获取成功: "
-                                f"rows={len(df)}, elapsed={elapsed:.2f}s"
+                                f"rows={len(df)}, latest={latest_date}, elapsed={elapsed:.2f}s"
                             )
                             self._record_daily_source_success(fetcher, market)
                             return df, fetcher.name
@@ -1426,6 +1875,69 @@ class DataFetcherManager:
                 )
                 
                 if df is not None and not df.empty:
+                    fresh_df, latest_date, freshness_error = self._filter_daily_frame_to_completed_bar(
+                        df,
+                        expected_daily_bar_date,
+                    )
+                    if freshness_error:
+                        duration_ms = int((time.time() - attempt_start) * 1000)
+                        record_provider_run(
+                            data_type="daily_data",
+                            provider=fetcher.name,
+                            operation="get_daily_data",
+                            success=False,
+                            latency_ms=duration_ms,
+                            error_type="stale_daily_data",
+                            error_message=freshness_error,
+                            fallback_to=fallback_to,
+                            record_count=len(df),
+                        )
+                        logger.warning(
+                            "[数据源过期 %s/%s] [%s] %s: %s",
+                            attempt,
+                            total_fetchers,
+                            fetcher.name,
+                            stock_code,
+                            freshness_error,
+                        )
+                        self._record_daily_source_failure(fetcher, market, freshness_error)
+                        errors.append(f"[{fetcher.name}] (StaleDailyData) {freshness_error}")
+                        if attempt < total_fetchers:
+                            next_fetcher = fetchers[attempt]
+                            logger.info(f"[数据源切换] {stock_code}: [{fetcher.name}] -> [{next_fetcher.name}]")
+                        continue
+                    df = fresh_df if fresh_df is not None else df
+                    quality_error = self._validate_required_daily_fields(
+                        df,
+                        required_fields,
+                        required_tail_rows,
+                    )
+                    if quality_error:
+                        duration_ms = int((time.time() - attempt_start) * 1000)
+                        record_provider_run(
+                            data_type="daily_data",
+                            provider=fetcher.name,
+                            operation="get_daily_data",
+                            success=False,
+                            latency_ms=duration_ms,
+                            error_type="required_field_quality",
+                            error_message=quality_error,
+                            fallback_to=fallback_to,
+                            record_count=len(df),
+                        )
+                        logger.warning(
+                            "[数据源字段不足 %s/%s] [%s] %s: %s",
+                            attempt,
+                            total_fetchers,
+                            fetcher.name,
+                            stock_code,
+                            quality_error,
+                        )
+                        errors.append(f"[{fetcher.name}] (RequiredFieldQuality) {quality_error}")
+                        if attempt < total_fetchers:
+                            next_fetcher = fetchers[attempt]
+                            logger.info(f"[数据源切换] {stock_code}: [{fetcher.name}] -> [{next_fetcher.name}]")
+                        continue
                     duration_ms = int((time.time() - attempt_start) * 1000)
                     record_provider_run(
                         data_type="daily_data",
@@ -1438,7 +1950,7 @@ class DataFetcherManager:
                     elapsed = time.time() - request_start
                     logger.info(
                         f"[数据源完成] {stock_code} 使用 [{fetcher.name}] 获取成功: "
-                        f"rows={len(df)}, elapsed={elapsed:.2f}s"
+                        f"rows={len(df)}, latest={latest_date}, elapsed={elapsed:.2f}s"
                     )
                     self._record_daily_source_success(fetcher, market)
                     return df, fetcher.name
@@ -2031,6 +2543,120 @@ class DataFetcherManager:
             capability=capability,
         ) is not None
 
+    def get_auction_snapshot(self, stock_code: str, *, market: str = "cn") -> Optional[UnifiedAuctionSnapshot]:
+        """Fetch an attributable opening-auction snapshot from explicit provider capabilities only."""
+
+        raw_stock_code = (stock_code or "").strip()
+        normalized = normalize_stock_code(raw_stock_code)
+        fetched_at = self._utc_now_iso()
+        candidates = list(getattr(self, "fetchers", []) or [])
+        for fetcher in candidates:
+            if not hasattr(fetcher, "get_auction_snapshot"):
+                continue
+            try:
+                snapshot = self._call_fetcher_method(
+                    fetcher,
+                    "get_auction_snapshot",
+                    raw_stock_code or normalized,
+                    market=market,
+                )
+            except TypeError:
+                snapshot = self._call_fetcher_method(
+                    fetcher,
+                    "get_auction_snapshot",
+                    raw_stock_code or normalized,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[集合竞价] %s get_auction_snapshot failed: %s",
+                    getattr(fetcher, "name", fetcher.__class__.__name__),
+                    exc,
+                )
+                continue
+            if snapshot is None:
+                continue
+            if not isinstance(snapshot, UnifiedAuctionSnapshot):
+                if isinstance(snapshot, dict):
+                    snapshot = UnifiedAuctionSnapshot(**snapshot)
+                else:
+                    logger.warning(
+                        "[集合竞价] provider returned unsupported snapshot type: %s",
+                        type(snapshot).__name__,
+                    )
+                    continue
+            snapshot.fetched_at = snapshot.fetched_at or fetched_at
+            snapshot.source = snapshot.source or getattr(fetcher, "name", fetcher.__class__.__name__)
+            return snapshot
+        return None
+
+    def get_auction_capability_diagnostics(self, stock_code: str, *, market: str = "cn") -> List[Dict[str, Any]]:
+        """Return provider diagnostics for dedicated auction capability probes."""
+
+        diagnostics: List[Dict[str, Any]] = []
+        raw_stock_code = (stock_code or "").strip()
+        normalized = normalize_stock_code(raw_stock_code)
+        for fetcher in list(getattr(self, "fetchers", []) or []):
+            provider_name = getattr(fetcher, "name", fetcher.__class__.__name__)
+            if hasattr(fetcher, "get_auction_capability_diagnostics"):
+                try:
+                    item = self._call_fetcher_method(
+                        fetcher,
+                        "get_auction_capability_diagnostics",
+                        raw_stock_code or normalized,
+                        market=market,
+                    )
+                except TypeError:
+                    item = self._call_fetcher_method(
+                        fetcher,
+                        "get_auction_capability_diagnostics",
+                        raw_stock_code or normalized,
+                    )
+                except Exception as exc:
+                    item = {"provider": provider_name, "supported": False, "reason": str(exc)[:160]}
+                if isinstance(item, dict):
+                    diagnostics.append(item)
+                continue
+            diagnostics.append({
+                "provider": provider_name,
+                "supported": False,
+                "reason": "provider_has_no_dedicated_auction_capability",
+            })
+        return diagnostics
+
+    def get_limit_prices(self, stock_code: str, *, trade_date: str, market: str = "cn") -> Optional[Dict[str, Any]]:
+        """Fetch attributable daily limit prices from explicit provider capabilities."""
+
+        raw_stock_code = (stock_code or "").strip()
+        normalized = normalize_stock_code(raw_stock_code)
+        for fetcher in list(getattr(self, "fetchers", []) or []):
+            if not hasattr(fetcher, "get_limit_prices"):
+                continue
+            try:
+                result = self._call_fetcher_method(
+                    fetcher,
+                    "get_limit_prices",
+                    raw_stock_code or normalized,
+                    trade_date=trade_date,
+                    market=market,
+                )
+            except TypeError:
+                result = self._call_fetcher_method(
+                    fetcher,
+                    "get_limit_prices",
+                    raw_stock_code or normalized,
+                    trade_date=trade_date,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[涨跌停] %s get_limit_prices failed: %s",
+                    getattr(fetcher, "name", fetcher.__class__.__name__),
+                    exc,
+                )
+                continue
+            if isinstance(result, dict) and result.get("up_limit") is not None and result.get("down_limit") is not None:
+                return result
+        return None
+
     def _try_fetcher_quote(self, stock_code: str, fetcher_name: str, **kw):
         """Try to get a realtime quote from a named fetcher; returns quote or None."""
         fetcher = self._get_fetcher_by_name(fetcher_name, capability="realtime_quote")
@@ -2577,13 +3203,14 @@ class DataFetcherManager:
             return None, f"{task_name} timeout", 0
         result_holder: Dict[str, Any] = {}
         error_holder: Dict[str, Exception] = {}
+        task_context = copy_context()
 
         if not self._fundamental_timeout_slots.acquire(blocking=False):
             return None, f"{task_name} timeout worker pool exhausted", int(timeout_value * 1000)
 
         def runner() -> None:
             try:
-                result_holder["value"] = task()
+                result_holder["value"] = task_context.run(task)
             except Exception as exc:
                 error_holder["value"] = exc
             finally:
@@ -3115,6 +3742,88 @@ class DataFetcherManager:
             **blocks,
         }
 
+    def _collect_cn_fundamental_inputs(
+        self, stock_code: str, stage_timeout: float, fetch_timeout: float,
+        is_etf: bool, frozen_as_of: Any,
+    ) -> Dict[str, Any]:
+        """Collect independent blocks concurrently without raising the provider worker cap.
+
+        Coordinator threads only wait on the existing bounded provider workers.
+        One monotonic deadline covers all blocks; late bundle work cannot mutate
+        the returned snapshot or erase financial evidence already received.
+        """
+        started = time.monotonic()
+        deadline = started + (stage_timeout if fetch_timeout > 0 else 0.0)
+        snapshot_lock = RLock()
+        progress: Dict[str, Any] = {}
+        accepting_progress = True
+
+        def publish(payload: Dict[str, Any]) -> None:
+            with snapshot_lock:
+                if accepting_progress:
+                    progress.clear()
+                    progress.update(deepcopy(payload))
+
+        def remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        def fetch_budget() -> float:
+            return min(fetch_timeout, remaining())
+
+        def bundle() -> Any:
+            return self._run_with_retry(
+                lambda: self._fundamental_adapter.get_fundamental_bundle(
+                    stock_code, as_of=frozen_as_of, deadline=deadline, on_progress=publish,
+                ), remaining(), "fundamental_bundle",
+            )
+
+        tasks = {
+            "bundle": bundle,
+            "valuation": lambda: self._run_with_retry(
+                lambda: self.get_realtime_quote(stock_code), fetch_budget(), "fundamental_valuation",
+            ),
+        }
+        if not is_etf:
+            tasks.update({
+                "capital_flow": lambda: self.get_capital_flow_context(stock_code, budget_seconds=fetch_budget()),
+                "dragon_tiger": lambda: self.get_dragon_tiger_context(stock_code, budget_seconds=fetch_budget()),
+                "boards": lambda: self.get_board_context(stock_code, budget_seconds=fetch_budget()),
+            })
+        results: Dict[str, Any] = {}
+        if remaining() <= 0:
+            futures = {}
+            executor = None
+        else:
+            executor = ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix="fundamental-block")
+            futures = {name: executor.submit(copy_context().run, task) for name, task in tasks.items()}
+        try:
+            for name in tasks:
+                try:
+                    future = futures.get(name)
+                    if future is None:
+                        raise FutureTimeoutError()
+                    results[name] = future.result(timeout=remaining())
+                except Exception as exc:
+                    reason = f"{name} timeout" if isinstance(exc, FutureTimeoutError) else f"{name}: {exc}"
+                    if name in {"bundle", "valuation"}:
+                        results[name] = (None, reason, int((time.monotonic() - started) * 1000))
+                    else:
+                        results[name] = self._build_fundamental_block(
+                            "failed", {}, [{"provider": name, "result": "failed"}], [reason],
+                        )
+        finally:
+            with snapshot_lock:
+                accepting_progress = False
+                partial_bundle = deepcopy(progress)
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
+        payload, error, elapsed = results["bundle"]
+        if not isinstance(payload, dict) and partial_bundle:
+            partial_bundle.setdefault("errors", []).append(error or "fundamental bundle incomplete")
+            partial_bundle["status"] = "partial"
+            results["bundle"] = (partial_bundle, error, elapsed)
+        return results
+
     def get_fundamental_context(
         self,
         stock_code: str,
@@ -3151,6 +3860,8 @@ class DataFetcherManager:
 
         cache_ttl = int(config.fundamental_cache_ttl_seconds)
         cache_max_entries = max(0, int(getattr(config, "fundamental_cache_max_entries", 256)))
+        from src.services.history_loader import get_frozen_target_date
+        frozen_as_of = get_frozen_target_date()
         cache_key = self._get_fundamental_cache_key(stock_code, stage_timeout)
         if cache_ttl > 0:
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
@@ -3161,7 +3872,6 @@ class DataFetcherManager:
                     if age <= cache_ttl:
                         return cache_item.get("context", {})
 
-        remaining_seconds = stage_timeout
         result_ctx: Dict[str, Any] = {
             "market": market,
             "valuation": {},
@@ -3178,20 +3888,10 @@ class DataFetcherManager:
 
         start_ts = time.time()
 
-        def _consume_budget(consumed_ms: int) -> None:
-            nonlocal remaining_seconds
-            remaining_seconds = max(0.0, remaining_seconds - consumed_ms / 1000.0)
-
-        valuation_timeout = min(fetch_timeout, remaining_seconds)
-        if valuation_timeout > 0:
-            quote_payload, valuation_err, valuation_ms = self._run_with_retry(
-                lambda: self.get_realtime_quote(stock_code),
-                valuation_timeout,
-                "fundamental_valuation",
-            )
-            _consume_budget(valuation_ms)
-        else:
-            quote_payload, valuation_err, valuation_ms = None, "fundamental stage timeout", 0
+        inputs = self._collect_cn_fundamental_inputs(
+            stock_code, stage_timeout, fetch_timeout, is_etf, frozen_as_of,
+        )
+        quote_payload, valuation_err, valuation_ms = inputs["valuation"]
 
         valuation_payload = {
             "pe_ratio": getattr(quote_payload, "pe_ratio", None) if quote_payload else None,
@@ -3203,7 +3903,7 @@ class DataFetcherManager:
             valuation_payload,
             "partial" if quote_payload is not None else "not_supported",
         )
-        if valuation_status == "partial" and valuation_err and not self._has_meaningful_payload(valuation_payload):
+        if valuation_err and not self._has_meaningful_payload(valuation_payload):
             valuation_status = "failed"
         result_ctx["valuation"] = self._build_fundamental_block(
             valuation_status,
@@ -3217,29 +3917,15 @@ class DataFetcherManager:
             [valuation_err] if valuation_err else [],
         )
 
-        # growth / earnings / institution (one AkShare call)
-        if remaining_seconds <= 0:
+        # Preserve already completed bundle blocks if a later provider times out.
+        bundle_payload, bundle_err_msg, bundle_ms = inputs["bundle"]
+        if not isinstance(bundle_payload, dict):
             bundle_status = "failed"
-            bundle_payload: Dict[str, Any] = {}
-            bundle_errors = ["fundamental stage timeout"]
-            bundle_ms = 0
+            bundle_payload = {}
+            bundle_errors = [bundle_err_msg or "fundamental_bundle failed"]
         else:
-            bundle_timeout = min(fetch_timeout, remaining_seconds)
-            bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
-                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
-                bundle_timeout,
-                "fundamental_bundle",
-            )
-            _consume_budget(bundle_ms)
-            if not isinstance(bundle_payload, dict):
-                bundle_status = "failed"
-                bundle_payload = {}
-                bundle_errors = ["fundamental_bundle failed"]
-                if bundle_err_msg:
-                    bundle_errors.append(bundle_err_msg)
-            else:
-                bundle_status = str(bundle_payload.get("status", "not_supported"))
-                bundle_errors = [bundle_err_msg] if bundle_err_msg else []
+            bundle_status = str(bundle_payload.get("status", "not_supported"))
+            bundle_errors = [bundle_err_msg] if bundle_err_msg else []
 
         bundle_chain = self._normalize_source_chain(
             bundle_payload.get("source_chain", []),
@@ -3313,6 +3999,16 @@ class DataFetcherManager:
         earnings_status = self._infer_block_status(earnings_payload, bundle_status)
         institution_status = self._infer_block_status(institution_payload, bundle_status)
 
+        # Empty blocks after transport/budget failure are unavailable, not an
+        # unsupported capability or a successful "no events" observation.
+        if adapter_errors:
+            if not self._has_meaningful_payload(growth_payload):
+                growth_status = "failed"
+            if not self._has_meaningful_payload(earnings_payload):
+                earnings_status = "failed"
+            if not self._has_meaningful_payload(institution_payload):
+                institution_status = "failed"
+
         result_ctx["growth"] = self._build_fundamental_block(
             growth_status,
             growth_payload,
@@ -3354,26 +4050,8 @@ class DataFetcherManager:
             )
             result_ctx["status"] = "partial"
         else:
-            capital_flow_budget = min(fetch_timeout, remaining_seconds)
-            capital_flow_start = time.time()
-            result_ctx["capital_flow"] = self.get_capital_flow_context(
-                stock_code,
-                budget_seconds=capital_flow_budget,
-            )
-            _consume_budget(int((time.time() - capital_flow_start) * 1000))
-
-            dragon_tiger_budget = min(fetch_timeout, remaining_seconds)
-            dragon_tiger_start = time.time()
-            result_ctx["dragon_tiger"] = self.get_dragon_tiger_context(
-                stock_code,
-                budget_seconds=dragon_tiger_budget,
-            )
-            _consume_budget(int((time.time() - dragon_tiger_start) * 1000))
-
-            result_ctx["boards"] = self.get_board_context(
-                stock_code,
-                budget_seconds=min(fetch_timeout, remaining_seconds),
-            )
+            for block in ("capital_flow", "dragon_tiger", "boards"):
+                result_ctx[block] = inputs[block]
 
         block_statuses = {
             "valuation": result_ctx["valuation"].get("status", "not_supported"),
@@ -3441,8 +4119,10 @@ class DataFetcherManager:
                 [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
                 ["fundamental stage timeout"],
             )
+        from src.services.history_loader import get_frozen_target_date
+        frozen_as_of = get_frozen_target_date()
         payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_capital_flow(stock_code),
+            lambda: self._fundamental_adapter.get_capital_flow(stock_code, as_of=frozen_as_of),
             timeout,
             "capital_flow",
         )
@@ -3458,11 +4138,18 @@ class DataFetcherManager:
         sector_rankings = payload.get("sector_rankings") or {}
         has_stock_flow = False
         if isinstance(stock_flow, dict):
-            has_stock_flow = any(v is not None for v in stock_flow.values())
+            has_stock_flow = any(
+                isinstance(stock_flow.get(key), (int, float))
+                and not isinstance(stock_flow.get(key), bool)
+                and np.isfinite(stock_flow[key])
+                for key in ("main_net_inflow", "inflow_5d", "inflow_10d")
+            )
         has_sector_rankings = bool(sector_rankings.get("top")) or bool(sector_rankings.get("bottom"))
         adapter_status = str(payload.get("status", "not_supported"))
         if has_stock_flow or has_sector_rankings:
             capital_flow_status = "ok"
+        elif payload.get("errors") or err:
+            capital_flow_status = "failed"
         elif adapter_status == "not_supported":
             capital_flow_status = "not_supported"
         else:
@@ -3472,6 +4159,7 @@ class DataFetcherManager:
             capital_flow_status,
             {
                 "stock_flow": payload.get("stock_flow", {}),
+                "stock_flow_meta": payload.get("stock_flow_meta", {}),
                 "sector_rankings": payload.get("sector_rankings", {}),
             },
             self._normalize_source_chain(
@@ -3505,8 +4193,10 @@ class DataFetcherManager:
                 [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
                 ["fundamental stage timeout"],
             )
+        from src.services.history_loader import get_frozen_target_date
+        frozen_as_of = get_frozen_target_date()
         payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_dragon_tiger_flag(stock_code),
+            lambda: self._fundamental_adapter.get_dragon_tiger_flag(stock_code, as_of=frozen_as_of),
             timeout,
             "dragon_tiger",
         )
@@ -3517,17 +4207,20 @@ class DataFetcherManager:
                 [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}],
                 [err or "dragon_tiger failed"],
             )
+        status = payload.get("status") if isinstance(payload.get("status"), str) else "partial"
+        if payload.get("is_on_list") is None and (payload.get("errors") or err):
+            status = "failed"
         return self._build_fundamental_block(
-            (payload.get("status") if isinstance(payload.get("status"), str) else "partial"),
+            status,
             {
-                "is_on_list": bool(payload.get("is_on_list", False)),
-                "recent_count": int(payload.get("recent_count", 0)),
+                "is_on_list": payload.get("is_on_list"),
+                "recent_count": payload.get("recent_count"),
                 "latest_date": payload.get("latest_date"),
             },
             self._normalize_source_chain(
                 payload.get("source_chain", []),
                 "dragon_tiger",
-                str(payload.get("status", "ok")),
+                status,
                 cost_ms,
             ),
             list(payload.get("errors", [])) + ([err] if err else []),
@@ -3608,7 +4301,7 @@ class DataFetcherManager:
                 try:
                     data = fetcher.get_sector_rankings(n)
                     duration_ms = int((time.time() - start) * 1000)
-                    if data and data[0] is not None and data[1] is not None:
+                    if data and (data[0] or data[1]):
                         source_chain.append(
                             {
                                 "provider": fetcher.name,
@@ -3646,12 +4339,97 @@ class DataFetcherManager:
 
     def get_sector_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:
         """获取板块涨跌榜（自动切换数据源）"""
-        # 按需求固定回退顺序：Akshare(EM) -> Akshare(Sina) -> Tushare -> Efinance
+        # Follow the configured provider priority; each adapter owns its source fallback.
         top, bottom, _, last_error = self._get_sector_rankings_with_meta(n)
         if top or bottom:
             return top, bottom
         logger.warning(f"[板块排行] 所有数据源均失败，最终错误: {last_error}")
         return [], []
+
+    def get_full_board_rankings(
+        self,
+        *,
+        market: str = "cn",
+        board_type: str = "industry",
+        source: str = "csrc_tencent",
+    ) -> Dict[str, Any]:
+        """获取完整板块排名快照；机会池观测使用固定来源避免混源。"""
+        normalized_market = str(market or "cn").strip().lower() or "cn"
+        normalized_type = str(board_type or "industry").strip().lower() or "industry"
+        normalized_source = str(source or "csrc_tencent").strip().lower() or "csrc_tencent"
+        source_chain: List[Dict[str, Any]] = []
+
+        if normalized_source == "csrc_tencent":
+            started = time.time()
+            try:
+                from data_provider.csrc_board_provider import CsrcBoardConstituentProvider
+
+                provider = CsrcBoardConstituentProvider()
+                payload = provider.get_full_board_rankings(
+                    market=normalized_market,
+                    board_type=normalized_type,
+                )
+                source_chain.append(
+                    {
+                        "provider": provider.provider_name,
+                        "result": "ok",
+                        "duration_ms": int((time.time() - started) * 1000),
+                    }
+                )
+                payload["source_chain"] = source_chain
+                return payload
+            except Exception as exc:
+                error_type, error_reason = summarize_exception(exc)
+                source_chain.append(
+                    {
+                        "provider": normalized_source,
+                        "result": "failed",
+                        "duration_ms": int((time.time() - started) * 1000),
+                        "error": error_reason,
+                    }
+                )
+                return {
+                    "status": "failed",
+                    "market": normalized_market,
+                    "source": normalized_source,
+                    "taxonomy": "csrc_industry" if normalized_source == "csrc_tencent" else normalized_type,
+                    "themes": [],
+                    "coverage": {"status": "failed", "reason": f"{error_type}:{error_reason}"},
+                    "source_chain": source_chain,
+                }
+
+        for fetcher in self._get_fetchers_snapshot():
+            fetcher_method = getattr(type(fetcher), "get_full_board_rankings", None)
+            if fetcher_method is BaseFetcher.get_full_board_rankings:
+                continue
+            started = time.time()
+            try:
+                payload = fetcher.get_full_board_rankings(market=normalized_market, board_type=normalized_type)
+                duration_ms = int((time.time() - started) * 1000)
+                if payload and payload.get("themes"):
+                    source_chain.append({"provider": fetcher.name, "result": "ok", "duration_ms": duration_ms})
+                    payload["source_chain"] = source_chain
+                    return payload
+                source_chain.append({"provider": fetcher.name, "result": "empty", "duration_ms": duration_ms})
+            except Exception as exc:
+                error_type, error_reason = summarize_exception(exc)
+                source_chain.append(
+                    {
+                        "provider": fetcher.name,
+                        "result": "failed",
+                        "duration_ms": int((time.time() - started) * 1000),
+                        "error": error_reason,
+                    }
+                )
+        return {
+            "status": "failed",
+            "market": normalized_market,
+            "source": normalized_source,
+            "taxonomy": normalized_type,
+            "themes": [],
+            "coverage": {"status": "failed", "reason": "all_full_board_sources_failed"},
+            "source_chain": source_chain,
+        }
 
     @staticmethod
     def _copy_ranking_rows(rows: List[Dict]) -> List[Dict]:
@@ -3716,6 +4494,48 @@ class DataFetcherManager:
                 cached_bottom,
             )
             return self._copy_ranking_rows(cached_top), self._copy_ranking_rows(cached_bottom)
+
+    def get_board_constituents(
+        self,
+        board_name: str,
+        board_type: str = "concept",
+    ) -> List[Dict[str, Any]]:
+        """获取行业/概念板块成分股（自动切换数据源）。"""
+        topic = str(board_name or "").strip()
+        normalized_type = str(board_type or "concept").strip().lower()
+        if not topic or normalized_type not in {"concept", "industry"}:
+            return []
+
+        last_error = ""
+        for fetcher in self._get_fetchers_snapshot():
+            fetcher_method = getattr(type(fetcher), "get_board_constituents", None)
+            if fetcher_method is BaseFetcher.get_board_constituents:
+                continue
+            try:
+                rows = fetcher.get_board_constituents(topic, normalized_type)
+                if rows:
+                    logger.info(
+                        "[%s] 获取板块成分股成功: board=%s type=%s rows=%d",
+                        fetcher.name,
+                        topic,
+                        normalized_type,
+                        len(rows),
+                    )
+                    return [dict(row) for row in rows if isinstance(row, dict)]
+                last_error = f"{fetcher.name}返回空结果"
+            except Exception as exc:
+                error_type, error_reason = summarize_exception(exc)
+                last_error = f"{fetcher.name} ({error_type}) {error_reason}"
+                logger.warning(
+                    "[%s] 获取板块成分股失败: board=%s type=%s error=%s",
+                    fetcher.name,
+                    topic,
+                    normalized_type,
+                    error_reason,
+                )
+        if last_error:
+            logger.warning("[板块成分股] 所有数据源均失败: %s", last_error)
+        return []
 
     def get_hot_stocks(self, n: int = 10) -> List[Dict[str, Any]]:
         """获取市场人气股榜（自动切换数据源）。"""

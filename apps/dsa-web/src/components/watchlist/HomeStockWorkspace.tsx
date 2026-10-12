@@ -17,7 +17,11 @@ import { DashboardPanelHeader, DashboardStateBlock } from '../dashboard';
 import { StockBar } from '../history';
 import type { StockBarItem, TaskInfo } from '../../types/analysis';
 import { getSentimentColor } from '../../types/analysis';
-import { buildDecisionActionLabelMap, getDecisionActionLabel } from '../../utils/decisionAction';
+import {
+  buildDecisionActionLabelMap,
+  getDecisionActionLabel,
+  getLegacyDecisionActionLabel,
+} from '../../utils/decisionAction';
 import { formatDateTime } from '../../utils/format';
 import { truncateStockName } from '../../utils/stockName';
 import { useUiLanguage } from '../../contexts/UiLanguageContext';
@@ -63,6 +67,7 @@ interface HomeStockWorkspaceProps {
   selectedRecordId?: number;
   onHistoryItemClick: (recordId: number) => void;
   onDeleteStock?: (stockCode: string) => Promise<void> | void;
+  onAnalyzeHistoryStocks: (stockCodes: string[]) => Promise<void>;
   isDeleting?: boolean;
   className?: string;
 }
@@ -77,6 +82,17 @@ function getTaskStatusLabel(task: TaskInfo | undefined, t: (key: UiTextKey, para
 
 const ScoreBadge: React.FC<{ item?: StockBarItem }> = ({ item }) => {
   const { t } = useUiLanguage();
+  if (item?.analysisStatus === 'failed' || item?.analysisStatus === 'degraded') {
+    return (
+      <Badge
+        variant="danger"
+        size="sm"
+        className="shrink-0 shadow-none text-[11px] font-semibold leading-none"
+      >
+        {item.operationAdvice || '分析失败'}
+      </Badge>
+    );
+  }
   const score = typeof item?.sentimentScore === 'number' ? item.sentimentScore : null;
   const color = score !== null ? getSentimentColor(score) : null;
   if (score === null || !color) {
@@ -90,7 +106,7 @@ const ScoreBadge: React.FC<{ item?: StockBarItem }> = ({ item }) => {
     item?.operationAdvice,
     t('history.sentiment'),
     actionLabels,
-  );
+  ) || getLegacyDecisionActionLabel(item?.operationAdvice, actionLabels);
 
   return (
     <Badge
@@ -171,6 +187,11 @@ const WatchlistRowItem: React.FC<{
           <span className="truncate">{t('watchlist.taskRunning', { status: taskLabel })}</span>
         </div>
       ) : null}
+      {(item?.analysisStatus === 'failed' || item?.analysisStatus === 'degraded') && item.latestAttemptError ? (
+        <div className="truncate text-[11px] text-danger" title={item.latestAttemptError}>
+          {item.latestAttemptError}
+        </div>
+      ) : null}
     </div>
   );
 };
@@ -220,6 +241,7 @@ export const HomeStockWorkspace: React.FC<HomeStockWorkspaceProps> = ({
   selectedRecordId,
   onHistoryItemClick,
   onDeleteStock,
+  onAnalyzeHistoryStocks,
   isDeleting = false,
   className = '',
 }) => {
@@ -282,9 +304,16 @@ export const HomeStockWorkspace: React.FC<HomeStockWorkspaceProps> = ({
           selectedRecordId={selectedRecordId}
           onItemClick={onHistoryItemClick}
           onDeleteStock={onDeleteStock}
+          onAnalyzeStocks={onAnalyzeHistoryStocks}
+          isAnalyzing={isBatchAnalyzing}
           isDeleting={isDeleting}
           className="flex-1 overflow-hidden"
         />
+        {batchStatus ? (
+          <div className={`rounded-xl border px-3 py-2 text-xs ${statusClassName}`}>
+            {batchStatus.message}
+          </div>
+        ) : null}
       </div>
     );
   }

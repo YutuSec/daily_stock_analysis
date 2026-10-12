@@ -620,6 +620,59 @@ class AnalysisApiContractTestCase(unittest.TestCase):
         self.assertEqual(status.result.report["summary"]["action"], "avoid")
         self.assertEqual(status.result.report["summary"]["action_label"], "回避")
 
+    def test_get_analysis_status_queue_result_uses_frozen_empty_branch(self) -> None:
+        if get_analysis_status is None or analysis_endpoint_module is None:
+            self.skipTest("analysis endpoint helpers unavailable in this environment")
+
+        queue = MagicMock()
+        queue.get_task.return_value = SimpleNamespace(
+            task_id="task-empty-queue",
+            stock_code="002173.SZ",
+            stock_name="创新医疗",
+            status=analysis_endpoint_module.TaskStatusEnum.COMPLETED,
+            progress=100,
+            result={
+                "stock_code": "002173.SZ",
+                "stock_name": "创新医疗",
+                "report": {
+                    "meta": {
+                        "query_id": "task-empty-queue",
+                        "stock_code": "002173.SZ",
+                        "report_language": "zh",
+                    },
+                    "summary": {
+                        "sentiment_score": 37,
+                        "operation_advice": "减仓",
+                        "action": "reduce",
+                    },
+                    "details": {
+                        "raw_result": {
+                            "operation_advice": "减仓",
+                            "action": "reduce",
+                            "holding_state": "empty",
+                            "position_actions": {
+                                "empty": {"action": "watch", "advice": "观望"},
+                                "holding": {"action": "reduce", "advice": "减仓"},
+                            },
+                        }
+                    },
+                },
+            },
+            error=None,
+            original_query=None,
+            selection_source=None,
+            analysis_phase="postmarket",
+            created_at=datetime(2026, 8, 27, 15, 20, 0),
+            completed_at=datetime(2026, 8, 27, 15, 21, 0),
+        )
+
+        with patch("api.v1.endpoints.analysis.get_task_queue", return_value=queue):
+            status = get_analysis_status("task-empty-queue")
+
+        self.assertEqual(status.result.report["summary"]["operation_advice"], "观望")
+        self.assertEqual(status.result.report["summary"]["action"], "watch")
+        self.assertEqual(status.result.report["summary"]["action_label"], "观望")
+
     def test_get_analysis_status_prefers_raw_result_action_over_summary_action(self) -> None:
         if get_analysis_status is None or analysis_endpoint_module is None:
             self.skipTest("analysis endpoint helpers unavailable in this environment")
@@ -1087,6 +1140,51 @@ class AnalysisApiContractTestCase(unittest.TestCase):
         self.assertEqual(result.result.report["meta"]["current_price"], 1234.5)
         self.assertEqual(result.result.report["meta"]["change_pct"], 0.0)
 
+    def test_get_analysis_status_db_snapshot_uses_frozen_empty_branch(self) -> None:
+        if get_analysis_status is None:
+            self.skipTest("analysis endpoint helpers unavailable in this environment")
+
+        mock_queue = MagicMock()
+        mock_queue.get_task.return_value = None
+        mock_db = MagicMock()
+        mock_db.get_analysis_history.return_value = [
+            SimpleNamespace(
+                id=126,
+                code="002173.SZ",
+                name="创新医疗",
+                report_type="detailed",
+                report_language="zh",
+                model_used="test-model",
+                raw_result={
+                    "operation_advice": "减仓",
+                    "action": "reduce",
+                    "holding_state": "empty",
+                    "position_actions": {
+                        "empty": {"action": "watch", "advice": "观望"},
+                        "holding": {"action": "reduce", "advice": "减仓"},
+                    },
+                },
+                context_snapshot=None,
+                sentiment_score=37,
+                operation_advice="减仓",
+                trend_prediction="震荡",
+                analysis_summary="summary",
+                ideal_buy=None,
+                secondary_buy=None,
+                stop_loss=None,
+                take_profit=None,
+                created_at=None,
+            )
+        ]
+
+        with patch("api.v1.endpoints.analysis.get_task_queue", return_value=mock_queue), \
+             patch("src.storage.DatabaseManager.get_instance", return_value=mock_db):
+            result = get_analysis_status("task-empty-db")
+
+        self.assertEqual(result.result.report["summary"]["operation_advice"], "观望")
+        self.assertEqual(result.result.report["summary"]["action"], "watch")
+        self.assertEqual(result.result.report["summary"]["action_label"], "观望")
+
     def test_get_analysis_status_returns_market_review_report_from_db(self) -> None:
         if get_analysis_status is None:
             self.skipTest("analysis endpoint helpers unavailable in this environment")
@@ -1515,6 +1613,42 @@ class AnalysisApiContractTestCase(unittest.TestCase):
         self.assertEqual(result["stock_name"], "Unnamed Stock")
         self.assertEqual(result["report"]["meta"]["stock_name"], "Unnamed Stock")
 
+    def test_build_analysis_response_uses_frozen_empty_branch(self) -> None:
+        service = AnalysisService()
+        result = service._build_analysis_response(
+            SimpleNamespace(
+                code="002173.SZ",
+                name="创新医疗",
+                current_price=10.0,
+                change_pct=-1.0,
+                model_used="test-model",
+                analysis_summary="空仓不执行减仓",
+                operation_advice="减仓",
+                action="reduce",
+                action_label="减仓",
+                holding_state="empty",
+                position_actions={
+                    "empty": {"action": "watch", "advice": "观望"},
+                    "holding": {"action": "reduce", "advice": "减仓"},
+                },
+                trend_prediction="震荡",
+                sentiment_score=37,
+                news_summary="news",
+                technical_analysis="tech",
+                fundamental_analysis="fundamental",
+                risk_warning="risk",
+                report_language="zh",
+                get_sniper_points=lambda: {},
+            ),
+            "q-empty-response",
+            report_type="full",
+        )
+
+        summary = result["report"]["summary"]
+        self.assertEqual(summary["operation_advice"], "观望")
+        self.assertEqual(summary["action"], "watch")
+        self.assertEqual(summary["action_label"], "观望")
+
     def test_build_analysis_response_does_not_use_model_news_summary_as_retrieval_evidence(self) -> None:
         service = AnalysisService()
         result = service._build_analysis_response(
@@ -1767,6 +1901,43 @@ class AnalysisApiContractTestCase(unittest.TestCase):
             fallback_fundamental_payload=None,
         )
 
+        self.assertEqual(report.summary.action, "watch")
+        self.assertEqual(report.summary.action_label, "观望")
+
+    def test_build_analysis_report_uses_frozen_empty_branch(self) -> None:
+        if _build_analysis_report is None:
+            self.skipTest("analysis endpoint helpers unavailable in this environment")
+
+        report = _build_analysis_report(
+            report_data={
+                "meta": {"report_type": "detailed", "report_language": "zh"},
+                "summary": {
+                    "analysis_summary": "空仓不执行持仓动作",
+                    "operation_advice": "减仓",
+                    "action": "reduce",
+                    "sentiment_score": 37,
+                },
+                "strategy": {},
+                "details": {
+                    "raw_result": {
+                        "operation_advice": "减仓",
+                        "action": "reduce",
+                        "holding_state": "empty",
+                        "position_actions": {
+                            "empty": {"action": "watch", "advice": "观望"},
+                            "holding": {"action": "reduce", "advice": "减仓"},
+                        },
+                    }
+                },
+            },
+            query_id="q-empty",
+            stock_code="002173.SZ",
+            stock_name="创新医疗",
+            context_snapshot=None,
+            fallback_fundamental_payload=None,
+        )
+
+        self.assertEqual(report.summary.operation_advice, "观望")
         self.assertEqual(report.summary.action, "watch")
         self.assertEqual(report.summary.action_label, "观望")
 

@@ -746,7 +746,19 @@ class LocalCliGenerationBackend(GenerationBackend):
         stream_progress_callback: Optional[Callable[[int], None]] = None,
         response_validator: Optional[Callable[[str], None]] = None,
         audit_context: Optional[Dict[str, Any]] = None,
+        structured_tool: Optional[Dict[str, Any]] = None,
     ) -> GenerationResult:
+        if structured_tool is not None:
+            raise GenerationError(
+                error_code=GenerationErrorCode.UNSUPPORTED_TOOL_CALLING,
+                stage="configuration",
+                retryable=False,
+                fallbackable=True,
+                backend=self.backend_id,
+                provider=self.preset_id,
+                details={"reason": "structured_tool_not_supported"},
+            )
+
         executable, argv, executable_summary = self._resolve_command()
         timeout_seconds = min(
             _positive_int(

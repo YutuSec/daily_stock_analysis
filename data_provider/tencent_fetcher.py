@@ -15,7 +15,14 @@ try:
 except ImportError:  # pragma: no cover - dependency is present in supported installs
     xcals = None
 
-from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, normalize_stock_code, is_bse_code
+from .base import (
+    BaseFetcher,
+    DataFetchError,
+    STANDARD_COLUMNS,
+    is_bse_code,
+    normalize_stock_code,
+    preserve_cn_index_daily_code,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +40,7 @@ class TencentFetcher(BaseFetcher):
     _HTTP_TIMEOUT_SECONDS = 8
 
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-        code = normalize_stock_code(stock_code)
-        symbol = _to_tencent_symbol(code)
+        symbol = _to_tencent_index_symbol(stock_code) or _to_tencent_symbol(stock_code)
         if not symbol:
             raise DataFetchError(f"TencentFetcher unsupported stock code: {stock_code}")
 
@@ -86,6 +92,18 @@ class TencentFetcher(BaseFetcher):
             return _empty_daily_frame()
         return df
 
+    def get_index_daily_data(
+        self,
+        symbol: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 30,
+    ) -> pd.DataFrame:
+        """Fetch explicit CN index daily bars without falling back to stock routing."""
+        if not _to_tencent_index_symbol(symbol):
+            raise DataFetchError(f"TencentFetcher unsupported index code: {symbol}")
+        return self.get_daily_data(symbol, start_date=start_date, end_date=end_date, days=days)
+
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         normalized = df.copy()
         for column in ("open", "high", "low", "close", "volume", "amount"):
@@ -95,6 +113,23 @@ class TencentFetcher(BaseFetcher):
             normalized["pct_chg"] = normalized["close"].pct_change().fillna(0.0) * 100
         normalized = normalized[["date", "open", "high", "low", "close", "volume", "amount", "pct_chg"]]
         return normalized
+
+
+_TENCENT_CN_INDEX_SYMBOLS = {
+    "000001.SH": "sh000001",
+    "000300.SH": "sh000300",
+    "000016.SH": "sh000016",
+    "000688.SH": "sh000688",
+    "399001.SZ": "sz399001",
+    "399006.SZ": "sz399006",
+}
+
+
+def _to_tencent_index_symbol(stock_code: str) -> str:
+    canonical = preserve_cn_index_daily_code(stock_code)
+    if canonical is None:
+        return ""
+    return _TENCENT_CN_INDEX_SYMBOLS.get(canonical, "")
 
 
 def _to_tencent_symbol(stock_code: str) -> str:

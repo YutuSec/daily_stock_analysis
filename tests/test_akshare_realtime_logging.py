@@ -54,6 +54,7 @@ def _make_tencent_payload(
     turnover_rate: str = "0.69",
     circ_mv_yi: str = "0.93",
     total_mv_yi: str = "1.20",
+    provider_time: str = "20260908110611",
 ) -> str:
     fields = ["0"] * 50
     fields[1] = "大秦铁路"
@@ -62,6 +63,7 @@ def _make_tencent_payload(
     fields[4] = "5.00"
     fields[5] = "5.10"
     fields[6] = volume
+    fields[30] = provider_time
     fields[31] = "0.19"
     fields[32] = "3.80"
     fields[33] = "5.20"
@@ -129,15 +131,20 @@ def test_sina_realtime_remote_disconnect_logs_category(caplog, monkeypatch, aksh
 def test_tencent_realtime_http_status_logs_endpoint(caplog, monkeypatch, akshare_fetcher):
     breaker = _DummyCircuitBreaker()
     monkeypatch.setattr("data_provider.akshare_fetcher.get_realtime_circuit_breaker", lambda: breaker)
+    requested_urls = []
+    def unavailable(url, **kwargs):
+        requested_urls.append(url)
+        return _DummyResponse(503, "service unavailable")
     monkeypatch.setattr(
         "data_provider.akshare_fetcher.requests.get",
-        lambda *args, **kwargs: _DummyResponse(503, "service unavailable"),
+        unavailable,
     )
 
     with caplog.at_level(logging.INFO):
         quote = akshare_fetcher._get_stock_realtime_quote_tencent("601006")
 
     assert quote is None
+    assert requested_urls == [f"https://{TENCENT_REALTIME_ENDPOINT}=sh601006"]
     assert breaker.failures
     source_key, message = breaker.failures[0]
     assert source_key == "akshare_tencent"
@@ -161,10 +168,19 @@ def test_tencent_realtime_success_logs_endpoint(caplog, monkeypatch, akshare_fet
     assert quote.name == "大秦铁路"
     assert quote.price == 5.19
     assert quote.volume == 123400
+    assert quote.provider_timestamp == "2026-09-08T11:06:11+08:00"
     assert quote.amount == 6404500
     assert breaker.successes == ["akshare_tencent"]
     assert f"endpoint={TENCENT_REALTIME_ENDPOINT}" in caplog.text
     assert "[实时行情-腾讯] 601006 大秦铁路:" in caplog.text
+
+
+def test_tencent_invalid_timestamp_does_not_invent_current_time(monkeypatch, akshare_fetcher):
+    monkeypatch.setattr('data_provider.akshare_fetcher.requests.get',
+        lambda *args, **kwargs: _DummyResponse(200, _make_tencent_payload(provider_time='invalid')))
+    quote = akshare_fetcher._get_stock_realtime_quote_tencent('601006')
+    assert quote is not None and quote.price == 5.19
+    assert quote.provider_timestamp is None
 
 
 def test_tencent_realtime_volume_keeps_share_unit_when_turnover_matches(monkeypatch, akshare_fetcher):

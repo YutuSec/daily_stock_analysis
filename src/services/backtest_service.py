@@ -16,7 +16,11 @@ from src.core.backtest_engine import OVERALL_SENTINEL_CODE, BacktestEngine, Eval
 from src.market_phase_summary import extract_market_phase_summary, normalize_analysis_phase_bucket
 from src.repositories.backtest_repo import BacktestRepository
 from src.repositories.stock_repo import StockRepository
-from src.schemas.decision_action import build_action_fields
+from src.schemas.decision_action import (
+    build_action_fields,
+    display_action_fields,
+    normalize_holding_state,
+)
 from src.storage import BacktestResult, BacktestSummary, DatabaseManager
 from src.utils.data_processing import parse_json_field
 from src.services.stock_code_utils import normalize_code as normalize_backtest_code
@@ -44,6 +48,7 @@ class BacktestService:
         analysis_date_from: Optional[date] = None,
         analysis_date_to: Optional[date] = None,
         limit: int = 200,
+        model_used: Optional[str] = None,
     ) -> Dict[str, Any]:
         config = get_config()
 
@@ -52,6 +57,7 @@ class BacktestService:
 
         query_code = self._normalize_code(code)
         diagnostic_code = self._normalize_code_for_display(code)
+        model_used = self._normalize_model_filter(model_used)
 
         if eval_window_days is None:
             eval_window_days = getattr(config, "backtest_eval_window_days", 10)
@@ -77,6 +83,7 @@ class BacktestService:
             force=force,
             analysis_date_from=analysis_date_from,
             analysis_date_to=analysis_date_to,
+            model_used=model_used,
         )
 
         processed = 0
@@ -89,6 +96,7 @@ class BacktestService:
 
         for analysis in candidates:
             processed += 1
+            general_action, frozen_holding_state, frozen_holding_action = self._extract_frozen_actions(analysis)
             normalized_code = self._normalize_summary_code(analysis.code)
             if normalized_code:
                 touched_codes.add(normalized_code)
@@ -106,6 +114,13 @@ class BacktestService:
                             eval_status="error",
                             evaluated_at=datetime.now(),
                             operation_advice=analysis.operation_advice,
+                            **BacktestEngine.evaluate_holding_decision(
+                                holding_state=frozen_holding_state,
+                                holding_action=frozen_holding_action,
+                                stock_return_pct=None,
+                                eval_status="error",
+                                neutral_band_pct=neutral_band_pct,
+                            ),
                         )
                     )
                     continue
@@ -139,6 +154,13 @@ class BacktestService:
                             eval_status="insufficient_data",
                             evaluated_at=datetime.now(),
                             operation_advice=analysis.operation_advice,
+                            **BacktestEngine.evaluate_holding_decision(
+                                holding_state=frozen_holding_state,
+                                holding_action=frozen_holding_action,
+                                stock_return_pct=None,
+                                eval_status="insufficient_data",
+                                neutral_band_pct=neutral_band_pct,
+                            ),
                         )
                     )
                     continue
@@ -180,6 +202,15 @@ class BacktestService:
                     stop_loss=analysis.stop_loss,
                     take_profit=analysis.take_profit,
                     config=eval_config,
+                    action=general_action,
+                )
+
+                holding_evaluation = BacktestEngine.evaluate_holding_decision(
+                    holding_state=frozen_holding_state,
+                    holding_action=frozen_holding_action,
+                    stock_return_pct=evaluation.get("stock_return_pct"),
+                    eval_status=str(evaluation.get("eval_status") or "error"),
+                    neutral_band_pct=neutral_band_pct,
                 )
 
                 status = evaluation.get("eval_status")
@@ -220,6 +251,7 @@ class BacktestService:
                         simulated_exit_price=evaluation.get("simulated_exit_price"),
                         simulated_exit_reason=evaluation.get("simulated_exit_reason"),
                         simulated_return_pct=evaluation.get("simulated_return_pct"),
+                        **holding_evaluation,
                     )
                 )
 
@@ -236,6 +268,13 @@ class BacktestService:
                         eval_status="error",
                         evaluated_at=datetime.now(),
                         operation_advice=analysis.operation_advice,
+                        **BacktestEngine.evaluate_holding_decision(
+                            holding_state=frozen_holding_state,
+                            holding_action=frozen_holding_action,
+                            stock_return_pct=None,
+                            eval_status="error",
+                            neutral_band_pct=neutral_band_pct,
+                        ),
                     )
                 )
 
@@ -261,6 +300,7 @@ class BacktestService:
                 engine_version=str(engine_version),
                 analysis_date_from=analysis_date_from,
                 analysis_date_to=analysis_date_to,
+                model_used=model_used,
             )
         if not force and processed == 0:
             has_matching_analysis = self._has_matching_analysis_for_run(
@@ -270,6 +310,7 @@ class BacktestService:
                 engine_version=str(engine_version),
                 analysis_date_from=analysis_date_from,
                 analysis_date_to=analysis_date_to,
+                model_used=model_used,
             )
 
         diagnostics = self._build_run_diagnostics(
@@ -286,6 +327,7 @@ class BacktestService:
             errors=errors,
             has_matching_analysis=has_matching_analysis,
             aligned_existing_result_dates=aligned_existing_result_dates,
+            model_used=model_used,
         )
 
         return {
@@ -299,6 +341,42 @@ class BacktestService:
             "diagnostics": diagnostics,
         }
 
+    @staticmethod
+    def _extract_frozen_actions(analysis: Any) -> Tuple[Optional[str], str, Optional[str]]:
+        """Read only report-time action snapshots; never query current holdings."""
+
+        parsed = parse_json_field(getattr(analysis, "raw_result", None))
+        raw = parsed if isinstance(parsed, dict) else {}
+        holding_state = normalize_holding_state(raw.get("holding_state"))
+        position_actions = raw.get("position_actions")
+        # The general action remains a separate backtest metric from the
+        # report-time account-effective action shown by result serializers.
+        # This preserves the two-metric contract: market direction plus the
+        # explicitly frozen holding decision.
+        action_fields = build_action_fields(
+            operation_advice=raw.get("operation_advice") or getattr(analysis, "operation_advice", None),
+            explicit_action=raw.get("action"),
+            report_type=getattr(analysis, "report_type", None),
+            report_language=raw.get("report_language"),
+            sentiment_score=(
+                raw.get("sentiment_score")
+                if raw.get("sentiment_score") is not None
+                else getattr(analysis, "sentiment_score", None)
+            ),
+            guardrail_reason=raw.get("guardrail_reason") or raw.get("downgrade_reason"),
+            align_with_score=False,
+        )
+
+        holding_action: Optional[str] = None
+        if isinstance(position_actions, dict):
+            holding_payload = position_actions.get("holding")
+            if isinstance(holding_payload, dict):
+                candidate = str(holding_payload.get("action") or "").strip().lower()
+                if candidate in {"buy", "add", "hold", "reduce", "sell", "avoid", "watch", "alert"}:
+                    holding_action = candidate
+
+        return action_fields.get("action"), holding_state, holding_action
+
     def _get_run_candidates(
         self,
         *,
@@ -310,6 +388,7 @@ class BacktestService:
         force: bool,
         analysis_date_from: Optional[date],
         analysis_date_to: Optional[date],
+        model_used: Optional[str],
     ) -> List[Any]:
         if limit <= 0:
             return []
@@ -322,6 +401,7 @@ class BacktestService:
                 eval_window_days=eval_window_days,
                 engine_version=engine_version,
                 force=force,
+                model_used=model_used,
             )
 
         matched: List[Any] = []
@@ -337,6 +417,7 @@ class BacktestService:
                 eval_window_days=eval_window_days,
                 engine_version=engine_version,
                 force=force,
+                model_used=model_used,
             )
             if not batch:
                 break
@@ -363,6 +444,7 @@ class BacktestService:
         engine_version: str,
         analysis_date_from: Optional[date],
         analysis_date_to: Optional[date],
+        model_used: Optional[str],
     ) -> bool:
         """Check if historical analysis rows match the same run filters, ignoring backtest history."""
         if analysis_date_from is None and analysis_date_to is None:
@@ -374,6 +456,7 @@ class BacktestService:
                     eval_window_days=eval_window_days,
                     engine_version=engine_version,
                     force=True,
+                    model_used=model_used,
                 )
             )
 
@@ -387,6 +470,7 @@ class BacktestService:
                 force=True,
                 analysis_date_from=analysis_date_from,
                 analysis_date_to=analysis_date_to,
+                model_used=model_used,
             )
         ) > 0
 
@@ -570,6 +654,7 @@ class BacktestService:
         errors: int,
         has_matching_analysis: bool = False,
         aligned_existing_result_dates: int = 0,
+        model_used: Optional[str] = None,
     ) -> Dict[str, Any]:
         diagnostics: Dict[str, Any] = {
             "code": code,
@@ -578,6 +663,7 @@ class BacktestService:
             "limit": limit,
             "analysis_date_from": analysis_date_from.isoformat() if analysis_date_from else None,
             "analysis_date_to": analysis_date_to.isoformat() if analysis_date_to else None,
+            "model_used": model_used,
         }
         if aligned_existing_result_dates:
             diagnostics["aligned_existing_result_dates"] = aligned_existing_result_dates
@@ -614,10 +700,12 @@ class BacktestService:
         analysis_date_from: Optional[date] = None,
         analysis_date_to: Optional[date] = None,
         analysis_phase: Optional[str] = None,
+        model_used: Optional[str] = None,
     ) -> Dict[str, Any]:
         config = get_config()
         engine_version = str(getattr(config, "backtest_engine_version", "v1"))
         code = self._normalize_code(code)
+        model_used = self._normalize_model_filter(model_used)
 
         phase_bucket = self._normalize_phase_filter(analysis_phase)
         if eval_window_days is None and (analysis_date_from is not None or analysis_date_to is not None or phase_bucket is not None):
@@ -626,6 +714,7 @@ class BacktestService:
                 engine_version=engine_version,
                 analysis_date_from=analysis_date_from,
                 analysis_date_to=analysis_date_to,
+                model_used=model_used,
             )
         if phase_bucket is not None:
             return self._get_recent_evaluations_by_phase(
@@ -637,6 +726,7 @@ class BacktestService:
                 analysis_date_from=analysis_date_from,
                 analysis_date_to=analysis_date_to,
                 phase_bucket=phase_bucket,
+                model_used=model_used,
             )
 
         offset = max(page - 1, 0) * limit
@@ -649,9 +739,21 @@ class BacktestService:
             days=None,
             offset=offset,
             limit=limit,
+            model_used=model_used,
         )
         items = []
-        for result, stock_name, trend_prediction, _created_at, context_snapshot, raw_result, report_type, analysis_sentiment_score in rows:
+        for context_row in rows:
+            (
+                result,
+                stock_name,
+                trend_prediction,
+                _created_at,
+                context_snapshot,
+                raw_result,
+                report_type,
+                analysis_sentiment_score,
+                history_model_used,
+            ) = self._unpack_result_context_row(context_row)
             summary = extract_market_phase_summary(context_snapshot)
             items.append(
                 self._result_to_dict(
@@ -663,6 +765,7 @@ class BacktestService:
                     raw_result=raw_result,
                     report_type=report_type,
                     analysis_sentiment_score=analysis_sentiment_score,
+                    model_used=history_model_used,
                 )
             )
         return {"total": total, "page": page, "limit": limit, "items": items}
@@ -676,20 +779,23 @@ class BacktestService:
         analysis_date_from: Optional[date] = None,
         analysis_date_to: Optional[date] = None,
         analysis_phase: Optional[str] = None,
+        model_used: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         config = get_config()
         engine_version = str(getattr(config, "backtest_engine_version", "v1"))
         code = self._normalize_code(code)
+        model_used = self._normalize_model_filter(model_used)
         lookup_code = OVERALL_SENTINEL_CODE if scope == "overall" else code
 
         phase_bucket = self._normalize_phase_filter(analysis_phase)
-        if analysis_date_from is not None or analysis_date_to is not None or phase_bucket is not None:
+        if analysis_date_from is not None or analysis_date_to is not None or phase_bucket is not None or model_used is not None:
             if eval_window_days is None:
                 eval_window_days = self._infer_eval_window_for_query(
                     code=code,
                     engine_version=engine_version,
                     analysis_date_from=analysis_date_from,
                     analysis_date_to=analysis_date_to,
+                    model_used=model_used,
                 )
             ew = int(eval_window_days) if eval_window_days is not None else None
             count = self.repo.count_results(
@@ -698,6 +804,7 @@ class BacktestService:
                 engine_version=engine_version,
                 analysis_date_from=analysis_date_from,
                 analysis_date_to=analysis_date_to,
+                model_used=model_used,
             )
             if count > self.MAX_DYNAMIC_SUMMARY_ROWS:
                 if phase_bucket is not None:
@@ -713,6 +820,7 @@ class BacktestService:
                     engine_version=engine_version,
                     analysis_date_from=analysis_date_from,
                     analysis_date_to=analysis_date_to,
+                    model_used=model_used,
                     limit=self.MAX_DYNAMIC_SUMMARY_ROWS + 1,
                 )
                 if len(rows_with_context) > self.MAX_DYNAMIC_SUMMARY_ROWS:
@@ -726,7 +834,7 @@ class BacktestService:
                 ]
                 phase_counts = self._phase_counts_from_contexts([snapshot for _, snapshot in filtered_pairs])
                 filtered_rows = [row for row, _ in filtered_pairs]
-                return self._build_dynamic_summary(
+                summary = self._build_dynamic_summary(
                     rows=filtered_rows,
                     scope=scope,
                     code=lookup_code,
@@ -736,14 +844,18 @@ class BacktestService:
                     phase_breakdown=phase_counts["phase_breakdown"],
                     raw_phase_counts=phase_counts["raw_phase_counts"],
                 )
+                if summary is not None:
+                    summary["model_used"] = model_used
+                return summary
             rows = self.repo.list_results(
                 code=code,
                 eval_window_days=ew,
                 engine_version=engine_version,
                 analysis_date_from=analysis_date_from,
                 analysis_date_to=analysis_date_to,
+                model_used=model_used,
             )
-            return self._build_dynamic_summary(
+            summary = self._build_dynamic_summary(
                 rows=rows,
                 scope=scope,
                 code=lookup_code,
@@ -751,6 +863,9 @@ class BacktestService:
                 engine_version=engine_version,
                 max_rows=self.MAX_DYNAMIC_SUMMARY_ROWS,
             )
+            if summary is not None:
+                summary["model_used"] = model_used
+            return summary
 
         summary = self.repo.get_summary(
             scope=scope,
@@ -800,12 +915,14 @@ class BacktestService:
         engine_version: str,
         analysis_date_from: Optional[date],
         analysis_date_to: Optional[date],
+        model_used: Optional[str] = None,
     ) -> Optional[int]:
         windows = self.repo.get_distinct_eval_windows(
             code=code,
             engine_version=engine_version,
             analysis_date_from=analysis_date_from,
             analysis_date_to=analysis_date_to,
+            model_used=model_used,
         )
         return windows[0] if windows else None
 
@@ -820,6 +937,7 @@ class BacktestService:
         analysis_date_from: Optional[date],
         analysis_date_to: Optional[date],
         phase_bucket: str,
+        model_used: Optional[str] = None,
     ) -> Dict[str, Any]:
         page_offset = max(page - 1, 0) * limit
         batch_size = max(100, min(500, limit * 4))
@@ -836,6 +954,7 @@ class BacktestService:
                 Optional[str],
                 Optional[str],
                 Optional[int],
+                Optional[str],
             ]
         ] = []
 
@@ -853,6 +972,7 @@ class BacktestService:
                 days=None,
                 offset=sql_offset,
                 limit=batch_limit,
+                model_used=model_used,
             )
             if not batch:
                 break
@@ -860,22 +980,24 @@ class BacktestService:
             if scanned > self.MAX_DYNAMIC_SUMMARY_ROWS:
                 raise ValueError("Phase-filtered results match too many rows; narrow the analysis date range or stock code.")
             sql_offset += len(batch)
-            for (
-                result,
-                stock_name,
-                trend_prediction,
-                _created_at,
-                context_snapshot,
-                raw_result,
-                report_type,
-                analysis_sentiment_score,
-            ) in batch:
+            for context_row in batch:
+                (
+                    result,
+                    stock_name,
+                    trend_prediction,
+                    _created_at,
+                    context_snapshot,
+                    raw_result,
+                    report_type,
+                    analysis_sentiment_score,
+                    history_model_used,
+                ) = self._unpack_result_context_row(context_row)
                 summary = extract_market_phase_summary(context_snapshot)
                 bucket = self._phase_bucket_from_summary(summary)
                 if bucket != phase_bucket:
                     continue
                 if matched_total >= page_offset and len(page_rows) < limit:
-                    page_rows.append((result, stock_name, trend_prediction, summary, bucket, raw_result, report_type, analysis_sentiment_score))
+                    page_rows.append((result, stock_name, trend_prediction, summary, bucket, raw_result, report_type, analysis_sentiment_score, history_model_used))
                 matched_total += 1
             if len(batch) < batch_limit:
                 break
@@ -890,8 +1012,9 @@ class BacktestService:
                 raw_result=raw_result,
                 report_type=report_type,
                 analysis_sentiment_score=analysis_sentiment_score,
+                model_used=history_model_used,
             )
-            for result, stock_name, trend_prediction, summary, bucket, raw_result, report_type, analysis_sentiment_score in page_rows
+            for result, stock_name, trend_prediction, summary, bucket, raw_result, report_type, analysis_sentiment_score, history_model_used in page_rows
         ]
         return {"total": matched_total, "page": page, "limit": limit, "items": items}
 
@@ -906,6 +1029,27 @@ class BacktestService:
         if text not in allowed:
             raise ValueError("analysis_phase must be one of premarket, intraday, postmarket, unknown")
         return text
+
+    @staticmethod
+    def _normalize_model_filter(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if len(text) > 255:
+            raise ValueError("model_used must not exceed 255 characters")
+        return text
+
+    @staticmethod
+    def _unpack_result_context_row(row: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        """Accept legacy eight-field repository rows used by existing adapters/tests."""
+        values = tuple(row)
+        if len(values) == 8:
+            return (*values, None)
+        if len(values) == 9:
+            return values
+        raise ValueError(f"unexpected backtest result context width: {len(values)}")
 
     @staticmethod
     def _phase_bucket_from_summary(summary: Optional[Dict[str, Any]]) -> str:
@@ -1032,6 +1176,15 @@ class BacktestService:
             take_profit_trigger_rate=summary_data.get("take_profit_trigger_rate"),
             ambiguous_rate=summary_data.get("ambiguous_rate"),
             avg_days_to_first_hit=summary_data.get("avg_days_to_first_hit"),
+            direction_evaluable_count=summary_data.get("direction_evaluable_count") or 0,
+            holding_applicable_count=summary_data.get("holding_applicable_count") or 0,
+            holding_evaluable_count=summary_data.get("holding_evaluable_count") or 0,
+            holding_unavailable_count=summary_data.get("holding_unavailable_count") or 0,
+            holding_correct_count=summary_data.get("holding_correct_count") or 0,
+            holding_incorrect_count=summary_data.get("holding_incorrect_count") or 0,
+            holding_neutral_count=summary_data.get("holding_neutral_count") or 0,
+            holding_decision_accuracy_pct=summary_data.get("holding_decision_accuracy_pct"),
+            avg_holding_decision_return_pct=summary_data.get("avg_holding_decision_return_pct"),
             advice_breakdown_json=json.dumps(summary_data.get("advice_breakdown") or {}, ensure_ascii=False),
             diagnostics_json=json.dumps(summary_data.get("diagnostics") or {}, ensure_ascii=False),
         )
@@ -1046,10 +1199,12 @@ class BacktestService:
         raw_result: Optional[Any] = None,
         report_type: Optional[str] = None,
         analysis_sentiment_score: Optional[int] = None,
+        model_used: Optional[str] = None,
     ) -> Dict[str, Any]:
         parsed_raw_result = parse_json_field(raw_result)
         raw = parsed_raw_result if isinstance(parsed_raw_result, dict) else {}
-        action_fields = build_action_fields(
+        holding_state = normalize_holding_state(raw.get("holding_state") or row.holding_state)
+        action_fields = display_action_fields(
             operation_advice=raw.get("operation_advice") or row.operation_advice,
             explicit_action=raw.get("action"),
             report_type=report_type or ("market_review" if row.code == "market_review" else None),
@@ -1060,18 +1215,24 @@ class BacktestService:
                 else analysis_sentiment_score
             ),
             guardrail_reason=raw.get("guardrail_reason") or raw.get("downgrade_reason"),
-            align_with_score=True,
+            holding_state=holding_state,
+            position_actions=raw.get("position_actions"),
         )
         return {
             "analysis_history_id": row.analysis_history_id,
             "code": row.code,
             "stock_name": stock_name,
+            "model_used": model_used or raw.get("model_used"),
             "analysis_date": row.analysis_date.isoformat() if row.analysis_date else None,
             "eval_window_days": row.eval_window_days,
             "engine_version": row.engine_version,
             "eval_status": row.eval_status,
             "evaluated_at": row.evaluated_at.isoformat() if row.evaluated_at else None,
-            "operation_advice": row.operation_advice,
+            "operation_advice": (
+                action_fields["action_label"]
+                if holding_state != "unknown"
+                else row.operation_advice
+            ),
             "action": action_fields["action"],
             "action_label": action_fields["action_label"],
             "trend_prediction": trend_prediction,
@@ -1099,6 +1260,15 @@ class BacktestService:
             "simulated_exit_price": row.simulated_exit_price,
             "simulated_exit_reason": row.simulated_exit_reason,
             "simulated_return_pct": row.simulated_return_pct,
+            "holding_state": row.holding_state or "unknown",
+            "holding_action": row.holding_action,
+            "holding_action_applicable": bool(row.holding_action_applicable),
+            "holding_action_evaluable": bool(row.holding_action_evaluable),
+            "holding_eval_status": row.holding_eval_status or "unavailable",
+            "holding_direction_expected": row.holding_direction_expected,
+            "holding_decision_correct": row.holding_decision_correct,
+            "holding_outcome": row.holding_outcome,
+            "holding_decision_return_pct": row.holding_decision_return_pct,
         }
 
     @staticmethod
@@ -1118,6 +1288,15 @@ class BacktestService:
             "loss_count": row.loss_count,
             "neutral_count": row.neutral_count,
             "direction_accuracy_pct": row.direction_accuracy_pct,
+            "direction_evaluable_count": row.direction_evaluable_count or 0,
+            "holding_applicable_count": row.holding_applicable_count or 0,
+            "holding_evaluable_count": row.holding_evaluable_count or 0,
+            "holding_unavailable_count": row.holding_unavailable_count or 0,
+            "holding_correct_count": row.holding_correct_count or 0,
+            "holding_incorrect_count": row.holding_incorrect_count or 0,
+            "holding_neutral_count": row.holding_neutral_count or 0,
+            "holding_decision_accuracy_pct": row.holding_decision_accuracy_pct,
+            "avg_holding_decision_return_pct": row.avg_holding_decision_return_pct,
             "win_rate_pct": row.win_rate_pct,
             "neutral_rate_pct": row.neutral_rate_pct,
             "avg_stock_return_pct": row.avg_stock_return_pct,

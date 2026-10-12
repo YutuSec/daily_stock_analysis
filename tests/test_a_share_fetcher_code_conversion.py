@@ -7,7 +7,7 @@ import unittest
 
 import pandas as pd
 
-from data_provider.base import DataFetcherManager, normalize_stock_code
+from data_provider.base import DataFetcherManager, normalize_stock_code, preserve_cn_index_daily_code
 from data_provider.baostock_fetcher import BaostockFetcher
 from data_provider.pytdx_fetcher import PytdxFetcher
 from data_provider.tushare_fetcher import TushareFetcher
@@ -30,11 +30,21 @@ class TestDataFetcherManagerAShareCodes(unittest.TestCase):
         fetcher = _RecordingDailyFetcher()
         manager = DataFetcherManager(fetchers=[fetcher])
 
-        df, source = manager.get_daily_data("601888", days=1)
+        df, source = manager.get_daily_data("601888", end_date="2026-05-22", days=1)
 
         self.assertFalse(df.empty)
         self.assertEqual(source, "RecordingDailyFetcher")
         self.assertEqual(fetcher.calls, ["601888"])
+
+    def test_get_daily_data_preserves_explicit_cn_index_identity(self) -> None:
+        fetcher = _RecordingDailyFetcher()
+        manager = DataFetcherManager(fetchers=[fetcher])
+
+        df, source = manager.get_daily_data("sh000300", end_date="2026-05-22", days=1)
+
+        self.assertFalse(df.empty)
+        self.assertEqual(source, "RecordingDailyFetcher")
+        self.assertEqual(fetcher.calls, ["000300.SH"])
 
 
 class TestBaostockAShareCodeConversion(unittest.TestCase):
@@ -121,6 +131,11 @@ class TestNormalizeStockCode(unittest.TestCase):
         self.assertEqual(normalize_stock_code("SS.600519"), "600519")
         self.assertEqual(normalize_stock_code("600519.SS"), "600519")
         self.assertEqual(normalize_stock_code("BJ.920748"), "920748")
+
+    def test_preserve_cn_index_daily_code_only_for_explicit_index_identity(self) -> None:
+        self.assertEqual(preserve_cn_index_daily_code("sh000300"), "000300.SH")
+        self.assertEqual(preserve_cn_index_daily_code("000300.SH"), "000300.SH")
+        self.assertIsNone(preserve_cn_index_daily_code("000300"))
 
 
 if __name__ == "__main__":

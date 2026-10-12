@@ -2,6 +2,8 @@ import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Pie, PieChart, ResponsiveContainer, Tooltip, Legend, Cell } from 'recharts';
 import { decisionSignalsApi } from '../api/decisionSignals';
+import { analysisApi } from '../api/analysis';
+import { paperTradingApi } from '../api/paperTrading';
 import { portfolioApi } from '../api/portfolio';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
@@ -56,6 +58,7 @@ import { buildDecisionActionLabelMap, getDecisionActionLabel } from '../utils/de
 const PIE_COLORS = ['#00d4ff', '#00ff88', '#ffaa00', '#ff7a45', '#7f8cff', '#ff4466'];
 const DEFAULT_PAGE_SIZE = 20;
 const PORTFOLIO_SIGNAL_LOOKUP_CONCURRENCY = 6;
+const stablePaperSyncKeyPart = (value: unknown) => String(value ?? '').trim().replace(/[^a-zA-Z0-9_.:-]+/g, '_');
 const FALLBACK_BROKERS: PortfolioImportBrokerItem[] = [
   { broker: 'huatai', aliases: [], displayName: '华泰' },
   { broker: 'citic', aliases: ['zhongxin'], displayName: '中信' },
@@ -74,6 +77,12 @@ type PortfolioSignalLookup = {
   stockCode: string;
   market?: DecisionSignalMarket;
 };
+
+const portfolioPositionKey = (row: FlatPosition) => (
+  row.positionId
+    ? `position-${row.positionId}`
+    : `${row.accountId}-${row.symbol}-${row.market}`
+);
 
 type PortfolioSignalLookupResult = {
   items: DecisionSignalItem[];
@@ -217,6 +226,9 @@ const PortfolioPage: React.FC = () => {
   const portfolioSignalsRequestRef = useRef(0);
   const [positionAnalysisLoadingKey, setPositionAnalysisLoadingKey] = useState<string | null>(null);
   const [positionAnalysisMessage, setPositionAnalysisMessage] = useState<string | null>(null);
+  const [analysisModels, setAnalysisModels] = useState<string[]>([]);
+  const [selectedAnalysisModel, setSelectedAnalysisModel] = useState('');
+  const [analysisModelsWarning, setAnalysisModelsWarning] = useState<string | null>(null);
 
   const [brokers, setBrokers] = useState<PortfolioImportBrokerItem[]>([]);
   const [selectedBroker, setSelectedBroker] = useState('huatai');
@@ -337,6 +349,26 @@ const PortfolioPage: React.FC = () => {
     }
   }, [selectedBroker]);
 
+  const loadAnalysisModels = useCallback(async () => {
+    try {
+      const response = await analysisApi.getModels();
+      const models = response.models.map((item) => item.model).filter(Boolean);
+      setAnalysisModels(models);
+      setSelectedAnalysisModel((current) => (
+        current && models.includes(current)
+          ? current
+          : (response.defaultModel && models.includes(response.defaultModel)
+              ? response.defaultModel
+              : models[0] || '')
+      ));
+      setAnalysisModelsWarning(models.length > 0 ? null : '当前没有可用的分析模型配置。');
+    } catch (err) {
+      setAnalysisModels([]);
+      setSelectedAnalysisModel('');
+      setAnalysisModelsWarning(getParsedApiError(err).message || '分析模型配置加载失败。');
+    }
+  }, []);
+
   const loadSnapshotAndRisk = useCallback(async () => {
     setIsLoading(true);
     setRiskWarning(null);
@@ -436,7 +468,8 @@ const PortfolioPage: React.FC = () => {
   useEffect(() => {
     void loadAccounts();
     void loadBrokers();
-  }, [loadAccounts, loadBrokers]);
+    void loadAnalysisModels();
+  }, [loadAccounts, loadAnalysisModels, loadBrokers]);
 
   useEffect(() => {
     void loadSnapshotAndRisk();
@@ -562,7 +595,7 @@ const PortfolioPage: React.FC = () => {
         if (!areStockCodesEquivalent(row.symbol, signal.stockCode)) {
           continue;
         }
-        const key = `${row.accountId}-${row.symbol}-${row.market}`;
+        const key = portfolioPositionKey(row);
         const existing = mapped.get(key);
         if (isNewerSignal(existing, signal)) {
           mapped.set(key, signal);
@@ -572,8 +605,12 @@ const PortfolioPage: React.FC = () => {
     return mapped;
   }, [portfolioSignals, positionRows]);
 
-  const handleAnalyzePosition = async (row: FlatPosition) => {
-    const key = `${row.accountId}-${row.symbol}-${row.market}`;
+  const handleAnalyzePosition = async (row: FlatPosition, runAllModels = false) => {
+    if (!selectedAnalysisModel || analysisModels.length === 0) {
+      setAnalysisModelsWarning('当前没有可用的分析模型配置。');
+      return;
+    }
+    const key = portfolioPositionKey(row);
     setPositionAnalysisLoadingKey(key);
     setPositionAnalysisMessage(null);
     setError(null);
@@ -582,8 +619,59 @@ const PortfolioPage: React.FC = () => {
         accountId: row.accountId,
         analysisPhase: 'auto',
         force: false,
+        ...(runAllModels ? { models: analysisModels } : { model: selectedAnalysisModel }),
       });
-      setPositionAnalysisMessage(`已提交 ${row.symbol} 分析任务：${task.taskId}`);
+      if ('accepted' in task) {
+        setPositionAnalysisMessage(
+          `已提交 ${row.symbol} 的 ${task.accepted.length} 个模型任务，${task.duplicates.length} 个重复任务已跳过。`,
+        );
+      } else {
+        setPositionAnalysisMessage(`已提交 ${row.symbol} 的 ${task.model || selectedAnalysisModel} 分析任务：${task.taskId}`);
+      }
+    } catch (err) {
+      setError(getParsedApiError(err));
+    } finally {
+      setPositionAnalysisLoadingKey(null);
+    }
+  };
+
+  const handleSyncPositionToPaper = async (row: FlatPosition, runAllModels = false) => {
+    if (!row.positionId) {
+      setPositionAnalysisMessage(language === 'zh' ? '当前持仓快照缺少 positionId，请先刷新持仓后再同步。' : 'This snapshot has no positionId yet. Refresh portfolio data before syncing.');
+      return;
+    }
+    const targetModels = runAllModels ? analysisModels : [selectedAnalysisModel].filter(Boolean);
+    if (targetModels.length === 0) {
+      setAnalysisModelsWarning(language === 'zh' ? '当前没有可用的分析模型配置。' : 'No analysis model is configured.');
+      return;
+    }
+    const confirmed = window.confirm(
+      language === 'zh'
+        ? `确认将 ${row.symbol} 按当前持仓数量和成本导入 ${targetModels.length} 个模型的模拟账本？不会发送真实订单。`
+        : `Import ${row.symbol} into ${targetModels.length} model paper ledger(s)? No real order will be sent.`
+    );
+    if (!confirmed) return;
+    const key = portfolioPositionKey(row);
+    setPositionAnalysisLoadingKey(key);
+    setPositionAnalysisMessage(null);
+    setError(null);
+    try {
+      const result = await paperTradingApi.syncFromPortfolio({
+        portfolioPositionId: row.positionId,
+        sourceModels: targetModels,
+        tradeDate: snapshot?.asOf || getTodayIso(),
+        idempotencyKey: [
+          'portfolio-import',
+          row.positionId,
+          snapshot?.asOf || getTodayIso(),
+          ...targetModels,
+        ].map(stablePaperSyncKeyPart).join('-').slice(0, 128),
+      });
+      setPositionAnalysisMessage(
+        language === 'zh'
+          ? `已同步 ${result.items.length} 个模型模拟账本。`
+          : `Synced ${result.items.length} model paper ledger(s).`
+      );
     } catch (err) {
       setError(getParsedApiError(err));
     } finally {
@@ -1179,10 +1267,33 @@ const PortfolioPage: React.FC = () => {
 
       <section className="grid grid-cols-1 xl:grid-cols-3 gap-3">
         <Card className="xl:col-span-2" padding="md">
-          <div className="flex items-center justify-between mb-3">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold text-foreground">{text.positionsTitle}</h2>
-            <span className="text-xs text-secondary">{formatUiText(text.countItems, { count: positionRows.length })}</span>
+            <div className="flex items-center gap-2">
+              {analysisModels.length > 0 ? (
+                <select
+                  aria-label={language === 'zh' ? '持仓分析模型' : 'Portfolio analysis model'}
+                  className={`${PORTFOLIO_SELECT_CLASS} !h-9 !w-auto min-w-44 !px-3 !pr-8 text-xs`}
+                  value={selectedAnalysisModel}
+                  onChange={(event) => setSelectedAnalysisModel(event.target.value)}
+                  disabled={positionAnalysisLoadingKey !== null}
+                >
+                  {analysisModels.map((model) => (
+                    <option key={model} value={model}>{model}</option>
+                  ))}
+                </select>
+              ) : null}
+              <span className="text-xs text-secondary">{formatUiText(text.countItems, { count: positionRows.length })}</span>
+            </div>
           </div>
+          {analysisModelsWarning ? (
+            <InlineAlert
+              variant="warning"
+              title={language === 'zh' ? '模型配置不可用' : 'Model configuration unavailable'}
+              message={analysisModelsWarning}
+              className="mb-3 rounded-xl px-3 py-2 text-xs shadow-none"
+            />
+          ) : null}
           {portfolioSignalsWarning ? (
             <InlineAlert
               variant="warning"
@@ -1211,16 +1322,16 @@ const PortfolioPage: React.FC = () => {
                     <th className="text-right py-2 pr-3">{text.unrealizedPnl}</th>
                     <th className="text-right py-2 pr-3">{text.returnPct}</th>
                     <th className="min-w-[9rem] text-right py-2 pr-3">{t('decisionSignals.portfolioColumn')}</th>
-                    <th className="w-20 text-right py-2">{text.action}</th>
+                    <th className="min-w-36 text-right py-2">{text.action}</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {positionRows.map((row) => {
-                    const rowKey = `${row.accountId}-${row.symbol}-${row.market}`;
+                  {positionRows.map((row, index) => {
+                    const rowKey = portfolioPositionKey(row);
                     const analyzing = positionAnalysisLoadingKey === rowKey;
                     const signal = signalByPositionKey.get(rowKey);
                     return (
-                    <tr key={rowKey} className="border-b border-white/5">
+                    <tr key={`${rowKey}-${index}`} className="border-b border-white/5">
                       <td className="py-2 pr-2 text-secondary">{row.accountName}</td>
                       <td className="py-2 pr-2 font-mono text-foreground">{row.symbol}</td>
                       <td className="py-2 pr-2 text-right">{row.quantity.toFixed(2)}</td>
@@ -1258,14 +1369,44 @@ const PortfolioPage: React.FC = () => {
                         <PortfolioSignalSummary item={signal} loading={portfolioSignalsLoading} />
                       </td>
                       <td className="py-2 text-right">
-                        <button
-                          type="button"
-                          onClick={() => void handleAnalyzePosition(row)}
-                          disabled={analyzing}
-                          className="btn-secondary px-2 py-1 text-xs disabled:cursor-wait disabled:opacity-60"
-                        >
-                          {analyzing ? text.submitting : text.analyze}
-                        </button>
+                        <div className="flex justify-end gap-1">
+                          <button
+                            type="button"
+                            onClick={() => void handleAnalyzePosition(row)}
+                            disabled={analyzing || !selectedAnalysisModel}
+                            className="btn-secondary px-2 py-1 text-xs disabled:cursor-wait disabled:opacity-60"
+                          >
+                            {analyzing ? text.submitting : text.analyze}
+                          </button>
+                          {analysisModels.length > 1 ? (
+                            <button
+                              type="button"
+                              onClick={() => void handleAnalyzePosition(row, true)}
+                              disabled={analyzing}
+                              className="btn-secondary px-2 py-1 text-xs disabled:cursor-wait disabled:opacity-60"
+                            >
+                              {language === 'zh' ? '全部模型' : 'All models'}
+                            </button>
+                          ) : null}
+                          <button
+                            type="button"
+                            onClick={() => void handleSyncPositionToPaper(row)}
+                            disabled={analyzing || !selectedAnalysisModel || !row.positionId}
+                            className="btn-secondary px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {language === 'zh' ? '同步模拟' : 'Sync paper'}
+                          </button>
+                          {analysisModels.length > 1 ? (
+                            <button
+                              type="button"
+                              onClick={() => void handleSyncPositionToPaper(row, true)}
+                              disabled={analyzing || !row.positionId}
+                              className="btn-secondary px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              {language === 'zh' ? '同步全部' : 'Sync all'}
+                            </button>
+                          ) : null}
+                        </div>
                       </td>
                     </tr>
                     );

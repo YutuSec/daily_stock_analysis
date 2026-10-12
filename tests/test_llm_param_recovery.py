@@ -81,6 +81,30 @@ def test_unsupported_temperature_error_retries_once_and_caches_recovery() -> Non
     assert "temperature" not in future_kwargs
 
 
+def test_unsupported_response_format_error_retries_without_json_mode() -> None:
+    calls = []
+
+    def _call(kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise RuntimeError("Unsupported parameter: response_format is not supported")
+        return "ok"
+
+    result = call_litellm_with_param_recovery(
+        _call,
+        model="anthropic/custom-model",
+        call_kwargs={
+            "model": "anthropic/custom-model",
+            "messages": [],
+            "response_format": {"type": "json_object"},
+        },
+    )
+
+    assert result == "ok"
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in calls[1]
+
+
 def test_recovery_cache_is_scoped_to_api_base() -> None:
     clear_litellm_generation_param_recovery_cache()
     calls = []

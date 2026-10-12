@@ -32,6 +32,7 @@ import src.auth as auth
 from src.config import Config
 from src.core.config_manager import ConfigManager
 from src.services.system_config_service import SystemConfigService
+from src.storage import DatabaseManager, RuntimeSetting, RuntimeSettingAudit
 
 
 class SystemConfigApiTestCase(unittest.TestCase):
@@ -64,6 +65,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
         os.environ["ENV_FILE"] = str(self.env_path)
         os.environ["DATABASE_PATH"] = str(Path(self.temp_dir.name) / "system_config_api_test.db")
         Config.reset_instance()
+        DatabaseManager.reset_instance()
 
         self.manager = ConfigManager(env_path=self.env_path)
         self.service = SystemConfigService(manager=self.manager)
@@ -72,6 +74,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
 
     def tearDown(self) -> None:
         Config.reset_instance()
+        DatabaseManager.reset_instance()
         self._verify_session_patch.stop()
         os.environ.pop("ENV_FILE", None)
         if self._orig_dsa_desktop_mode is None:
@@ -350,6 +353,39 @@ class SystemConfigApiTestCase(unittest.TestCase):
 
         self.assertEqual(context.exception.status_code, 409)
         self.assertEqual(context.exception.detail["error"], "config_version_conflict")
+
+    def test_put_config_persists_market_opportunity_mode_as_runtime_setting(self) -> None:
+        current = system_config.get_system_config(include_schema=False, service=self.service).model_dump()
+
+        payload = system_config.update_system_config(
+            request=UpdateSystemConfigRequest(
+                config_version=current["config_version"],
+                mask_token="******",
+                reload_now=False,
+                items=[{"key": "MARKET_OPPORTUNITY_MODE", "value": "observe"}],
+            ),
+            service=self.service,
+        ).model_dump()
+
+        self.assertEqual(payload["applied_count"], 1)
+        self.assertIn("MARKET_OPPORTUNITY_MODE", payload["updated_keys"])
+        self.assertNotIn("MARKET_OPPORTUNITY_MODE=observe", self.env_path.read_text(encoding="utf-8"))
+        db = DatabaseManager.get_instance()
+        with db.session_scope() as session:
+            row = session.get(RuntimeSetting, "MARKET_OPPORTUNITY_MODE")
+            self.assertIsNotNone(row)
+            self.assertEqual(row.value, "observe")
+            audit_count = (
+                session.query(RuntimeSettingAudit)
+                .filter_by(key="MARKET_OPPORTUNITY_MODE", new_value="observe")
+                .count()
+            )
+            self.assertEqual(audit_count, 1)
+
+        refreshed = system_config.get_system_config(include_schema=False, service=self.service).model_dump()
+        item_map = {item["key"]: item for item in refreshed["items"]}
+        self.assertEqual(item_map["MARKET_OPPORTUNITY_MODE"]["value"], "observe")
+        self.assertTrue(item_map["MARKET_OPPORTUNITY_MODE"]["raw_value_exists"])
 
     def test_put_config_preserves_comments_and_blank_lines(self) -> None:
         self.env_path.write_text(

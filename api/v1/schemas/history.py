@@ -34,6 +34,11 @@ class HistoryItem(BaseModel):
     operation_advice: Optional[str] = Field(None, description="操作建议")
     action: Optional[DecisionAction] = Field(None, description="结构化建议动作 taxonomy")
     action_label: Optional[str] = Field(None, description="建议动作展示标签")
+    analysis_status: Literal["success", "failed", "degraded"] = Field(
+        "success",
+        description="分析尝试状态：success/failed/degraded",
+    )
+    error_message: Optional[str] = Field(None, description="失败尝试的脱敏错误摘要")
     current_price: Optional[float] = Field(None, description="分析时股价")
     change_pct: Optional[float] = Field(None, description="分析时涨跌幅(%)")
     volume_ratio: Optional[float] = Field(None, description="分析时量比")
@@ -153,6 +158,11 @@ class ReportSummary(BaseModel):
     operation_advice: Optional[str] = Field(None, description="操作建议")
     action: Optional[DecisionAction] = Field(None, description="结构化建议动作 taxonomy")
     action_label: Optional[str] = Field(None, description="建议动作展示标签")
+    analysis_status: Literal["success", "failed", "degraded"] = Field(
+        "success",
+        description="最新分析尝试状态：success/failed/degraded",
+    )
+    error_message: Optional[str] = Field(None, description="失败尝试的脱敏错误摘要")
     trend_prediction: Optional[str] = Field(None, description="趋势预测")
     sentiment_score: Optional[int] = Field(
         None,
@@ -358,6 +368,14 @@ class StockBarItem(BaseModel):
         None,
         description="最新分析市场阶段低敏摘要",
     )
+    analysis_status: Literal["completed", "failed", "degraded", "stale_success"] = Field(
+        "completed",
+        description="该股票/模型最近一次分析尝试状态；失败尝试可能比最新成功报告更新",
+    )
+    error_message: Optional[str] = Field(None, description="失败/降级尝试的脱敏错误摘要")
+    latest_attempt_time: Optional[str] = Field(None, description="最近一次分析尝试时间")
+    latest_attempt_error: Optional[str] = Field(None, description="最近一次失败/降级原因")
+    last_success_time: Optional[str] = Field(None, description="最近一次成功报告时间")
     model_config = ConfigDict(json_schema_extra={
         "example": {
             "id": 1234,

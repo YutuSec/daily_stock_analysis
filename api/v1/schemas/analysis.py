@@ -13,7 +13,7 @@
 from typing import Optional, List, Any, Literal
 from enum import Enum
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 from src.utils.analysis_metadata import SELECTION_SOURCE_PATTERN
 
 
@@ -91,6 +91,28 @@ class AnalyzeRequest(BaseModel):
         description="本次分析使用的策略 skill ID 列表；兼容 legacy strategies 字段",
         json_schema_extra={"example": ["bull_trend", "growth_quality"]},
     )
+    model: Optional[str] = Field(
+        None,
+        description="本次分析锁定的模型路由；设置后禁用跨模型 fallback",
+        json_schema_extra={"example": "deepseek"},
+    )
+    models: Optional[List[str]] = Field(
+        None,
+        min_length=2,
+        max_length=50,
+        description="异步模式下并行运行的多个模型路由",
+        json_schema_extra={"example": ["deepseek", "claude", "gemini"]},
+    )
+
+    @model_validator(mode="after")
+    def validate_model_selection(self):
+        if self.model and self.models:
+            raise ValueError("model 与 models 不能同时设置")
+        if self.models:
+            normalized = [item.strip() for item in self.models if item.strip()]
+            if len(normalized) != len(self.models) or len(set(normalized)) != len(normalized):
+                raise ValueError("models 必须包含至少两个不同的非空模型")
+        return self
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
@@ -178,6 +200,7 @@ class TaskAccepted(BaseModel):
     )
     message: Optional[str] = Field(None, description="提示信息")
     analysis_phase: AnalysisPhase = Field("auto", description="请求的分析阶段")
+    model: Optional[str] = Field(None, description="本任务锁定的模型路由")
     
     model_config = ConfigDict(json_schema_extra={
         "example": {
@@ -202,6 +225,7 @@ class BatchTaskAcceptedItem(BaseModel):
     )
     message: Optional[str] = Field(None, description="提示信息")
     analysis_phase: AnalysisPhase = Field("auto", description="请求的分析阶段")
+    model: Optional[str] = Field(None, description="本任务锁定的模型路由")
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
@@ -220,6 +244,7 @@ class BatchDuplicateTaskItem(BaseModel):
     stock_code: str = Field(..., description="股票代码")
     existing_task_id: str = Field(..., description="已存在的任务 ID")
     message: str = Field(..., description="错误信息")
+    model: Optional[str] = Field(None, description="重复任务锁定的模型路由")
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
@@ -303,7 +328,8 @@ class TaskStatus(BaseModel):
         description="请求的分析阶段；无持久化字段的历史 DB fallback 可能为空",
     )
     skills: Optional[List[str]] = Field(None, description="本次任务使用的策略 skill ID 列表")
-    
+    model: Optional[str] = Field(None, description="本次任务锁定的模型路由")
+
     model_config = ConfigDict(json_schema_extra={
         "example": {
             "task_id": "task_abc123",
@@ -316,7 +342,8 @@ class TaskStatus(BaseModel):
             "original_query": "茅台",
             "selection_source": "autocomplete",
             "analysis_phase": "auto",
-            "skills": ["bull_trend"]
+            "skills": ["bull_trend"],
+            "model": "deepseek",
         }
     })
 
@@ -348,7 +375,8 @@ class TaskInfo(BaseModel):
     )
     analysis_phase: AnalysisPhase = Field("auto", description="请求的分析阶段")
     skills: Optional[List[str]] = Field(None, description="本次任务使用的策略 skill ID 列表")
-    
+    model: Optional[str] = Field(None, description="本次任务锁定的模型路由")
+
     model_config = ConfigDict(json_schema_extra={
         "example": {
             "task_id": "abc123def456",
@@ -365,9 +393,26 @@ class TaskInfo(BaseModel):
             "original_query": "茅台",
             "selection_source": "autocomplete",
             "analysis_phase": "auto",
-            "skills": ["bull_trend"]
+            "skills": ["bull_trend"],
+            "model": "deepseek",
         }
     })
+
+
+class AnalysisModelInfo(BaseModel):
+    """A configured analysis model route safe to expose to clients."""
+
+    model: str = Field(..., description="模型路由名称")
+    is_default: bool = Field(False, description="是否为默认分析模型")
+
+
+class AnalysisModelsResponse(BaseModel):
+    """Configured request-selectable analysis models."""
+
+    models: List[AnalysisModelInfo] = Field(default_factory=list)
+    default_model: Optional[str] = Field(None, description="默认分析模型")
+    comparison_available: bool = Field(False, description="是否至少配置两个可并行分析的模型")
+    supported_markets: List[str] = Field(default_factory=list, description="当前服务支持的市场代码")
 
 
 class TaskListResponse(BaseModel):

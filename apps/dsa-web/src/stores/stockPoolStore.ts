@@ -31,6 +31,8 @@ type SubmitAnalysisOptions = {
   forceRefresh?: boolean;
   skills?: string[];
   reportLanguage?: ReportLanguage;
+  model?: string;
+  models?: string[];
 };
 
 type CompletedTaskSelectionIntent = {
@@ -106,6 +108,7 @@ export interface StockPoolState {
   refreshMarketReviewHistory: (silent?: boolean) => Promise<void>;
   loadMoreMarketReviewHistory: () => Promise<void>;
   selectHistoryItem: (recordId: number, isUserInitiated?: boolean) => Promise<void>;
+  clearSelectedReport: () => void;
   toggleHistorySelection: (recordId: number) => void;
   toggleSelectAllVisible: () => void;
   deleteSelectedHistory: () => Promise<void>;
@@ -120,8 +123,8 @@ export interface StockPoolState {
   refreshActiveTasks: () => Promise<void>;
   removeTask: (taskId: string) => void;
   resetDashboardState: () => void;
-  loadStockBar: () => Promise<void>;
-  refreshStockBar: () => Promise<void>;
+  loadStockBar: (modelUsed?: string) => Promise<void>;
+  refreshStockBar: (modelUsed?: string) => Promise<void>;
 }
 
 const initialState = {
@@ -745,6 +748,17 @@ export const useStockPoolStore = create<StockPoolState>((set, get) => ({
     }
   },
 
+  clearSelectedReport: () => {
+    reportRequestSeq += 1;
+    stockHistoryRequestSeq += 1;
+    resetStockHistoryState(set);
+    set({
+      selectedReport: null,
+      isLoadingReport: false,
+      isHistoryTrendOpen: false,
+    });
+  },
+
   toggleHistorySelection: (recordId) => {
     const selected = new Set(get().selectedHistoryIds);
     if (selected.has(recordId)) {
@@ -916,6 +930,8 @@ export const useStockPoolStore = create<StockPoolState>((set, get) => ({
         notify,
         forceRefresh,
         skills,
+        model: options?.model,
+        models: options?.models,
         ...(options?.reportLanguage !== undefined && { reportLanguage: options.reportLanguage }),
       });
 
@@ -1049,7 +1065,7 @@ export const useStockPoolStore = create<StockPoolState>((set, get) => ({
     set({ ...initialState });
   },
 
-  loadStockBar: async () => {
+  loadStockBar: async (modelUsed) => {
     const state = get();
     if (state.isLoadingStockBar) return;
     const requestSeq = ++stockBarRequestSeq;
@@ -1058,6 +1074,7 @@ export const useStockPoolStore = create<StockPoolState>((set, get) => ({
       const response = await historyApi.getStockBarList({
         startDate: getRecentStartDate(90),
         endDate: getTodayInShanghai(),
+        modelUsed,
       });
       if (requestSeq !== stockBarRequestSeq) {
         return;
@@ -1075,12 +1092,13 @@ export const useStockPoolStore = create<StockPoolState>((set, get) => ({
     }
   },
 
-  refreshStockBar: async () => {
+  refreshStockBar: async (modelUsed) => {
     const requestSeq = ++stockBarRequestSeq;
     try {
       const response = await historyApi.getStockBarList({
         startDate: getRecentStartDate(90),
         endDate: getTodayInShanghai(),
+        modelUsed,
       });
       if (requestSeq !== stockBarRequestSeq) {
         return;

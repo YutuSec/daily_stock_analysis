@@ -1588,6 +1588,41 @@ def test_reassess_preview_prefers_stability_adjusted_score(client_and_db) -> Non
     assert _decision_signal_count(db) == 0
 
 
+def test_reassess_preview_uses_frozen_empty_branch(client_and_db) -> None:
+    client, db = client_and_db
+    raw_result = _valid_reassess_raw(
+        action="reduce",
+        operation_advice="减仓",
+        sentiment_score=37,
+        holding_state="empty",
+        position_actions={
+            "empty": {"action": "watch", "advice": "观望"},
+            "holding": {"action": "reduce", "advice": "减仓"},
+        },
+    )
+    record_id = _save_reassess_history(
+        db,
+        operation_advice="减仓",
+        sentiment_score=37,
+        raw_result=raw_result,
+        context_snapshot=_valid_reassess_context(),
+    )
+
+    response = client.post(
+        "/api/v1/decision-signals/reassess",
+        json={"source_report_id": record_id, "decision_profile": "balanced", "persist": False},
+    )
+
+    assert response.status_code == 200, response.text
+    preview = response.json()["preview"]
+    assert preview["action"] == "watch"
+    assert preview["metadata"]["holding_state"] == "empty"
+    assert preview["metadata"]["base_action"] == "reduce"
+    assert preview["metadata"]["effective_action_source"] == "position_actions.empty"
+    assert preview["metadata"]["position_actions"]["holding"]["action"] == "reduce"
+    assert _decision_signal_count(db) == 0
+
+
 def test_reassess_service_has_no_live_market_provider_imports() -> None:
     source = (Path(__file__).resolve().parents[1] / "src/services/decision_signal_reassess_service.py").read_text(
         encoding="utf-8"

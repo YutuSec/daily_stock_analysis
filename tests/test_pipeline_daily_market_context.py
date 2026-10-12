@@ -6,9 +6,11 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pandas as pd
 
 from src.analyzer import GeminiAnalyzer
 from src.core.pipeline import StockAnalysisPipeline
@@ -36,6 +38,8 @@ def _pipeline_config(*, daily_market_context_enabled: bool) -> SimpleNamespace:
         social_sentiment_api_key="",
         social_sentiment_api_url="https://example.invalid/social",
         daily_market_context_enabled=daily_market_context_enabled,
+        paper_trading_style="position",
+        paper_trading_style_overrides={},
     )
 
 
@@ -91,6 +95,152 @@ def test_pipeline_constructor_explicit_flag_overrides_config() -> None:
     )
 
     assert pipeline.daily_market_context_enabled is False
+
+
+def test_pipeline_daily_fetch_uses_effective_paper_style_window() -> None:
+    pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+    pipeline.config = _pipeline_config(daily_market_context_enabled=False)
+    pipeline.config.paper_trading_style = "short_swing"
+    pipeline.config.paper_trading_style_overrides = {"cn:600519": "trend"}
+    pipeline.fetcher_manager = MagicMock()
+    pipeline.fetcher_manager.get_stock_name.return_value = "贵州茅台"
+    pipeline.fetcher_manager.get_daily_data.return_value = (
+        pd.DataFrame([
+            {"date": "2026-08-28", "open": 1, "high": 2, "low": 1, "close": 1.5, "volume": 100}
+        ]),
+        "unit",
+    )
+    pipeline.db = MagicMock()
+    pipeline.db.has_today_data.return_value = False
+    pipeline.db.save_daily_data.return_value = 1
+    pipeline._resolve_resume_target_date = lambda code, current_time=None: date(2026, 8, 28)
+
+    ok, error = pipeline.fetch_and_save_stock_data("600519")
+
+    assert ok is True
+    assert error is None
+    pipeline.fetcher_manager.get_daily_data.assert_called_once_with(
+        "600519",
+        days=500,
+        end_date="2026-08-28",
+        current_time=None,
+    )
+
+
+def test_pipeline_backfills_when_latest_row_exists_but_style_window_is_short() -> None:
+    pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+    pipeline.config = _pipeline_config(daily_market_context_enabled=False)
+    pipeline.config.paper_trading_style = "position"
+    pipeline.config.paper_trading_style_overrides = {"cn:600519": "trend"}
+    pipeline.fetcher_manager = MagicMock()
+    pipeline.fetcher_manager.get_stock_name.return_value = "贵州茅台"
+    pipeline.fetcher_manager.get_daily_data.return_value = (
+        pd.DataFrame([
+            {"date": f"2026-01-{(index % 28) + 1:02d}", "open": 1, "high": 2, "low": 1, "close": 1.5, "volume": 100}
+            for index in range(500)
+        ]),
+        "unit",
+    )
+    pipeline.db = MagicMock()
+    pipeline.db.has_today_data.return_value = True
+    pipeline.db.get_data_range.return_value = [object() for _ in range(180)]
+    pipeline.db.save_daily_data.return_value = 320
+    pipeline._resolve_resume_target_date = lambda code, current_time=None: date(2026, 8, 28)
+
+    ok, error = pipeline.fetch_and_save_stock_data("600519")
+
+    assert ok is True
+    assert error is None
+    pipeline.fetcher_manager.get_daily_data.assert_called_once_with(
+        "600519",
+        days=500,
+        end_date="2026-08-28",
+        current_time=None,
+    )
+    assert pipeline.db.get_data_range.called
+
+
+def test_agent_history_requires_full_effective_style_window() -> None:
+    pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+    pipeline.db = MagicMock()
+    pipeline.db.get_data_range.return_value = [object() for _ in range(200)]
+    pipeline.fetcher_manager = MagicMock()
+    pipeline.fetcher_manager.get_daily_data.return_value = (
+        pd.DataFrame([
+            {"date": f"2026-01-{(index % 28) + 1:02d}", "open": 1, "high": 2, "low": 1, "close": 1.5, "volume": 100}
+            for index in range(500)
+        ]),
+        "unit",
+    )
+    pipeline._resolve_resume_target_date = lambda code: date(2026, 8, 28)
+
+    pipeline._ensure_agent_history("600519", min_days=500)
+
+    pipeline.fetcher_manager.get_daily_data.assert_called_once_with(
+        "600519",
+        days=500,
+        end_date="2026-08-28",
+    )
+
+
+def test_pipeline_context_fallback_uses_effective_paper_style_window() -> None:
+    pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+    pipeline.config = _pipeline_config(daily_market_context_enabled=False)
+    pipeline.config.paper_trading_style = "position"
+    pipeline.config.paper_trading_style_overrides = {}
+    pipeline.db = MagicMock()
+    pipeline.db.get_analysis_context.return_value = None
+    pipeline.db.save_daily_data.return_value = 2
+    pipeline.fetcher_manager = MagicMock()
+    pipeline.fetcher_manager.get_daily_data.return_value = (
+        pd.DataFrame([
+            {"date": "2026-08-27", "open": 1, "high": 2, "low": 1, "close": 1.5, "volume": 100},
+            {"date": "2026-08-28", "open": 2, "high": 3, "low": 2, "close": 2.5, "volume": 200},
+        ]),
+        "unit",
+    )
+    style_context = pipeline._paper_trading_style_context("7203.T", market="jp")
+
+    context = pipeline._get_analysis_context_with_market_fallback(
+        "7203.T",
+        paper_trading_style_context=style_context,
+        target_date=date(2026, 8, 28),
+    )
+
+    pipeline.fetcher_manager.get_daily_data.assert_called_once_with(
+        "7203.T",
+        days=180,
+        end_date="2026-08-28",
+    )
+    assert context["today"]["close"] == 2.5
+
+
+def test_pipeline_style_indicator_snapshot_uses_profile_windows() -> None:
+    pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+    pipeline.config = _pipeline_config(daily_market_context_enabled=False)
+    pipeline.config.paper_trading_style = "trend"
+    pipeline.config.paper_trading_style_overrides = {}
+    style_context = pipeline._paper_trading_style_context("600519", market="cn")
+    df = pd.DataFrame([
+        {
+            "date": (date(2026, 1, 1) + timedelta(days=index)).isoformat(),
+            "open": 100 + index,
+            "high": 102 + index,
+            "low": 99 + index,
+            "close": 101 + index,
+            "volume": 1000 + index,
+        }
+        for index in range(260)
+    ])
+
+    snapshot = pipeline._style_indicator_snapshot(df, style_context)
+
+    assert snapshot["analysis_window_sessions"] == 500
+    assert snapshot["bars_observed"] == 260
+    assert snapshot["history_sufficient"] is False
+    assert snapshot["core_ma_windows"] == [20, 60, 120, 250]
+    assert "ma250" in snapshot["moving_averages"]
+    assert "atr120" in snapshot["volatility"]
 
 
 def test_pipeline_loads_daily_market_context_when_market_review_enabled() -> None:

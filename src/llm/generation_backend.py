@@ -100,5 +100,6 @@ class GenerationBackend(Protocol):
         stream_progress_callback: Optional[Callable[[int], None]] = None,
         response_validator: Optional[Callable[[str], None]] = None,
         audit_context: Optional[Dict[str, Any]] = None,
+        structured_tool: Optional[Dict[str, Any]] = None,
     ) -> GenerationResult:
         """Generate text with the backend."""

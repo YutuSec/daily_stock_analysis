@@ -18,7 +18,7 @@ import json as _json
 import logging
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as clock_time
 from typing import Optional, Tuple, List, Dict, Any
 
 import pandas as pd
@@ -32,7 +32,7 @@ from tenacity import (
 )
 
 from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS,is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code, _is_hk_market
-from .realtime_types import UnifiedRealtimeQuote, ChipDistribution
+from .realtime_types import UnifiedRealtimeQuote, UnifiedAuctionSnapshot, ChipDistribution, safe_float
 from src.config import get_config
 import os
 from zoneinfo import ZoneInfo
@@ -58,6 +58,19 @@ def _is_etf_code(stock_code: str) -> bool:
     """
     code = normalize_stock_code(stock_code)
     return code.startswith(_ETF_ALL_PREFIXES) and len(code) == 6
+
+
+def _to_tushare_ts_code(stock_code: str) -> Optional[str]:
+    code = normalize_stock_code(stock_code)
+    if not re.fullmatch(r"\d{6}", code or ""):
+        return None
+    if code.startswith(("5", "6", "9")):
+        return f"{code}.SH"
+    if code.startswith(("0", "1", "2", "3")):
+        return f"{code}.SZ"
+    if code.startswith(("4", "8")):
+        return f"{code}.BJ"
+    return None
 
 
 def _is_us_code(stock_code: str) -> bool:
@@ -266,6 +279,143 @@ class TushareFetcher(BaseFetcher):
     def _get_china_now(self) -> datetime:
         """返回上海时区当前时间，方便测试覆盖跨日刷新逻辑。"""
         return datetime.now(ZoneInfo("Asia/Shanghai"))
+
+    def get_auction_capability_diagnostics(self, stock_code: str, *, market: str = "cn") -> Dict[str, Any]:
+        """Return provider-level opening-auction capability metadata."""
+
+        ts_code = _to_tushare_ts_code(stock_code)
+        china_now = self._get_china_now()
+        local_time = china_now.time()
+        in_publish_window = clock_time(9, 26) <= local_time <= clock_time(9, 29, 30)
+        supported = bool(str(market or "").lower() == "cn" and ts_code and self._api is not None)
+        if not supported:
+            reason = "missing_token_or_unsupported_symbol"
+        elif not in_publish_window:
+            reason = "outside_publish_window"
+        else:
+            reason = "configured_permission_unverified_until_successful_stk_auction_call"
+        return {
+            "provider": self.name,
+            "api_name": "stk_auction",
+            "supported": supported,
+            "token_configured": self._api is not None,
+            "market": str(market or "").lower(),
+            "ts_code": ts_code,
+            "publish_window": "09:26:00-09:29:30 Asia/Shanghai",
+            "in_publish_window": in_publish_window,
+            "reason": reason,
+        }
+
+    def get_auction_snapshot(self, stock_code: str, *, market: str = "cn") -> Optional[UnifiedAuctionSnapshot]:
+        """Fetch Tushare's dedicated same-day opening-auction成交 snapshot.
+
+        Tushare documents ``stk_auction`` as the opening-auction endpoint
+        available around 09:26-09:29 for the current trading day.  It has no
+        provider timestamp field, so we do not invent one; attribution relies on
+        the official publish window, trade_date, fetched_at and raw field names.
+        """
+
+        diagnostics = self.get_auction_capability_diagnostics(stock_code, market=market)
+        if not diagnostics.get("supported") or not diagnostics.get("in_publish_window"):
+            return None
+        ts_code = diagnostics.get("ts_code")
+        if not ts_code:
+            return None
+        china_now = self._get_china_now()
+        trade_date = china_now.strftime("%Y%m%d")
+        fields = "ts_code,trade_date,vol,price,amount,pre_close,turnover_rate,volume_ratio"
+        try:
+            df = self._call_api_with_rate_limit(
+                "stk_auction",
+                ts_code=ts_code,
+                trade_date=trade_date,
+                ts_type="ETF" if _is_etf_code(stock_code) else "STK",
+                fields=fields,
+            )
+        except Exception as exc:
+            logger.info("[Tushare] stk_auction unavailable for %s: %s", ts_code, exc)
+            return None
+        if df is None or df.empty:
+            return None
+        row = df.iloc[0].to_dict()
+        fetched_at = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
+        return UnifiedAuctionSnapshot(
+            code=str(row.get("ts_code") or ts_code),
+            market="cn",
+            phase="opening_auction",
+            virtual_price=safe_float(row.get("price")),
+            matched_volume=safe_float(row.get("vol")),
+            unmatched_volume=None,
+            unmatched_side=None,
+            source=self.name,
+            provider_timestamp=None,
+            fetched_at=fetched_at,
+            provenance={
+                "provider": self.name,
+                "api_name": "stk_auction",
+                "ordinary_realtime_quote_alias": False,
+                "trade_date": str(row.get("trade_date") or trade_date),
+                "official_publish_window": "09:26:00-09:29:30 Asia/Shanghai",
+                "fields": {
+                    "code": "ts_code",
+                    "trade_date": "trade_date",
+                    "virtual_price": "price",
+                    "matched_volume": "vol",
+                    "amount": "amount",
+                    "pre_close": "pre_close",
+                    "turnover_rate": "turnover_rate",
+                    "volume_ratio": "volume_ratio",
+                },
+                "pre_close": safe_float(row.get("pre_close")),
+                "volume_ratio": safe_float(row.get("volume_ratio")),
+                "turnover_rate": safe_float(row.get("turnover_rate")),
+                "raw_keys": sorted(str(key) for key in row.keys()),
+            },
+        )
+
+    def get_limit_prices(self, stock_code: str, *, trade_date: str, market: str = "cn") -> Optional[Dict[str, Any]]:
+        """Fetch attributable daily limit prices from Tushare stk_limit."""
+
+        if str(market or "").lower() != "cn":
+            return None
+        ts_code = _to_tushare_ts_code(stock_code)
+        if not ts_code:
+            return None
+        fields = "trade_date,ts_code,pre_close,up_limit,down_limit"
+        try:
+            df = self._call_api_with_rate_limit(
+                "stk_limit",
+                ts_code=ts_code,
+                trade_date=trade_date,
+                fields=fields,
+            )
+        except Exception as exc:
+            logger.info("[Tushare] stk_limit unavailable for %s/%s: %s", ts_code, trade_date, exc)
+            return None
+        if df is None or df.empty:
+            return None
+        row = df.iloc[0].to_dict()
+        up_limit = safe_float(row.get("up_limit"))
+        down_limit = safe_float(row.get("down_limit"))
+        pre_close = safe_float(row.get("pre_close"))
+        if up_limit is None or down_limit is None:
+            return None
+        return {
+            "provider": self.name,
+            "api_name": "stk_limit",
+            "ts_code": str(row.get("ts_code") or ts_code),
+            "trade_date": str(row.get("trade_date") or trade_date),
+            "pre_close": pre_close,
+            "up_limit": up_limit,
+            "down_limit": down_limit,
+            "fields": {
+                "trade_date": "trade_date",
+                "code": "ts_code",
+                "pre_close": "pre_close",
+                "up_limit": "up_limit",
+                "down_limit": "down_limit",
+            },
+        }
 
     def _get_trade_dates(self, end_date: Optional[str] = None) -> List[str]:
         """按自然日刷新交易日历缓存，避免服务跨日后继续复用旧日历。"""
@@ -716,7 +866,9 @@ class TushareFetcher(BaseFetcher):
                     price=safe_float(row.get('price')),
                     change_pct=safe_float(row.get('pct_chg')),  # Pro 接口通常直接返回涨跌幅
                     change_amount=safe_float(row.get('change')),
-                    volume=safe_int(row.get('vol')),
+                    # Legacy Pro quotation has no verified volume-unit contract.
+                    # Price may still be useful; abstain on volume confirmation.
+                    volume=None,
                     amount=safe_float(row.get('amount')),
                     high=safe_float(row.get('high')),
                     low=safe_float(row.get('low')),
@@ -763,7 +915,7 @@ class TushareFetcher(BaseFetcher):
                 price=price,
                 change_pct=round(change_pct, 2),
                 change_amount=round(change_amount, 2),
-                volume=safe_int(row['volume']) // 100,  # 转换为手
+                volume=safe_int(row['volume']),  # Legacy Sina quote already uses shares.
                 amount=safe_float(row['amount']),
                 high=safe_float(row['high']),
                 low=safe_float(row['low']),

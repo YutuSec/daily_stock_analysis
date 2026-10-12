@@ -388,6 +388,39 @@ def test_build_action_fields_keeps_neutral_score_conflict_when_guardrail_is_expl
     ) == {"action": "watch", "action_label": "观望"}
 
 
+def test_unified_contract_can_preserve_native_tool_action_without_score_promotion() -> None:
+    from src.schemas.decision_action import normalize_result_decision_contract
+
+    result = type(
+        "Result",
+        (),
+        {
+            "sentiment_score": 72,
+            "raw_score": 72,
+            "adjusted_score": None,
+            "action": "watch",
+            "operation_advice": "观望",
+            "decision_type": "hold",
+            "action_label": None,
+            "report_language": "zh",
+            "dashboard": {},
+            "guardrail": None,
+            "position_actions": None,
+            "holding_state": "unknown",
+        },
+    )()
+
+    normalize_result_decision_contract(result, explicit_action="watch", align_with_score=False)
+
+    assert result.raw_score == 72
+    assert result.adjusted_score == 72
+    assert result.sentiment_score == 72
+    assert result.action == "watch"
+    assert result.action_label == "观望"
+    assert result.operation_advice == "观望"
+    assert result.decision_type == "hold"
+
+
 def test_display_helpers_share_score_aligned_action_with_report_rows_and_counts() -> None:
     result = type(
         "Result",
@@ -431,3 +464,260 @@ def test_display_helpers_preserve_neutral_action_when_guardrail_was_applied() ->
     assert display_action_fields_for_result(result) == {"action": "hold", "action_label": "Hold"}
     assert display_operation_advice_for_result(result) == "Hold"
     assert display_decision_type_for_result(result) == "hold"
+
+
+def test_unified_contract_derives_legacy_fields_from_structured_action() -> None:
+    from src.schemas.decision_action import normalize_result_decision_contract
+
+    result = type(
+        "Result",
+        (),
+        {
+            "sentiment_score": 65,
+            "raw_score": None,
+            "action": "buy",
+            "operation_advice": "观望",
+            "decision_type": "hold",
+            "action_label": None,
+            "report_language": "zh",
+            "dashboard": {},
+            "guardrail": None,
+            "position_actions": None,
+        },
+    )()
+
+    normalize_result_decision_contract(result)
+
+    assert result.raw_score == 65
+    assert result.adjusted_score == 65
+    assert result.sentiment_score == 65
+    assert result.action == "buy"
+    assert result.action_label == "买入"
+    assert result.operation_advice == "买入"
+    assert result.decision_type == "buy"
+
+
+def test_unified_contract_requires_complete_guardrail_and_explicit_scenario_actions() -> None:
+    from src.schemas.decision_action import normalize_result_decision_contract
+
+    result = type(
+        "Result",
+        (),
+        {
+            "sentiment_score": 72,
+            "raw_score": None,
+            "action": "watch",
+            "operation_advice": "观望",
+            "decision_type": "hold",
+            "action_label": None,
+            "report_language": "zh",
+            "dashboard": {
+                "core_conclusion": {
+                    "position_advice": {
+                        "no_position": "空仓观望",
+                        "has_position": "继续持有",
+                    }
+                }
+            },
+            "guardrail": {"applied": True, "reason": "等待确认"},
+            "position_actions": None,
+        },
+    )()
+
+    normalize_result_decision_contract(result)
+
+    assert result.action == "buy"
+    assert result.operation_advice == "买入"
+    assert result.guardrail == {"applied": False, "invalid": True}
+    assert result.position_actions["empty"] == {"advice": "空仓观望"}
+    assert result.position_actions["holding"] == {"advice": "继续持有"}
+
+
+def test_unified_contract_accepts_auditable_guardrail_and_rewrites_conflicting_position_advice() -> None:
+    from src.schemas.decision_action import normalize_result_decision_contract
+
+    result = type(
+        "Result",
+        (),
+        {
+            "sentiment_score": 72,
+            "raw_score": None,
+            "action": "watch",
+            "operation_advice": "观望",
+            "decision_type": "hold",
+            "action_label": None,
+            "report_language": "zh",
+            "dashboard": {},
+            "guardrail": {
+                "applied": True,
+                "reason_code": "near_resistance",
+                "reason": "临近压力位且量价背离",
+                "raw_score": 72,
+                "adjusted_score": 55,
+                "score_delta": -17,
+            },
+            "position_actions": {
+                "empty": {"action": "watch", "advice": "观望"},
+                "holding": {"action": "hold", "advice": "观望"},
+            },
+        },
+    )()
+
+    normalize_result_decision_contract(result)
+
+    assert result.raw_score == 72
+    assert result.adjusted_score == result.sentiment_score == 55
+    assert result.action == "watch"
+    assert result.operation_advice == "观望"
+    assert result.guardrail["score_delta"] == -17
+    assert result.position_actions["holding"] == {"action": "hold", "advice": "持有"}
+
+
+def test_unified_contract_resolves_empty_hold_alias_to_watch() -> None:
+    from src.schemas.decision_action import normalize_result_decision_contract
+
+    result = type(
+        "Result",
+        (),
+        {
+            "sentiment_score": 46,
+            "raw_score": None,
+            "action": "hold",
+            "operation_advice": "持有",
+            "decision_type": "hold",
+            "action_label": None,
+            "report_language": "zh",
+            "holding_state": "empty",
+            "dashboard": {
+                "core_conclusion": {
+                    "position_advice": {
+                        "无持仓": {"action": "hold", "advice": "持有观察"},
+                        "existing_position": {"action": "reduce", "advice": "持仓减仓"},
+                    },
+                },
+            },
+            "guardrail": None,
+            "position_actions": None,
+        },
+    )()
+
+    normalize_result_decision_contract(result)
+
+    assert result.holding_state == "empty"
+    assert result.action == "watch"
+    assert result.action_label == "观望"
+    assert result.operation_advice == "观望"
+    assert result.decision_type == "hold"
+    assert result.position_actions["empty"].get("action") is None
+    assert result.position_actions["holding"].get("action") is None
+
+
+def test_unified_contract_preserves_only_explicit_valid_holding_risk() -> None:
+    from src.schemas.decision_action import normalize_result_decision_contract
+
+    result = type(
+        "Result",
+        (),
+        {
+            "sentiment_score": 55,
+            "raw_score": None,
+            "action": "watch",
+            "operation_advice": "观望",
+            "decision_type": "hold",
+            "action_label": None,
+            "report_language": "zh",
+            "dashboard": {"battle_plan": {"sniper_points": {"stop_loss": 88, "take_profit": 150}}},
+            "guardrail": None,
+            "position_actions": {
+                "empty": {"action": "watch", "advice": "等待"},
+                "holding": {
+                    "action": "hold",
+                    "advice": "持有",
+                    "stop_loss": 101.5,
+                    "target_price": 128,
+                },
+            },
+        },
+    )()
+
+    normalize_result_decision_contract(result)
+
+    assert result.position_actions["holding"]["stop_loss"] == 101.5
+    assert result.position_actions["holding"]["target_price"] == 128.0
+
+    result.position_actions = {
+        "holding": {"action": "hold", "advice": "持有", "stop_loss": -1, "target_price": "nan"}
+    }
+    normalize_result_decision_contract(result)
+    assert result.position_actions["holding"] == {"action": "hold", "advice": "持有"}
+    assert "stop_loss" not in result.position_actions["holding"]
+    assert "target_price" not in result.position_actions["holding"]
+
+
+def test_position_aware_action_uses_matching_frozen_branch() -> None:
+    from src.schemas.decision_action import resolve_position_aware_action_fields
+
+    branches = {
+        "empty": {"action": "watch", "advice": "空仓观望"},
+        "holding": {"action": "reduce", "advice": "持仓减仓"},
+    }
+
+    empty = resolve_position_aware_action_fields(
+        holding_state="empty",
+        position_actions=branches,
+        fallback_action="reduce",
+        report_language="zh",
+    )
+    holding = resolve_position_aware_action_fields(
+        holding_state="holding",
+        position_actions=branches,
+        fallback_action="watch",
+        report_language="zh",
+    )
+
+    assert empty == {
+        "action": "watch",
+        "action_label": "观望",
+        "holding_state": "empty",
+        "resolution_source": "position_actions.empty",
+        "base_action": "reduce",
+    }
+    assert holding["action"] == "reduce"
+    assert holding["resolution_source"] == "position_actions.holding"
+
+
+def test_position_aware_action_fails_closed_for_empty_holder_only_fallbacks() -> None:
+    from src.schemas.decision_action import resolve_position_aware_action_fields
+
+    assert resolve_position_aware_action_fields(
+        holding_state="empty",
+        position_actions={},
+        fallback_action="hold",
+    )["action"] == "watch"
+    assert resolve_position_aware_action_fields(
+        holding_state="empty",
+        position_actions={"empty": {"action": "sell"}},
+        fallback_action="sell",
+    )["action"] == "avoid"
+    assert resolve_position_aware_action_fields(
+        holding_state="empty",
+        position_actions={},
+        fallback_action="reduce",
+    )["action"] == "avoid"
+
+
+def test_position_aware_action_does_not_infer_holding_when_state_is_unknown() -> None:
+    from src.schemas.decision_action import resolve_position_aware_action_fields
+
+    resolved = resolve_position_aware_action_fields(
+        holding_state="unexpected",
+        position_actions={
+            "empty": {"action": "watch"},
+            "holding": {"action": "reduce"},
+        },
+        fallback_action="alert",
+    )
+
+    assert resolved["holding_state"] == "unknown"
+    assert resolved["action"] == "alert"
+    assert resolved["resolution_source"] == "canonical_fallback"

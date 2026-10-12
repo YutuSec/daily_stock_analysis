@@ -49,6 +49,7 @@ class LiteLLMGenerationBackend(GenerationBackend):
         stream_progress_callback: Optional[Callable[[int], None]] = None,
         response_validator: Optional[Callable[[str], None]] = None,
         audit_context: Optional[Dict[str, Any]] = None,
+        structured_tool: Optional[Dict[str, Any]] = None,
     ) -> GenerationResult:
         text, model, usage = self._completion_callable(
             prompt,
@@ -58,6 +59,7 @@ class LiteLLMGenerationBackend(GenerationBackend):
             stream_progress_callback=stream_progress_callback,
             response_validator=response_validator,
             audit_context=audit_context,
+            structured_tool=structured_tool,
         )
         provider = str((usage or {}).get("provider") or _provider_from_model(model))
         return GenerationResult(

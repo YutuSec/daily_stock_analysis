@@ -17,6 +17,7 @@ from src.report_language import normalize_report_language
 from src.schemas.decision_action import (
     DecisionAction,
     build_action_fields,
+    display_action_fields,
     localize_action_label,
     normalize_decision_action,
 )
@@ -33,6 +34,7 @@ from src.storage import (
     AnalysisHistory,
     DatabaseManager,
     DecisionSignalRecord,
+    report_execution_intent_allows_signals,
     to_utc_naive_datetime,
     utc_naive_now,
 )
@@ -88,6 +90,11 @@ class DecisionSignalService:
 
     def create_signal(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         fields, lifecycle = self._normalize_payload(payload)
+        source_report_id = fields.get("source_report_id")
+        if source_report_id is not None and not self._report_allows_signals(source_report_id):
+            raise ValueError(
+                f"analysis report {source_report_id} is research-only and cannot create decision signals"
+            )
         result = self.repo.create_if_absent(
             fields,
             allow_relaxed_horizon_fill=lifecycle["horizon_defaulted"],
@@ -357,6 +364,9 @@ class DecisionSignalService:
             )
         )
 
+    def _report_allows_signals(self, source_report_id: int) -> bool:
+        return report_execution_intent_allows_signals(self.db.get_report_execution_intent(source_report_id))
+
     def _backfill_analysis_signal_from_history(self, source_report_id: int) -> None:
         """Best-effort lazy extraction for reports saved before DecisionSignal existed."""
 
@@ -364,17 +374,35 @@ class DecisionSignalService:
             record = self.db.get_analysis_history_by_id(source_report_id)
             if record is None or getattr(record, "report_type", None) == "market_review":
                 return
+            if not self._report_allows_signals(source_report_id):
+                logger.info(
+                    "Skip history decision signal backfill for research-only report: source_report_id=%s",
+                    source_report_id,
+                )
+                return
 
             raw_result = parse_json_field(getattr(record, "raw_result", None))
             raw = raw_result if isinstance(raw_result, dict) else {}
             context_snapshot = parse_json_field(getattr(record, "context_snapshot", None))
             if not isinstance(context_snapshot, dict):
                 context_snapshot = None
-            history_action, history_action_label = self._history_action_fields(
+            history_action, _history_action_label = self._history_action_fields(
                 raw=raw,
                 record=record,
             )
             if history_action is None:
+                return
+            base_action_fields = self._history_base_action_fields(raw=raw, record=record)
+            confidence_level = self._history_confidence_level(raw.get("confidence_level"))
+            if confidence_level is None and normalize_decision_action(base_action_fields.get("action")) in (
+                BULLISH_ACTIONS | DEFENSIVE_ACTIONS
+            ):
+                logger.info(
+                    "Skip history decision signal backfill: missing or invalid confidence "
+                    "source_report_id=%s action=%s",
+                    source_report_id,
+                    base_action_fields.get("action"),
+                )
                 return
 
             from src.analyzer import AnalysisResult
@@ -391,10 +419,10 @@ class DecisionSignalService:
                 trend_prediction=raw.get("trend_prediction") or getattr(record, "trend_prediction", None) or "",
                 operation_advice=raw.get("operation_advice") or getattr(record, "operation_advice", None) or "",
                 decision_type=raw.get("decision_type") or "",
-                confidence_level=raw.get("confidence_level") or "中",
+                confidence_level=confidence_level,
                 report_language=normalize_report_language(raw.get("report_language")),
-                action=history_action,
-                action_label=history_action_label,
+                action=base_action_fields["action"],
+                action_label=base_action_fields["action_label"],
                 dashboard=raw.get("dashboard") if isinstance(raw.get("dashboard"), dict) else None,
                 analysis_summary=raw.get("analysis_summary") or getattr(record, "analysis_summary", None) or "",
                 key_points=raw.get("key_points") or "",
@@ -412,6 +440,12 @@ class DecisionSignalService:
                 market_structure_context=(
                     raw.get("market_structure_context")
                     if isinstance(raw.get("market_structure_context"), dict)
+                    else None
+                ),
+                holding_state=raw.get("holding_state") or "unknown",
+                position_actions=(
+                    raw.get("position_actions")
+                    if isinstance(raw.get("position_actions"), dict)
                     else None
                 ),
             )
@@ -443,6 +477,23 @@ class DecisionSignalService:
             )
 
     @staticmethod
+    def _history_confidence_level(value: Any) -> Optional[str]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        normalized = text.lower()
+        return {
+            "高": "高",
+            "中": "中",
+            "中等": "中",
+            "低": "低",
+            "high": "high",
+            "medium": "medium",
+            "mid": "medium",
+            "low": "low",
+        }.get(normalized)
+
+    @staticmethod
     def _history_has_decision_source(*, raw: Dict[str, Any], record: AnalysisHistory) -> bool:
         action, _ = DecisionSignalService._history_action_fields(raw=raw, record=record)
         return action is not None
@@ -453,6 +504,31 @@ class DecisionSignalService:
         raw: Dict[str, Any],
         record: AnalysisHistory,
     ) -> tuple[Optional[str], Optional[str]]:
+        base_fields = DecisionSignalService._history_base_action_fields(raw=raw, record=record)
+        action_fields = display_action_fields(
+            operation_advice=raw.get("operation_advice") or getattr(record, "operation_advice", None),
+            explicit_action=base_fields["action"],
+            action_label=base_fields["action_label"],
+            report_type=getattr(record, "report_type", ""),
+            report_language=raw.get("report_language"),
+            sentiment_score=DecisionSignalService._history_int(
+                raw.get("sentiment_score"),
+                getattr(record, "sentiment_score", None),
+                default=None,
+            ),
+            holding_state=raw.get("holding_state"),
+            position_actions=raw.get("position_actions"),
+        )
+        return action_fields["action"], action_fields["action_label"]
+
+    @staticmethod
+    def _history_base_action_fields(
+        *,
+        raw: Dict[str, Any],
+        record: AnalysisHistory,
+    ) -> Dict[str, Optional[str]]:
+        """Return the score-aligned model action before account-state resolution."""
+
         raw_operation_advice = raw.get("operation_advice")
         normalized_operation_advice = str(raw_operation_advice).strip() if raw_operation_advice is not None else None
         if not normalized_operation_advice:
@@ -484,7 +560,7 @@ class DecisionSignalService:
             guardrail_reason=guardrail_reason,
             align_with_score=True,
         )
-        return action_fields["action"], action_fields["action_label"]
+        return action_fields
 
     @staticmethod
     def _history_guardrail_reason(

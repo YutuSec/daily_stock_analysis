@@ -1,6 +1,6 @@
 import apiClient from './index';
 import { toCamelCase } from './utils';
-import type { TaskAccepted } from '../types/analysis';
+import type { AnalyzeAsyncResponse } from '../types/analysis';
 import type {
   PortfolioAccountItem,
   PortfolioAccountCreateRequest,
@@ -136,16 +136,18 @@ export const portfolioApi = {
     return toCamelCase<PortfolioSnapshotResponse>(response.data);
   },
 
-  async analyzePosition(symbol: string, payload: PortfolioPositionAnalysisRequest = {}): Promise<TaskAccepted> {
+  async analyzePosition(symbol: string, payload: PortfolioPositionAnalysisRequest = {}): Promise<AnalyzeAsyncResponse> {
     const response = await apiClient.post<Record<string, unknown>>(
       `/api/v1/portfolio/positions/${encodeURIComponent(symbol)}/analysis`,
       {
         account_id: payload.accountId,
         analysis_phase: payload.analysisPhase ?? 'auto',
         force: payload.force ?? false,
+        model: payload.model,
+        models: payload.models,
       },
     );
-    return toCamelCase<TaskAccepted>(response.data);
+    return toCamelCase<AnalyzeAsyncResponse>(response.data);
   },
 
   async getRisk(query: SnapshotQuery = {}): Promise<PortfolioRiskResponse> {

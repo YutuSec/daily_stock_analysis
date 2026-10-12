@@ -28,6 +28,8 @@ const {
   createAccount,
   deleteAccount,
   analyzePosition,
+  syncFromPortfolio,
+  getAnalysisModels,
   listDecisionSignals,
   getLatestDecisionSignals,
 } = vi.hoisted(() => ({
@@ -50,14 +52,28 @@ const {
   createAccount: vi.fn(),
   deleteAccount: vi.fn(),
   analyzePosition: vi.fn(),
+  syncFromPortfolio: vi.fn(),
+  getAnalysisModels: vi.fn(),
   listDecisionSignals: vi.fn(),
   getLatestDecisionSignals: vi.fn(),
+}));
+
+vi.mock('../../api/analysis', () => ({
+  analysisApi: {
+    getModels: getAnalysisModels,
+  },
 }));
 
 vi.mock('../../api/decisionSignals', () => ({
   decisionSignalsApi: {
     list: listDecisionSignals,
     getLatest: getLatestDecisionSignals,
+  },
+}));
+
+vi.mock('../../api/paperTrading', () => ({
+  paperTradingApi: {
+    syncFromPortfolio,
   },
 }));
 
@@ -332,6 +348,16 @@ describe('PortfolioPage FX refresh', () => {
       status: 'pending',
       message: '分析任务已加入队列: HK00700',
       analysisPhase: 'auto',
+      model: 'route-a',
+    });
+    syncFromPortfolio.mockResolvedValue({ created: true, items: [{ id: 1 }] });
+    getAnalysisModels.mockResolvedValue({
+      models: [
+        { model: 'route-a', isDefault: true },
+        { model: 'route-b', isDefault: false },
+      ],
+      defaultModel: 'route-a',
+      comparisonAvailable: true,
     });
     getLatestDecisionSignals.mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 1 });
   });
@@ -865,9 +891,92 @@ describe('PortfolioPage FX refresh', () => {
         accountId: 1,
         analysisPhase: 'auto',
         force: false,
+        model: 'route-a',
       });
     });
-    expect(await screen.findByText('已提交 HK00700 分析任务：task-portfolio-1')).toBeInTheDocument();
+    expect(await screen.findByText('已提交 HK00700 的 route-a 分析任务：task-portfolio-1')).toBeInTheDocument();
+  });
+
+  it('loads configured models and submits the selected model for a held position', async () => {
+    getAnalysisModels.mockResolvedValueOnce({
+      models: [
+        { model: 'route-a', isDefault: true },
+        { model: 'route-c', isDefault: false },
+        { model: 'route-d', isDefault: false },
+      ],
+      defaultModel: 'route-a',
+      comparisonAvailable: true,
+    });
+    getSnapshot.mockResolvedValueOnce(makeSnapshot({ positions: [makePosition()] }));
+
+    render(<PortfolioPage />);
+    await waitForInitialLoad();
+
+    const modelSelect = await screen.findByRole('combobox', { name: '持仓分析模型' });
+    fireEvent.change(modelSelect, { target: { value: 'route-d' } });
+    const row = screen.getByText('600519').closest('tr');
+    fireEvent.click(within(row as HTMLTableRowElement).getByRole('button', { name: '分析' }));
+
+    await waitFor(() => expect(analyzePosition).toHaveBeenCalledWith('600519', {
+      accountId: 1,
+      analysisPhase: 'auto',
+      force: false,
+      model: 'route-d',
+    }));
+  });
+
+  it('submits all configured models together and reports partial acceptance', async () => {
+    getSnapshot.mockResolvedValueOnce(makeSnapshot({ positions: [makePosition()] }));
+    analyzePosition.mockResolvedValueOnce({
+      accepted: [{
+        taskId: 'task-route-a',
+        traceId: 'task-route-a',
+        stockCode: '600519',
+        status: 'pending',
+        analysisPhase: 'auto',
+        model: 'route-a',
+      }],
+      duplicates: [{
+        stockCode: '600519',
+        existingTaskId: 'task-route-b',
+        message: 'duplicate',
+        model: 'route-b',
+      }],
+      message: '已提交 1 个任务，1 个重复跳过',
+    });
+
+    render(<PortfolioPage />);
+    await waitForInitialLoad();
+
+    const row = screen.getByText('600519').closest('tr');
+    fireEvent.click(within(row as HTMLTableRowElement).getByRole('button', { name: '全部模型' }));
+
+    await waitFor(() => expect(analyzePosition).toHaveBeenCalledWith('600519', {
+      accountId: 1,
+      analysisPhase: 'auto',
+      force: false,
+      models: ['route-a', 'route-b'],
+    }));
+    expect(await screen.findByText('已提交 600519 的 1 个模型任务，1 个重复任务已跳过。')).toBeInTheDocument();
+  });
+
+  it('syncs a portfolio position to paper with a stable idempotency key', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    getSnapshot.mockResolvedValueOnce(makeSnapshot({ positions: [makePosition({ positionId: 42 })] }));
+
+    render(<PortfolioPage />);
+    await waitForInitialLoad();
+
+    const row = screen.getByText('600519').closest('tr');
+    fireEvent.click(within(row as HTMLTableRowElement).getByRole('button', { name: '同步模拟' }));
+
+    await waitFor(() => expect(syncFromPortfolio).toHaveBeenCalledWith({
+      portfolioPositionId: 42,
+      sourceModels: ['route-a'],
+      tradeDate: '2026-03-19',
+      idempotencyKey: 'portfolio-import-42-2026-03-19-route-a',
+    }));
+    confirmSpy.mockRestore();
   });
 
   it('prefers disabled feedback over empty-pair feedback when refresh is disabled', async () => {

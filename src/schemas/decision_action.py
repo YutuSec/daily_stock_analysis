@@ -8,13 +8,15 @@ This module is deliberately separate from ``src.agent.protocols``:
 
 from __future__ import annotations
 
+import math
 import re
-from typing import Any, Dict, Literal, Optional, TypedDict, get_args
+from typing import Any, Dict, Literal, Mapping, Optional, TypedDict, get_args
 
 from src.report_language import localize_operation_advice, normalize_report_language
 from src.schemas.decision_scale import (
     action_for_score,
     extract_decision_guardrail_reason,
+    normalize_score,
     score_action_conflicts_without_guardrail,
 )
 
@@ -24,6 +26,14 @@ DecisionAction = Literal["buy", "add", "hold", "reduce", "sell", "watch", "avoid
 class DecisionActionFields(TypedDict):
     action: Optional[DecisionAction]
     action_label: Optional[str]
+
+
+class PositionAwareActionFields(DecisionActionFields):
+    """One account-effective action plus auditable resolution metadata."""
+
+    holding_state: str
+    resolution_source: str
+    base_action: Optional[DecisionAction]
 
 
 _ACTION_VALUES = set(get_args(DecisionAction))
@@ -234,6 +244,285 @@ _ENGLISH_AVOIDED_HOLD_ACTION_TERMS = ("adding", "accumulating", "selling", "redu
 _ENGLISH_DEFERRED_ACTION_TERMS = ("buy", "add", "accumulate", "sell", "reduce", "trim")
 _FINANCIAL_COMPOUND_SENTINEL = "financialcompound"
 
+_SCORE_COMPATIBLE_ACTIONS: Dict[str, set[str]] = {
+    "buy": {"buy", "add"},
+    "watch": {"hold", "watch"},
+    "reduce": {"reduce"},
+    "sell": {"sell", "avoid", "alert"},
+}
+
+
+def decision_type_for_action(action: Any) -> str:
+    """Map the canonical action to the legacy three-state statistics bucket."""
+
+    normalized = normalize_decision_action(action)
+    if normalized in {"buy", "add"}:
+        return "buy"
+    if normalized in {"reduce", "sell", "avoid", "alert"}:
+        return "sell"
+    return "hold"
+
+
+def _as_mapping(value: Any) -> Dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _structured_guardrail(result: Any, raw_score: int) -> Dict[str, Any]:
+    """Return a validated, auditable guardrail or an explicit non-applied record.
+
+    Narrative text is deliberately insufficient.  A score/action override is
+    accepted only when the producer supplied every audit field and the score
+    delta is arithmetically consistent.
+    """
+
+    dashboard = _as_mapping(getattr(result, "dashboard", None))
+    source = _as_mapping(getattr(result, "guardrail", None))
+    if not source:
+        source = _as_mapping(dashboard.get("decision_guardrail"))
+    if not source:
+        calibration = _as_mapping(dashboard.get("decision_score_calibration"))
+        stability = _as_mapping(dashboard.get("decision_stability"))
+        source = {
+            "applied": stability.get("applied"),
+            "reason_code": stability.get("reason_code") or calibration.get("reason_code"),
+            "reason": stability.get("reason") or calibration.get("guardrail_reason"),
+            "raw_score": calibration.get("raw_score"),
+            "adjusted_score": calibration.get("adjusted_score"),
+            "score_delta": calibration.get("score_delta") or stability.get("score_delta"),
+        }
+
+    if source.get("applied") is not True:
+        return {"applied": False}
+
+    reason_code = str(source.get("reason_code") or "").strip()
+    reason = str(source.get("reason") or "").strip()
+    declared_raw = normalize_score(source.get("raw_score"))
+    adjusted = normalize_score(source.get("adjusted_score"))
+    try:
+        delta = int(source.get("score_delta"))
+    except (TypeError, ValueError):
+        delta = None
+    valid = (
+        bool(reason_code)
+        and bool(reason)
+        and declared_raw == raw_score
+        and adjusted is not None
+        and delta is not None
+        and delta == adjusted - raw_score
+    )
+    if not valid:
+        return {"applied": False, "invalid": True}
+    return {
+        "applied": True,
+        "reason_code": reason_code,
+        "reason": reason,
+        "raw_score": raw_score,
+        "adjusted_score": adjusted,
+        "score_delta": delta,
+    }
+
+
+def _score_compatible_action(action: Any, score: int) -> Optional[DecisionAction]:
+    normalized = normalize_decision_action(action)
+    canonical = action_for_score(score)
+    if normalized and normalized in _SCORE_COMPATIBLE_ACTIONS.get(str(canonical), set()):
+        return normalized
+    if canonical in _ACTION_VALUES:
+        return canonical  # type: ignore[return-value]
+    return None
+
+
+def _positive_finite_price(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _normalize_position_actions(result: Any) -> Dict[str, Dict[str, Any]]:
+    dashboard = _as_mapping(getattr(result, "dashboard", None))
+    core = _as_mapping(dashboard.get("core_conclusion"))
+    legacy = _as_mapping(core.get("position_advice"))
+    supplied = _as_mapping(getattr(result, "position_actions", None))
+    output: Dict[str, Dict[str, Any]] = {}
+    aliases = {
+        "empty": ("empty", "no_position", "no position", "none", "cash", "空仓", "无持仓", "未持仓"),
+        "holding": ("holding", "has_position", "has position", "existing_position", "existing position", "持仓", "已有持仓"),
+    }
+    for state, legacy_key in (("empty", "no_position"), ("holding", "has_position")):
+        block: Dict[str, Any] = {}
+        for alias in aliases[state]:
+            candidate = supplied.get(alias)
+            if isinstance(candidate, Mapping):
+                block = _as_mapping(candidate)
+                break
+        legacy_advice = legacy.get(legacy_key)
+        if not legacy_advice:
+            for alias in aliases[state]:
+                legacy_advice = legacy.get(alias)
+                if legacy_advice:
+                    break
+        advice = str(block.get("advice") or legacy_advice or "").strip()
+        action = normalize_decision_action(block.get("action"))
+        advice_action = normalize_decision_action(advice)
+        if action and advice_action and advice_action != action:
+            advice = localize_action_label(
+                action, getattr(result, "report_language", "zh")
+            ) or str(action)
+        elif action and not advice:
+            advice = localize_action_label(
+                action, getattr(result, "report_language", "zh")
+            ) or str(action)
+        normalized: Dict[str, Any] = {}
+        if action:
+            normalized["action"] = action
+        if advice:
+            normalized["advice"] = advice
+        if state == "holding":
+            stop_loss = _positive_finite_price(block.get("stop_loss"))
+            target_price = _positive_finite_price(block.get("target_price"))
+            if stop_loss is not None:
+                normalized["stop_loss"] = stop_loss
+            if target_price is not None:
+                normalized["target_price"] = target_price
+        output[state] = normalized
+    return output
+
+
+def normalize_result_decision_contract(
+    result: Any,
+    *,
+    explicit_action: Any = None,
+    align_with_score: bool = True,
+) -> Any:
+    """Make score, action, labels and legacy fields one coherent contract.
+
+    ``raw_score`` is the model score. ``adjusted_score`` may differ only under
+    a complete structured guardrail.  Human-readable advice is always derived
+    from the final action, so it cannot contradict persisted statistics.
+    """
+
+    dashboard = _as_mapping(getattr(result, "dashboard", None))
+    calibration = _as_mapping(dashboard.get("decision_score_calibration"))
+    raw_score = normalize_score(getattr(result, "raw_score", None))
+    if raw_score is None:
+        raw_score = normalize_score(calibration.get("raw_score"))
+    if raw_score is None:
+        raw_score = normalize_score(getattr(result, "sentiment_score", None))
+    if raw_score is None:
+        return result
+
+    guardrail = _structured_guardrail(result, raw_score)
+    adjusted_score = raw_score
+    if guardrail.get("applied") is True:
+        adjusted_score = int(guardrail["adjusted_score"])
+
+    candidate = explicit_action
+    if normalize_decision_action(candidate) is None:
+        candidate = getattr(result, "action", None)
+    # operation_advice is a legacy input only when no structured action exists.
+    if normalize_decision_action(candidate) is None:
+        candidate = getattr(result, "operation_advice", None)
+    language = getattr(result, "report_language", "zh")
+    normalized_position_actions = _normalize_position_actions(result)
+    if align_with_score:
+        final_action = _score_compatible_action(candidate, adjusted_score)
+    else:
+        final_action = normalize_decision_action(candidate)
+        if final_action is None:
+            score_action = action_for_score(adjusted_score)
+            final_action = score_action if score_action in _ACTION_VALUES else None
+    holding_state = normalize_holding_state(getattr(result, "holding_state", None))
+    if holding_state in {"empty", "holding"}:
+        resolved = resolve_position_aware_action_fields(
+            holding_state=holding_state,
+            position_actions=normalized_position_actions,
+            fallback_action=final_action,
+            report_language=language,
+        )
+        final_action = resolved.get("action")
+    label = localize_action_label(final_action, language) if final_action else None
+
+    result.raw_score = raw_score
+    result.adjusted_score = adjusted_score
+    result.sentiment_score = adjusted_score
+    result.action = final_action
+    result.action_label = label
+    result.operation_advice = label or ""
+    result.decision_type = decision_type_for_action(final_action)
+    result.guardrail = guardrail
+    result.position_actions = normalized_position_actions
+
+    dashboard["sentiment_score"] = adjusted_score
+    dashboard["action"] = final_action
+    dashboard["action_label"] = label
+    dashboard["operation_advice"] = result.operation_advice
+    dashboard["decision_type"] = result.decision_type
+    dashboard["decision_guardrail"] = guardrail
+    dashboard["decision_score_calibration"] = {
+        "raw_score": raw_score,
+        "adjusted_score": adjusted_score,
+        "final_action": final_action,
+        "score_delta": adjusted_score - raw_score,
+        **(
+            {
+                "guardrail_reason": guardrail["reason"],
+                "reason_code": guardrail["reason_code"],
+            }
+            if guardrail.get("applied") is True
+            else {}
+        ),
+    }
+    result.dashboard = dashboard
+    return result
+
+
+def apply_position_aware_result_contract(
+    result: Any,
+    *,
+    report_type: Any = None,
+) -> Any:
+    """Persist the account-effective action once report-time holdings are known."""
+
+    if result is None:
+        return result
+    state = normalize_holding_state(getattr(result, "holding_state", None))
+    if state == "unknown":
+        return result
+    if getattr(result, "success", True) is False:
+        return result
+
+    resolved = resolve_position_aware_action_fields(
+        holding_state=state,
+        position_actions=getattr(result, "position_actions", None),
+        fallback_action=getattr(result, "action", None)
+        or getattr(result, "action_label", None)
+        or getattr(result, "operation_advice", None),
+        report_language=getattr(result, "report_language", "zh"),
+    )
+    action = resolved.get("action")
+    label = resolved.get("action_label")
+    result.action = action
+    result.action_label = label
+    if label:
+        result.operation_advice = label
+    result.decision_type = decision_type_for_action(action)
+
+    dashboard = _as_mapping(getattr(result, "dashboard", None))
+    if dashboard:
+        dashboard["action"] = action
+        dashboard["action_label"] = label
+        dashboard["operation_advice"] = result.operation_advice
+        dashboard["decision_type"] = result.decision_type
+        dashboard["position_action_resolution"] = {
+            "holding_state": resolved.get("holding_state"),
+            "source": resolved.get("resolution_source"),
+            "base_action": resolved.get("base_action"),
+        }
+        result.dashboard = dashboard
+    return result
+
 
 def _normalize_key(value: Any) -> str:
     return str(value or "").strip().lower().replace("_", " ").replace("-", " ")
@@ -401,6 +690,56 @@ def build_action_fields(
     }
 
 
+def normalize_holding_state(value: Any) -> str:
+    """Normalize only an explicitly frozen account state.
+
+    Unknown or malformed values must never be interpreted as ownership.
+    """
+
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in {"empty", "holding"} else "unknown"
+
+
+def resolve_position_aware_action_fields(
+    *,
+    holding_state: Any,
+    position_actions: Any,
+    fallback_action: Any,
+    report_language: Optional[str] = "zh",
+) -> PositionAwareActionFields:
+    """Resolve the effective action for the report-time account state.
+
+    The model may provide separate ``empty`` and ``holding`` branches.  A
+    branch action is operationally authoritative only for its matching frozen
+    state.  Empty accounts fail closed: a missing or malformed empty branch
+    can never inherit ``hold``, ``reduce`` or ``sell`` from a holder-oriented
+    top-level recommendation.
+    """
+
+    state = normalize_holding_state(holding_state)
+    base_action = normalize_decision_action(fallback_action)
+    branches = _as_mapping(position_actions)
+    branch = _as_mapping(branches.get(state)) if state in {"empty", "holding"} else {}
+    branch_action = normalize_decision_action(branch.get("action"))
+    if branch_action is None:
+        branch_action = normalize_decision_action(branch.get("advice"))
+
+    action = branch_action or base_action
+    source = f"position_actions.{state}" if branch_action else "canonical_fallback"
+
+    if state == "empty" and action in {"hold", "reduce", "sell"}:
+        action = "watch" if action == "hold" else "avoid"
+        source = "empty_state_fail_closed"
+
+    return {
+        "action": action,
+        "action_label": localize_action_label(action, report_language) if action else None,
+        "holding_state": state,
+        "resolution_source": source,
+        "base_action": base_action,
+    }
+
+
 def _result_guardrail_reason(result: Any) -> Optional[str]:
     return extract_decision_guardrail_reason(
         {
@@ -421,13 +760,15 @@ def display_action_fields(
     report_language: Optional[str] = "zh",
     sentiment_score: Any = None,
     guardrail_reason: Any = None,
+    holding_state: Any = None,
+    position_actions: Any = None,
 ) -> DecisionActionFields:
     """Resolve one canonical action for every public display surface."""
 
     action_source = explicit_action
     if normalize_decision_action(action_source) is None and str(action_label or "").strip():
         action_source = action_label
-    return build_action_fields(
+    fields = build_action_fields(
         operation_advice=operation_advice,
         explicit_action=action_source,
         report_type=report_type,
@@ -436,6 +777,13 @@ def display_action_fields(
         guardrail_reason=guardrail_reason,
         align_with_score=True,
     )
+    resolved = resolve_position_aware_action_fields(
+        holding_state=holding_state,
+        position_actions=position_actions,
+        fallback_action=fields["action"],
+        report_language=report_language,
+    )
+    return {"action": resolved["action"], "action_label": resolved["action_label"]}
 
 
 def _display_result_kwargs(
@@ -452,6 +800,8 @@ def _display_result_kwargs(
         "report_language": report_language or getattr(result, "report_language", "zh"),
         "sentiment_score": getattr(result, "sentiment_score", None),
         "guardrail_reason": _result_guardrail_reason(result),
+        "holding_state": getattr(result, "holding_state", None),
+        "position_actions": getattr(result, "position_actions", None),
     }
 
 

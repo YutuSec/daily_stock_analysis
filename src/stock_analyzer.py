@@ -418,7 +418,14 @@ class StockTrendAnalyzer:
             return
         
         latest = df.iloc[-1]
-        vol_5d_avg = df['volume'].iloc[-6:-1].mean()
+        volumes = pd.to_numeric(df['volume'].tail(6), errors='coerce')
+        if len(volumes) < 6 or not np.isfinite(volumes).all() or (volumes < 0).any():
+            result.volume_trend = "量能不可用：成交量缺失或单位未确认，不作放量/缩量判断"
+            return
+        vol_5d_avg = volumes.iloc[:-1].mean()
+        if vol_5d_avg <= 0:
+            result.volume_trend = "量能不可用：历史成交量为零"
+            return
         
         if vol_5d_avg > 0:
             result.volume_ratio_5d = float(latest['volume']) / vol_5d_avg

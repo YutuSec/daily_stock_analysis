@@ -18,6 +18,23 @@ from src.core.config_registry import (
 )
 
 
+class TestPaperStrategyContinuityFieldsRegistered(unittest.TestCase):
+    _KEYS = (
+        "PAPER_TRADING_STRATEGY_THESIS_ENABLED",
+        "PAPER_TRADING_STRATEGY_ENTRY_CONFIRMATION_SESSIONS",
+        "PAPER_TRADING_STRATEGY_FLIP_CONFIRMATION_SESSIONS",
+    )
+
+    def test_strategy_continuity_fields_are_editable_and_registered(self):
+        registered = set(get_registered_field_keys())
+        for key in self._KEYS:
+            self.assertIn(key, registered)
+            field = get_field_definition(key)
+            self.assertEqual(field["category"], "backtest")
+            self.assertTrue(field["is_editable"])
+            self.assertNotEqual(field["display_order"], 9000)
+
+
 class TestSlackFieldsRegistered(unittest.TestCase):
     """Slack config keys must be present in the registry."""
 

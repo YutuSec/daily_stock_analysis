@@ -5,13 +5,20 @@ from __future__ import annotations
 
 import logging
 from datetime import date
-from typing import Optional
+from typing import Optional, Union
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 
+from api.deps import get_config_dep
 from api.v1.errors import api_error
-from api.v1.schemas.analysis import DuplicateTaskErrorResponse, TaskAccepted
+from api.v1.schemas.analysis import (
+    BatchDuplicateTaskItem,
+    BatchTaskAcceptedItem,
+    BatchTaskAcceptedResponse,
+    DuplicateTaskErrorResponse,
+    TaskAccepted,
+)
 from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.portfolio import (
     PortfolioAccountCreateRequest,
@@ -36,6 +43,8 @@ from api.v1.schemas.portfolio import (
     PortfolioTradeCreateRequest,
 )
 from src.services.task_queue import get_task_queue
+from src.config import Config
+from src.services.analysis_model_service import validate_analysis_models
 from src.services.portfolio_import_service import PortfolioImportService
 from src.services.portfolio_risk_service import PortfolioRiskService
 from src.services.portfolio_service import (
@@ -444,11 +453,21 @@ def get_snapshot(
 @router.post(
     "/positions/{symbol}/analysis",
     status_code=202,
-    response_model=TaskAccepted,
+    response_model=Union[TaskAccepted, BatchTaskAcceptedResponse],
     responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": DuplicateTaskErrorResponse}, 500: {"model": ErrorResponse}},
     summary="Submit manual analysis for a held portfolio position",
 )
-def analyze_position(symbol: str, request: PortfolioPositionAnalysisRequest) -> TaskAccepted | JSONResponse:
+def analyze_position(
+    symbol: str,
+    request: PortfolioPositionAnalysisRequest,
+    config: Config = Depends(get_config_dep),
+) -> TaskAccepted | BatchTaskAcceptedResponse | JSONResponse:
+    raw_models = request.models or ([request.model] if request.model else [])
+    try:
+        requested_models = validate_analysis_models(config, raw_models)
+    except ValueError as exc:
+        raise _bad_request(exc)
+
     service = PortfolioService()
     try:
         context = _resolve_position_analysis_context(service, symbol=symbol, account_id=request.account_id)
@@ -460,8 +479,7 @@ def analyze_position(symbol: str, request: PortfolioPositionAnalysisRequest) -> 
         raise _internal_error("Resolve portfolio position failed", exc)
 
     queue = get_task_queue()
-    accepted, duplicates = queue.submit_tasks_batch(
-        [context["symbol"]],
+    submit_kwargs = dict(
         stock_name=None,
         original_query=context["symbol"],
         selection_source="manual",
@@ -472,7 +490,12 @@ def analyze_position(symbol: str, request: PortfolioPositionAnalysisRequest) -> 
         force_refresh=bool(request.force),
         notify=True,
     )
-    if duplicates:
+    if requested_models:
+        submit_kwargs["models"] = requested_models
+    accepted, duplicates = queue.submit_tasks_batch([context["symbol"]], **submit_kwargs)
+
+    expected_task_count = max(1, len(requested_models))
+    if expected_task_count == 1 and duplicates:
         dup = duplicates[0]
         error_response = DuplicateTaskErrorResponse(
             error="duplicate_task",
@@ -481,15 +504,43 @@ def analyze_position(symbol: str, request: PortfolioPositionAnalysisRequest) -> 
             existing_task_id=dup.existing_task_id,
         )
         return JSONResponse(status_code=409, content=error_response.model_dump())
-    task = accepted[0]
-    response = TaskAccepted(
-        task_id=task.task_id,
-        trace_id=task.trace_id or task.task_id,
-        status="pending",
-        message=f"分析任务已加入队列: {task.stock_code}",
-        analysis_phase=task.analysis_phase,
+    if expected_task_count == 1 and accepted:
+        task = accepted[0]
+        return TaskAccepted(
+            task_id=task.task_id,
+            trace_id=task.trace_id or task.task_id,
+            status="pending",
+            message=f"分析任务已加入队列: {task.stock_code}",
+            analysis_phase=task.analysis_phase,
+            model=getattr(task, "model", None),
+        )
+
+    accepted_items = [
+        BatchTaskAcceptedItem(
+            task_id=task.task_id,
+            trace_id=task.trace_id or task.task_id,
+            stock_code=task.stock_code,
+            status="pending",
+            message=f"分析任务已加入队列: {task.stock_code}",
+            analysis_phase=task.analysis_phase,
+            model=getattr(task, "model", None),
+        )
+        for task in accepted
+    ]
+    duplicate_items = [
+        BatchDuplicateTaskItem(
+            stock_code=dup.stock_code,
+            existing_task_id=dup.existing_task_id,
+            message=str(dup),
+            model=getattr(dup, "model", None),
+        )
+        for dup in duplicates
+    ]
+    return BatchTaskAcceptedResponse(
+        accepted=accepted_items,
+        duplicates=duplicate_items,
+        message=f"已提交 {len(accepted_items)} 个任务，{len(duplicate_items)} 个重复跳过",
     )
-    return response
 
 
 def _resolve_position_analysis_context(
