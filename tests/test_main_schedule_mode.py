@@ -182,6 +182,48 @@ class MainScheduleModeTestCase(unittest.TestCase):
         for call in run_full.call_args_list:
             self.assertEqual(call.args[2], ["002714.SZ", "512480.SH"])
             self.assertTrue(call.kwargs["raise_errors"])
+            # 多模型批次已在冻结后统一分级，单个模型内不再重复分级。
+            self.assertFalse(call.kwargs["apply_tiering"])
+
+    def test_scheduled_multi_model_tiers_once_and_shares_result(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            schedule_multi_model_enabled=True,
+            watchlist_tiering_enabled=True,
+            stock_list=["002714.SZ", "512480.SH", "600519"],
+        )
+        config.refresh_stock_list = MagicMock()
+
+        with patch(
+            "src.services.analysis_model_service.list_analysis_models",
+            return_value=["model-a", "model-b"],
+        ), patch(
+            "src.services.analysis_model_service.build_model_scoped_config",
+            side_effect=[SimpleNamespace(), SimpleNamespace()],
+        ), patch(
+            "main._apply_watchlist_tiering", return_value=["002714.SZ"],
+        ) as tier, patch("main.run_full_analysis", return_value=True) as run_full:
+            self.assertTrue(main.run_scheduled_analysis(config, args))
+
+        tier.assert_called_once_with(config, args, ["002714.SZ", "512480.SH", "600519"])
+        self.assertEqual([call.args[2] for call in run_full.call_args_list], [["002714.SZ"], ["002714.SZ"]])
+
+    def test_apply_watchlist_tiering_respects_switch_force_run_and_errors(self) -> None:
+        codes = ["002714.SZ", "600519"]
+        enabled = self._make_config(watchlist_tiering_enabled=True)
+        disabled = self._make_config(watchlist_tiering_enabled=False)
+        tiered = SimpleNamespace(to_analyze=["002714.SZ"], skipped=["600519"], reasons={})
+
+        with patch("src.services.watchlist_tiering_service.select_scheduled_codes", return_value=tiered) as select, \
+             patch("src.storage.get_db", return_value=MagicMock()), \
+             patch("data_provider.base.DataFetcherManager", return_value=MagicMock()), \
+             patch("src.repositories.portfolio_repo.PortfolioRepository", return_value=MagicMock()):
+            self.assertEqual(main._apply_watchlist_tiering(enabled, self._make_args(), codes), ["002714.SZ"])
+            self.assertEqual(main._apply_watchlist_tiering(disabled, self._make_args(), codes), codes)
+            self.assertEqual(main._apply_watchlist_tiering(enabled, self._make_args(force_run=True), codes), codes)
+            select.assert_called_once()
+            select.side_effect = RuntimeError("boom")
+            self.assertEqual(main._apply_watchlist_tiering(enabled, self._make_args(), codes), codes)
 
     def test_scheduled_single_model_mode_keeps_legacy_execution(self) -> None:
         args = self._make_args(schedule=True)
@@ -196,6 +238,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
             args,
             ["002714.SZ"],
             raise_errors=True,
+            apply_tiering=True,
         )
 
     def test_paper_monitor_runs_once_after_complete_multi_model_batch(self) -> None:
@@ -1091,7 +1134,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
         self.assertEqual(evening_task["active_time_end"], "23:59:59")
         self.assertEqual(evening_task["active_timezone"], "Asia/Shanghai")
         self.assertEqual(evening_task["lease_task_name"], "market_opportunity_evening_run")
-        run_full_analysis.assert_called_once_with(config, args, None, raise_errors=True)
+        run_full_analysis.assert_called_once_with(config, args, None, raise_errors=True, apply_tiering=True)
         warning_log.assert_any_call(
             "定时模式下检测到 --stocks 参数；计划执行将忽略启动时股票快照，并在每次运行前重新读取最新的 STOCK_LIST。"
         )
@@ -1146,7 +1189,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
             scheduled_call,
             {"schedule_time": "18:00", "shared_lease_enabled": True, "resolved_schedule_time": "09:30"},
         )
-        run_full_analysis.assert_called_once_with(runtime_config, args, None, raise_errors=True)
+        run_full_analysis.assert_called_once_with(runtime_config, args, None, raise_errors=True, apply_tiering=True)
 
     def test_schedule_mode_registers_event_monitor_background_task(self) -> None:
         args = self._make_args(schedule=True)
@@ -1374,7 +1417,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         start_bots.assert_not_called()
-        run_full_analysis.assert_called_once_with(config, args, None, raise_errors=True)
+        run_full_analysis.assert_called_once_with(config, args, None, raise_errors=True, apply_tiering=True)
         self.assertEqual(scheduled_call["schedule_time"], "18:00")
         self.assertEqual(scheduled_call["run_immediately"], True)
         self.assertEqual(scheduled_call["shared_lease_enabled"], True)

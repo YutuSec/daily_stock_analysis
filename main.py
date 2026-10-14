@@ -672,12 +672,47 @@ def _save_reused_market_review_report(
         logger.warning("复用大盘上下文保存大盘复盘报告失败: %s", exc)
 
 
+def _apply_watchlist_tiering(
+    config: Config,
+    args: argparse.Namespace,
+    stock_codes: List[str],
+) -> List[str]:
+    """定时批次的自选分级；关闭、--force-run 或任何异常时保持原列表（fail-open）。"""
+    if (
+        not stock_codes
+        or not getattr(config, "watchlist_tiering_enabled", False)
+        or getattr(args, "force_run", False)
+    ):
+        return stock_codes
+    try:
+        from data_provider.base import DataFetcherManager
+        from src.repositories.portfolio_repo import PortfolioRepository
+        from src.services.watchlist_tiering_service import select_scheduled_codes
+        from src.storage import get_db
+
+        db = get_db()
+        result = select_scheduled_codes(
+            list(stock_codes),
+            config=config,
+            db=db,
+            fetcher_manager=DataFetcherManager(),
+            portfolio_repo=PortfolioRepository(db),
+        )
+        for code in result.skipped:
+            logger.info("自选分级跳过: %s（未到刷新间隔且无异动）", code)
+        return result.to_analyze
+    except Exception as exc:
+        logger.warning("自选分级异常(fail-open，保持全量分析): %s", exc)
+        return stock_codes
+
+
 def run_full_analysis(
     config: Config,
     args: argparse.Namespace,
     stock_codes: Optional[List[str]] = None,
     *,
     raise_errors: bool = False,
+    apply_tiering: bool = False,
 ) -> bool:
     """
     执行完整的分析流程（个股 + 大盘复盘）
@@ -710,6 +745,10 @@ def run_full_analysis(
             skipped = set(effective_codes) - set(filtered_codes)
             logger.info("今日休市股票已跳过: %s", skipped)
         stock_codes = filtered_codes
+
+        # 自选股分级：仅定时批次生效，按持仓/计划、刷新间隔和异动降频
+        if apply_tiering:
+            stock_codes = _apply_watchlist_tiering(config, args, stock_codes)
 
         # 命令行参数 --single-notify 覆盖配置（#55）
         if getattr(args, 'single_notify', False):
@@ -1351,6 +1390,12 @@ def run_scheduled_analysis(
         failures.append(f"analysis_setup: {exc}")
         logger.exception("定时分析准备失败")
 
+    # 多模型批次冻结股票后只做一次自选分级，保证每个模型拿到同一批股票；
+    # 单模型批次在 run_full_analysis 内（热读取 STOCK_LIST 与交易日过滤之后）分级。
+    multi_model = bool(getattr(config, "schedule_multi_model_enabled", False))
+    if multi_model and scheduled_stock_codes:
+        scheduled_stock_codes = _apply_watchlist_tiering(config, args, scheduled_stock_codes)
+
     for model in models:
         try:
             scoped_config = build_model_scoped_config(config, model) if model else config
@@ -1363,6 +1408,7 @@ def run_scheduled_analysis(
                 args,
                 scheduled_stock_codes,
                 raise_errors=True,
+                apply_tiering=not multi_model,
             )
             if not succeeded:
                 failures.append(f"{model or 'default_model'}: analysis_unsuccessful (reported failure)")
@@ -1865,7 +1911,7 @@ def main() -> int:
             schedule_times_provider = _build_schedule_times_provider(config.schedule_time)
 
             def _run_full_analysis_raising(task_config, task_args, task_stock_codes):
-                return run_full_analysis(task_config, task_args, task_stock_codes, raise_errors=True)
+                return run_full_analysis(task_config, task_args, task_stock_codes, raise_errors=True, apply_tiering=True)
 
             def scheduled_task():
                 runtime_config = _reload_runtime_config()

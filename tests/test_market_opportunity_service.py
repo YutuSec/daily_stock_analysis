@@ -3109,11 +3109,11 @@ def test_manual_risk_off_analysis_creates_only_budgeted_research_jobs(isolated_d
         'id': 1, 'market': 'cn', 'trade_date': '2026-08-31', 'market_regime': 'risk_off',
         'run_key': 'market-opportunity:1:paper:opportunity-policy-v4',
         'candidates': [
-            {'id': 11, 'candidate_key': 'cn:sh:600001', 'status': 'selected'},
-            {'id': 12, 'candidate_key': 'cn:sh:600002', 'status': 'selected'},
-            {'id': 13, 'candidate_key': 'cn:sh:600003', 'status': 'selected'},
+            {'id': 11, 'candidate_key': 'cn:sh:600001', 'status': 'selected', 'score': 90},
+            {'id': 12, 'candidate_key': 'cn:sh:600002', 'status': 'selected', 'score': 88},
+            {'id': 13, 'candidate_key': 'cn:sh:600003', 'status': 'selected', 'score': 95},
         ],
-        # 已有任务的候选不再重复建任务。
+        # 已有任务的候选不再重复建任务；红灯限量按整轮计，600003 已占一个名额。
         'analysis_jobs': [{'candidate_id': 13, 'status': 'completed'}],
     }
     repo.research_budget_usage.return_value = {
@@ -3642,7 +3642,12 @@ def test_scheduler_separates_research_failure_watch_success_budget_and_no_candid
     repo = MarketOpportunityRepository(isolated_db)
     # 600002 由模型给出观望，情绪分落在买入区间也不得被改写为买入；600003 调用失败。
     writer = _ResearchReportWriter(isolated_db, advice_by_code={"600002.SH": "观望"}, fail_codes={"600003.SH"})
-    service = _research_service(isolated_db, repo, writer, market_opportunity_research_daily_llm_budget=3)
+    # 本用例验证结果分类与预算，红灯限量放宽到 3 只以免干扰。
+    service = _research_service(
+        isolated_db, repo, writer,
+        market_opportunity_research_daily_llm_budget=3,
+        market_opportunity_risk_off_max_candidates=3,
+    )
 
     with patch(_HISTORY_REFRESH, return_value={"status": "skipped"}), patch(_ANALYSIS_MODELS, return_value=["model-a"]):
         _enter_research_session(service, isolated_db, day1, candidates=[
@@ -3844,3 +3849,108 @@ def test_research_reuse_is_same_session_research_only_and_ignores_selection_drif
     # 主账户候选仍要求完全相同的选股证据，且永不复用研究报告。
     paper_report = lookup("paper_candidate")
     assert paper_report is not None and paper_report != review_report
+
+
+def test_risk_off_research_shortlist_keeps_top_scores_above_floor():
+    service = MarketOpportunityService(config=_service_config(
+        market_opportunity_risk_off_max_candidates=2,
+        market_opportunity_risk_off_min_score=80,
+    ))
+    policy = service._policy()
+    rows = [
+        {'candidate_key': 'cn:sh:600001', 'status': 'selected', 'score': 85, 'rejection_reasons': []},
+        {'candidate_key': 'cn:sh:600002', 'status': 'selected', 'score': 95, 'rejection_reasons': []},
+        {'candidate_key': 'cn:sh:600003', 'status': 'selected', 'score': 90, 'rejection_reasons': []},
+        {'candidate_key': 'cn:sh:600004', 'status': 'selected', 'score': 79.9, 'rejection_reasons': []},
+        {'candidate_key': 'cn:sh:600005', 'status': 'observing', 'score': 99, 'rejection_reasons': []},
+    ]
+
+    result = service._risk_off_research_shortlist(rows, policy=policy)
+
+    status = {row['candidate_key']: row['status'] for row in result}
+    assert status == {
+        'cn:sh:600001': 'observing',
+        'cn:sh:600002': 'selected',
+        'cn:sh:600003': 'selected',
+        'cn:sh:600004': 'observing',
+        # 原本就是观察的候选不会被提升。
+        'cn:sh:600005': 'observing',
+    }
+    capped = {row['candidate_key'] for row in result if 'risk_off_research_cap' in row['rejection_reasons']}
+    assert capped == {'cn:sh:600001', 'cn:sh:600004'}
+    # 输入不被原地修改，顺序保持不变。
+    assert rows[0]['status'] == 'selected'
+    assert [row['candidate_key'] for row in result] == [row['candidate_key'] for row in rows]
+
+
+def test_risk_off_research_shortlist_zero_cap_selects_nothing():
+    service = MarketOpportunityService(config=_service_config(market_opportunity_risk_off_max_candidates=0))
+    rows = [{'candidate_key': 'cn:sh:600001', 'status': 'selected', 'score': 99, 'rejection_reasons': []}]
+
+    result = service._risk_off_research_shortlist(rows, policy=service._policy())
+
+    assert result[0]['status'] == 'observing'
+
+
+@pytest.mark.parametrize(("max_candidates", "expected_selected"), [
+    (2, {"600001", "600002"}),
+    (0, set()),
+])
+def test_risk_off_discovery_caps_research_candidates(isolated_db, max_candidates, expected_selected):
+    day = date(2026, 9, 7)
+    repo = MarketOpportunityRepository(isolated_db)
+    service = _research_service(
+        isolated_db, repo, _ResearchReportWriter(isolated_db),
+        market_opportunity_risk_off_max_candidates=max_candidates,
+        market_opportunity_risk_off_min_score=80,
+    )
+    candidates = [
+        _research_candidate_row(day, "600001", score=95),
+        _research_candidate_row(day, "600002", score=85),
+        _research_candidate_row(day, "600003", score=78),
+    ]
+
+    with patch(_ANALYSIS_MODELS, return_value=["model-a"]):
+        _enter_research_session(service, isolated_db, day, candidates=candidates)
+        result = service.discover_from_latest_market_review(market="cn")
+
+    detail = repo.get_run_detail(int(result["run_id"]))
+    selected = {row["stock_code"] for row in detail["candidates"] if row["status"] == "selected"}
+    assert selected == expected_selected
+    job_codes = {
+        row["stock_code"]
+        for row in detail["candidates"]
+        for job in detail["analysis_jobs"]
+        if job.get("candidate_id") == row["id"]
+    }
+    assert job_codes == expected_selected
+    assert all(job["job_key"].startswith("market-opportunity-research:initial:") for job in detail["analysis_jobs"])
+    capped = {
+        row["stock_code"] for row in detail["candidates"]
+        if "risk_off_research_cap" in (row.get("rejection_reasons") or [])
+    }
+    assert capped == {"600001", "600002", "600003"} - expected_selected
+    snapshot = detail["config_snapshot"]
+    assert snapshot["risk_off_max_candidates"] == max_candidates
+    assert snapshot["risk_off_min_score"] == 80
+
+
+def test_normal_day_discovery_ignores_risk_off_cap(isolated_db):
+    day = date(2026, 9, 7)
+    repo = MarketOpportunityRepository(isolated_db)
+    service = _research_service(
+        isolated_db, repo, _ResearchReportWriter(isolated_db),
+        market_opportunity_risk_off_max_candidates=0,
+        market_opportunity_risk_off_min_score=100,
+    )
+
+    with patch(_ANALYSIS_MODELS, return_value=["model-a"]):
+        _enter_research_session(
+            service, isolated_db, day, regime="normal",
+            candidates=[_research_candidate_row(day, "600001", score=75)],
+        )
+        result = service.discover_from_latest_market_review(market="cn")
+
+    detail = repo.get_run_detail(int(result["run_id"]))
+    assert [row["status"] for row in detail["candidates"]] == ["selected"]
+    assert len(detail["analysis_jobs"]) == 1

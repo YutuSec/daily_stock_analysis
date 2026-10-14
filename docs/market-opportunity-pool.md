@@ -60,6 +60,8 @@ MARKET_OPPORTUNITY_RUN_TIME=
 
 `MARKET_OPPORTUNITY_RESEARCH_DAILY_LLM_BUDGET=16` 是红灯研究每个市场、每个交易日的模型调用总上限，首次研究、次日复核和每次重试共用；实际生效值取它与 `MARKET_OPPORTUNITY_MAX_LLM_CALLS_PER_RUN` 中更小者。设为 `0` 会停止全部研究调用，不影响板块快照和观察证据采集；不配置时按 16 运行。
 
+红灯日还会收紧研究入选：`MARKET_OPPORTUNITY_RISK_OFF_MAX_CANDIDATES=2` 是每轮最多送研究分析的候选数，`MARKET_OPPORTUNITY_RISK_OFF_MIN_SCORE=80` 是红灯日入选分数下限（普通日仍为 70）。只保留分数达标的前 N 只，其余降为观察并记录 `risk_off_research_cap`；手动重新触发分析时已分析过的候选也占名额，不会突破上限。设为 `0` 时红灯日不送 LLM，仍照常采集观察证据。两项都只作用于 `risk_off`，绿灯、黄灯日不受影响；运行配置快照会记录本轮生效值。
+
 模型列表不在机会池里单独配置，运行时读取系统实际启用模型。候选预算会随模型数收缩，避免新增模型后只分析部分模型。候选列表的模型筛选仅选择展示哪个模型的任务与无计划原因；尚未创建该模型任务的候选仍保留，显示 `missing / job_not_created`。分页总数按候选计，不按任务行数计，其他模型任务不会混入当前筛选。
 
 ## 策略 v3 观察框架与 v4 评分修正

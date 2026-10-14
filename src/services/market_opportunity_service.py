@@ -96,6 +96,8 @@ class OpportunityPolicy:
     discovery_max_themes: int = 15
     max_observation_candidates: int = 30
     research_daily_llm_budget: int = 16
+    risk_off_max_candidates: int = 2
+    risk_off_min_score: int = 80
 
 
 @lru_cache(maxsize=1)
@@ -922,6 +924,10 @@ class MarketOpportunityService:
         research_allowed = bool(
             policy.mode == "paper" and observe_gate.get("completed") and regime_name == "risk_off"
         )
+        if regime_name == "risk_off":
+            # 红灯日收紧研究入选数量与分数门槛；落选者保留为观察。
+            candidate_rows = self._risk_off_research_shortlist(candidate_rows, policy=policy)
+            selected_candidate_count = sum(1 for item in candidate_rows if item.get("status") == "selected")
         models = list_analysis_models(self.config) if (analysis_allowed or research_allowed) else []
         if analysis_allowed and not models:
             return self._persist_blocked_run(
@@ -1125,8 +1131,13 @@ class MarketOpportunityService:
                 for job in detail.get("analysis_jobs") or []
                 if job.get("candidate_id") is not None
             }
+            # 红灯限量按整轮候选计算，已分析过的也占名额，手动重复触发不会突破上限。
+            shortlisted = self._risk_off_research_shortlist(
+                list(detail.get("candidates") or []),
+                policy=policy,
+            )
             pending_candidates = [
-                item for item in detail.get("candidates") or []
+                item for item in shortlisted
                 if item.get("status") == "selected" and int(item.get("id") or 0) not in analyzed_candidate_ids
             ]
             research = self._research_budget_state(
@@ -1945,6 +1956,8 @@ class MarketOpportunityService:
             blacklist=policy.blacklist,
             observe_gate_days=policy.observe_gate_days,
             research_daily_llm_budget=policy.research_daily_llm_budget,
+            risk_off_max_candidates=policy.risk_off_max_candidates,
+            risk_off_min_score=policy.risk_off_min_score,
         )
         return self._observe_gate_status(market=market, as_of=as_of, policy=paper_policy)
 
@@ -2202,6 +2215,10 @@ class MarketOpportunityService:
         llm_budget = 16 if raw_llm_budget is None else int(raw_llm_budget)
         raw_research_budget = getattr(self.config, "market_opportunity_research_daily_llm_budget", 16)
         research_budget = 16 if raw_research_budget is None else int(raw_research_budget)
+        raw_risk_off_max = getattr(self.config, "market_opportunity_risk_off_max_candidates", 2)
+        risk_off_max = 2 if raw_risk_off_max is None else int(raw_risk_off_max)
+        raw_risk_off_score = getattr(self.config, "market_opportunity_risk_off_min_score", 80)
+        risk_off_score = 80 if raw_risk_off_score is None else int(raw_risk_off_score)
         return OpportunityPolicy(
             mode=mode,
             mode_source=effective_mode.source,
@@ -2230,6 +2247,8 @@ class MarketOpportunityService:
             ),
             observe_gate_days=max(0, int(getattr(self.config, "market_opportunity_observe_gate_days", 3) or 0)),
             research_daily_llm_budget=max(0, research_budget),
+            risk_off_max_candidates=max(0, risk_off_max),
+            risk_off_min_score=max(0, min(100, risk_off_score)),
         )
 
     @staticmethod
@@ -3526,6 +3545,35 @@ class MarketOpportunityService:
             "block_reason": block_reason,
         }
 
+    @staticmethod
+    def _risk_off_research_shortlist(
+        candidates: List[Dict[str, Any]],
+        *,
+        policy: OpportunityPolicy,
+    ) -> List[Dict[str, Any]]:
+        """红灯日收紧研究入选：只保留分数达标的前 N 只 selected，其余降为 observing。
+
+        研究预算账本仍是调用时的硬上限；这里只减少红灯日送 LLM 的候选。
+        """
+
+        max_count = max(0, int(policy.risk_off_max_candidates))
+        min_score = float(policy.risk_off_min_score)
+        ranked_selected = sorted(
+            (row for row in candidates if row.get("status") == "selected"),
+            key=lambda row: (-float(row.get("score") or 0), str(row.get("candidate_key") or "")),
+        )
+        eligible = [row for row in ranked_selected if float(row.get("score") or 0) >= min_score]
+        kept_keys = {row["candidate_key"] for row in eligible[:max_count]}
+        result: List[Dict[str, Any]] = []
+        for item in candidates:
+            row = item
+            if item.get("status") == "selected" and item["candidate_key"] not in kept_keys:
+                row = dict(item)
+                row["status"] = "observing"
+                row["rejection_reasons"] = list(item.get("rejection_reasons") or []) + ["risk_off_research_cap"]
+            result.append(row)
+        return result
+
     def _build_research_jobs(
         self,
         *,
@@ -4640,6 +4688,8 @@ class MarketOpportunityService:
             "max_observation_candidates": policy.max_observation_candidates,
             "max_llm_calls_per_run": policy.max_llm_calls_per_run,
             "research_daily_llm_budget": policy.research_daily_llm_budget,
+            "risk_off_max_candidates": policy.risk_off_max_candidates,
+            "risk_off_min_score": policy.risk_off_min_score,
             "min_20d_avg_amount_cny": policy.min_20d_avg_amount_cny,
             "observe_gate_days": policy.observe_gate_days,
             "board_discovery_policy_version": BOARD_DISCOVERY_POLICY_VERSION,

@@ -670,6 +670,17 @@ crontab -e
 
 > Single-model and multi-model scheduled batches independently attempt opportunity recovery and the end-of-day paper monitor even when analysis fails. One failed stage does not skip the other or delete saved reports; failures are aggregated after all stages have been attempted. Intraday/opening-confirmation service exceptions also reach scheduler failure state instead of advancing success timestamps. Closed sessions, no eligible objects, and no triggered fills are not errors.
 
+### Watchlist Tiering
+
+Off by default (`WATCHLIST_TIERING_ENABLED=false`), so scheduled batches still analyze the whole watchlist. When enabled, a scheduled batch decides each watchlist stock after trading-day filtering:
+
+1. Real holdings, open paper positions, or active paper plans: always analyzed (paper plans are valid for one session and must be refreshed daily).
+2. Never analyzed, or at least `WATCHLIST_REFRESH_TRADING_DAYS` (default 3) trading days since the last analysis: analyzed.
+3. Realtime absolute change ≥ `WATCHLIST_ANOMALY_PCT_CHG` (default 4%) or volume ratio ≥ `WATCHLIST_ANOMALY_VOLUME_RATIO` (default 2): analyzed.
+4. Otherwise: skipped for this batch and logged.
+
+ETFs use the same rules as stocks. If a history, holdings, or quote lookup fails, the stock is analyzed (fail-open). Skipped stocks do not count as batch failures. Multi-model batches tier once and every model gets the same list. Only scheduled batches are affected: CLI `--stocks`, one-off runs, Web/API manual analysis, and `--force-run` are not tiered. All four settings are editable under System in Web settings and apply to the next scheduled batch.
+
 ### Market Phase Baseline (Issue #1386 P0)
 
 Scheduled trading-day filtering recognizes numeric CN symbols and SH/SZ/SS/BJ prefixes, dotted prefixes and suffixes (for example `SZ159915`, `SH.513980`, `002714.SZ`). This only identifies the market: watchlist identifiers are preserved and instruments from different exchanges are not merged. Closed-session stocks are skipped without new stock reports or notifications. Explicit `--force-run` and disabled trading-day checks retain their existing behavior.

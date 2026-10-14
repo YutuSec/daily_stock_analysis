@@ -1210,6 +1210,9 @@ class Config:
     market_opportunity_blacklist: List[str] = field(default_factory=list)
     market_opportunity_observe_gate_days: int = 3
     market_opportunity_research_daily_llm_budget: int = 16
+    # 红灯日最多送研究分析的候选数（0=红灯日不送 LLM）与入选分数下限
+    market_opportunity_risk_off_max_candidates: int = 2
+    market_opportunity_risk_off_min_score: int = 80
     # 机会池专用交易风格；空串表示沿用 PAPER_TRADING_STYLE。驱动机会池筛选与其触发的个股分析，
     # 机会池来源的模拟计划冻结该风格；不改变主账户基础风格、自选股计划和现有持仓。
     market_opportunity_style: str = ""
@@ -1243,6 +1246,16 @@ class Config:
     market_review_color_scheme: str = "green_up"
     # 交易日检查：默认启用，非交易日跳过执行；设为 false 或 --force-run 可强制执行（Issue #373）
     trading_day_check_enabled: bool = True
+
+    # === 自选股分级分析 ===
+    # 启用后，定时分析会对自选股分级：持仓/计划必分析，其余按间隔和异动触发
+    watchlist_tiering_enabled: bool = False
+    # 普通自选的最长分析间隔（交易日）
+    watchlist_refresh_trading_days: int = 3
+    # 涨跌幅异动阈值（%），绝对值超过此值触发分析
+    watchlist_anomaly_pct_chg: float = 4.0
+    # 量比异动阈值，超过此值触发分析
+    watchlist_anomaly_volume_ratio: float = 2.0
 
     # === 实时行情增强数据配置 ===
     # 实时行情开关（关闭后使用历史收盘价进行分析）
@@ -2588,6 +2601,28 @@ class Config:
                 minimum=0,
                 maximum=200,
             ),
+            market_opportunity_risk_off_max_candidates=parse_env_int(
+                cls._resolve_env_value(
+                    'MARKET_OPPORTUNITY_RISK_OFF_MAX_CANDIDATES',
+                    default='2',
+                    prefer_env_file=True,
+                ),
+                2,
+                field_name='MARKET_OPPORTUNITY_RISK_OFF_MAX_CANDIDATES',
+                minimum=0,
+                maximum=50,
+            ),
+            market_opportunity_risk_off_min_score=parse_env_int(
+                cls._resolve_env_value(
+                    'MARKET_OPPORTUNITY_RISK_OFF_MIN_SCORE',
+                    default='80',
+                    prefer_env_file=True,
+                ),
+                80,
+                field_name='MARKET_OPPORTUNITY_RISK_OFF_MIN_SCORE',
+                minimum=0,
+                maximum=100,
+            ),
             market_opportunity_style=normalize_market_opportunity_style(
                 cls._resolve_env_value(
                     'MARKET_OPPORTUNITY_STYLE',
@@ -2640,6 +2675,10 @@ class Config:
                 os.getenv('MARKET_REVIEW_COLOR_SCHEME', 'green_up')
             ),
             trading_day_check_enabled=os.getenv('TRADING_DAY_CHECK_ENABLED', 'true').lower() != 'false',
+            watchlist_tiering_enabled=os.getenv('WATCHLIST_TIERING_ENABLED', 'false').lower() == 'true',
+            watchlist_refresh_trading_days=parse_env_int(os.getenv('WATCHLIST_REFRESH_TRADING_DAYS'), 3, field_name='WATCHLIST_REFRESH_TRADING_DAYS', minimum=1),
+            watchlist_anomaly_pct_chg=parse_env_float(os.getenv('WATCHLIST_ANOMALY_PCT_CHG'), 4.0, field_name='WATCHLIST_ANOMALY_PCT_CHG', minimum=0.0),
+            watchlist_anomaly_volume_ratio=parse_env_float(os.getenv('WATCHLIST_ANOMALY_VOLUME_RATIO'), 2.0, field_name='WATCHLIST_ANOMALY_VOLUME_RATIO', minimum=0.0),
             webui_enabled=os.getenv('WEBUI_ENABLED', 'false').lower() == 'true',
             webui_host=os.getenv('WEBUI_HOST', '127.0.0.1'),
             webui_port=parse_env_int(os.getenv('WEBUI_PORT'), 8000, field_name='WEBUI_PORT', minimum=1, maximum=65535),

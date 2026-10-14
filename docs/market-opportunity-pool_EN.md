@@ -60,6 +60,8 @@ Like `MARKET_OPPORTUNITY_STYLE`, this key can be changed on the Web settings pag
 
 `MARKET_OPPORTUNITY_RESEARCH_DAILY_LLM_BUDGET=16` caps red-light research model calls per market and trading session. Initial research, next-session reviews, and every retry share it, and the effective cap is the smaller of this value and `MARKET_OPPORTUNITY_MAX_LLM_CALLS_PER_RUN`. `0` stops all research calls without affecting board snapshots or observation evidence; when unset, the cap is 16.
 
+Red-light days also tighten research selection: `MARKET_OPPORTUNITY_RISK_OFF_MAX_CANDIDATES=2` caps candidates sent to research per run, and `MARKET_OPPORTUNITY_RISK_OFF_MIN_SCORE=80` is the red-light score floor (normal days keep 70). Only the top N candidates at or above the floor are kept; the rest become observing with `risk_off_research_cap`. On a manual re-analyze, already analyzed candidates still count toward the cap. `0` sends nothing to the LLM on red-light days while observation evidence is still collected. Both settings apply only to `risk_off`; the run config snapshot records the effective values.
+
 Model names are not duplicated in this feature. Runtime uses the actually configured model registry. Candidate capacity should shrink as model count grows so that adding a model does not silently skip that model for some candidates.
 
 ## Strategy v3 observation framework and v4 scoring correction

@@ -468,6 +468,10 @@ daily_stock_analysis/
 | `MARKET_REVIEW_REGION` | 大盘复盘市场区域：cn(A股)、hk(港股)、us(美股)、jp(日股)、kr(韩股)、both(五市场)，us/jp/kr 适合仅关注单区域用户 | `cn` |
 | `MARKET_REVIEW_COLOR_SCHEME` | 大盘复盘指数涨跌颜色：`green_up`=绿涨红跌（默认），`red_up`=红涨绿跌 | `green_up` |
 | `TRADING_DAY_CHECK_ENABLED` | 交易日检查：默认 `true`，非交易日跳过执行；设为 `false` 或使用 `--force-run` 可强制执行（Issue #373） | `true` |
+| `WATCHLIST_TIERING_ENABLED` | 自选分级分析：定时批次中持仓/计划必分析，其余按刷新间隔和异动触发，见[自选分级分析](#自选分级分析) | `false` |
+| `WATCHLIST_REFRESH_TRADING_DAYS` | 普通自选的最长分析间隔（交易日） | `3` |
+| `WATCHLIST_ANOMALY_PCT_CHG` | 涨跌幅异动阈值（%，取绝对值） | `4` |
+| `WATCHLIST_ANOMALY_VOLUME_RATIO` | 量比异动阈值 | `2` |
 | `SCHEDULE_ENABLED` | 启用定时任务 | `false` |
 | `SCHEDULE_TIME` | 定时执行时间 | `18:00` |
 | `SCHEDULE_TIMES` | 多个定时执行时间，逗号分隔；为空时使用 `SCHEDULE_TIME` | 空 |
@@ -809,6 +813,19 @@ docker run -e SCHEDULE_ENABLED=true -e SCHEDULE_RUN_IMMEDIATELY=false ...
 交易日证据缺失、依赖未安装或查询异常时，不再默认放行；定时分析记录失败，日志标明 `calendar_unavailable`。只检查本次股票和大盘涉及的市场，避免其他市场日历故障影响本次任务。无法识别所属市场的代码也不自动放行。人工研究可显式使用上述覆盖方式。
 
 定时批次中部分股票失败时，已成功报告仍保存，但整批记录失败；CLI、Web 调度和后台回调的失败返回均不会推进成功时间。共享租约记录失败并释放运行状态，后续定时任务仍可执行；这不等于自动重试或补发通知。
+
+#### 自选分级分析
+
+默认关闭（`WATCHLIST_TIERING_ENABLED=false`），定时批次照旧分析全部自选。开启后，定时批次在交易日过滤之后按以下顺序决定每只自选是否分析：
+
+1. 有真实持仓、模拟持仓或 active 模拟计划：每天必分析（模拟计划只对一个交易日有效，必须每日刷新）。
+2. 从未分析过，或距上次分析已满 `WATCHLIST_REFRESH_TRADING_DAYS`（默认 3）个交易日：分析。
+3. 实时涨跌幅绝对值 ≥ `WATCHLIST_ANOMALY_PCT_CHG`（默认 4%）或量比 ≥ `WATCHLIST_ANOMALY_VOLUME_RATIO`（默认 2）：分析。
+4. 以上都不满足：本批次跳过，日志记录 `自选分级跳过`。
+
+ETF 与个股使用同一套规则。分析历史、持仓、行情任一查询失败时该股票照常分析（fail-open），不会因数据源问题漏掉股票。被跳过的股票不计入批次失败。多模型批次只分级一次，所有模型拿到同一批股票。
+
+只影响定时批次：CLI `--stocks`、单次运行、Web/API 手动分析和 `--force-run` 均不分级。四个配置都可在 Web 设置页「系统」分类修改，下一次定时批次生效。
 
 #### 市场阶段基线（Issue #1386 P0）
 
