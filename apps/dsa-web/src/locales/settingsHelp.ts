@@ -1301,6 +1301,7 @@ const settingsHelpZhCN: SettingsHelpMap = {
     summary: '为不同类型的通知指定目标推送渠道。',
     usage: '三个路由字段分别控制报告推送、告警推送和系统错误推送的目标渠道。使用英文逗号分隔渠道名；留空则推送到所有已配置渠道。',
     valueNotes: [
+      'REPORT_NOTIFY_ENABLED=false 关闭全部报告推送（个股、聚合日报、大盘复盘、合并推送），报告仍保存；模拟交易的开仓、待平仓、平仓飞书提醒由 PAPER_TRADING_FEISHU_NOTIFY 单独控制。',
       'NOTIFICATION_REPORT_CHANNELS 控制日常分析报告推送渠道。',
       'NOTIFICATION_ALERT_CHANNELS 控制事件告警推送渠道。',
       'NOTIFICATION_SYSTEM_ERROR_CHANNELS 控制系统错误推送渠道。',
@@ -2656,6 +2657,7 @@ const settingsHelpEnUS: SettingsHelpMap = {
     summary: 'Specifies target push channels for different notification types.',
     usage: 'Three routing fields control the target channels for report pushes, alert pushes, and system error pushes. Use comma-separated channel names. Leave empty to push to all configured channels.',
     valueNotes: [
+      'REPORT_NOTIFY_ENABLED=false turns off all report pushes (single-stock, aggregate, market review, merged); reports are still saved. Paper trading Feishu reminders for open, pending exit, and close are controlled separately by PAPER_TRADING_FEISHU_NOTIFY.',
       'NOTIFICATION_REPORT_CHANNELS controls daily analysis report delivery.',
       'NOTIFICATION_ALERT_CHANNELS controls event alert delivery.',
       'NOTIFICATION_SYSTEM_ERROR_CHANNELS controls system error delivery.',

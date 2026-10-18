@@ -3797,6 +3797,10 @@ class StockAnalysisPipeline:
         fallback_code: Optional[str] = None,
     ) -> None:
         """发送单股通知，供直接单股入口和批量串行推送共用。"""
+        if getattr(getattr(self, "config", None), "report_notify_enabled", True) is False:
+            logger.info("报告推送已关闭（REPORT_NOTIFY_ENABLED=false），跳过单股推送")
+            record_notification_run(channel="report", status="skipped", success=False, attempts=0)
+            return
         if not self.notifier.is_available():
             notification_run = self._build_notification_run_snapshot(
                 channel="report",
@@ -3928,7 +3932,10 @@ class StockAnalysisPipeline:
             logger.info("生成决策仪表盘日报...")
             report = self._generate_aggregate_report(results, report_type)
             
-            # 跳过推送（单股推送模式 / 合并模式：报告已由 _save_local_report 保存）
+            # 跳过推送（单股推送模式 / 合并模式 / REPORT_NOTIFY_ENABLED=false：报告已由 _save_local_report 保存）
+            if getattr(getattr(self, "config", None), "report_notify_enabled", True) is False and not skip_push:
+                logger.info("报告推送已关闭（REPORT_NOTIFY_ENABLED=false），仅保存报告不推送")
+                skip_push = True
             if skip_push:
                 notification_run = self._build_notification_run_snapshot(
                     channel="report",

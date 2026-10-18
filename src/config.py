@@ -1077,6 +1077,9 @@ class Config:
     astrbot_token: Optional[str] = None
     astrbot_url: Optional[str] = None
 
+    # 报告类推送总开关：false 时个股/大盘/合并报告不推送到静态渠道（报告仍保存）；
+    # 模拟交易提醒走独立通道，不受影响。
+    report_notify_enabled: bool = True
     # 通知路由策略（Issue #1200 P3）：留空表示该类型使用全部已配置渠道
     notification_report_channels: List[str] = field(default_factory=list)
     notification_alert_channels: List[str] = field(default_factory=list)
@@ -2108,6 +2111,14 @@ class Config:
             slack_channel_id=os.getenv('SLACK_CHANNEL_ID'),
             astrbot_url=os.getenv('ASTRBOT_URL'),
             astrbot_token=os.getenv('ASTRBOT_TOKEN'),
+            report_notify_enabled=parse_env_bool(
+                cls._resolve_env_value(
+                    'REPORT_NOTIFY_ENABLED',
+                    default='true',
+                    prefer_env_file=True,
+                ),
+                True,
+            ),
             notification_report_channels=parse_notification_route_channels(
                 os.getenv('NOTIFICATION_REPORT_CHANNELS')
             ),

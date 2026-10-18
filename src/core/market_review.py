@@ -358,6 +358,21 @@ def run_market_review(
                     success=False,
                     attempts=0,
                 )
+            elif send_notification and getattr(get_config(), "report_notify_enabled", True) is False:
+                logger.info(
+                    "[MarketReview] component=market_review action=skip_notification "
+                    "reason=report_notify_disabled trigger_source=%s query_id=%s region=%s",
+                    trigger_source,
+                    history_query_id,
+                    persist_region,
+                )
+                _record_market_review_notification_run(
+                    query_id=history_query_id,
+                    channel="report",
+                    status="skipped",
+                    success=False,
+                    attempts=0,
+                )
             elif send_notification and notifier.is_available():
                 # 添加标题
                 report_content = _render_market_review_payload_markdown(

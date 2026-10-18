@@ -892,6 +892,7 @@ def run_full_analysis(
                     market_context_generated_during_stock
                     and not merge_notification
                     and not args.no_notify
+                    and getattr(config, "report_notify_enabled", True) is not False
                     and pipeline.notifier.is_available()
                 ):
                     if pipeline.notifier.send(
@@ -950,7 +951,8 @@ def run_full_analysis(
                 market_report = market_context_full_report or market_context_summary
 
         # Issue #190: 合并推送（个股+大盘复盘）
-        if merge_notification and (results or market_report) and not args.no_notify:
+        report_notify_enabled = getattr(config, "report_notify_enabled", True) is not False
+        if merge_notification and (results or market_report) and not args.no_notify and report_notify_enabled:
             parts = []
             if market_report:
                 parts.append(f"# 📈 大盘复盘\n\n{market_report}")

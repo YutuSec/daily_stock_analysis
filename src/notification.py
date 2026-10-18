@@ -494,6 +494,8 @@ class NotificationService(
         target_channels = list(channels if channels is not None else self._available_channels)
         if route_type is None:
             return target_channels
+        if self.is_report_route_disabled(route_type):
+            return []
 
         route_config = get_notification_route_config(route_type)
         if route_config is None:
@@ -514,6 +516,12 @@ class NotificationService(
 
         allowed = set(valid_channels)
         return [channel for channel in target_channels if channel.value in allowed]
+
+    def is_report_route_disabled(self, route_type: Optional[str]) -> bool:
+        """REPORT_NOTIFY_ENABLED=false 时，report 路由不再推送到任何静态渠道。"""
+        if str(route_type or "").strip().lower() != "report":
+            return False
+        return not bool(getattr(self._config, "report_notify_enabled", True))
 
     def get_channel_names(self) -> str:
         """获取所有已配置渠道的名称"""
@@ -2551,6 +2559,14 @@ class NotificationService(
                     success=True,
                     status="sent",
                     channel_results=[ChannelAttemptResult(channel="__context__", success=True)],
+                )
+            if self.is_report_route_disabled(route_type):
+                logger.info("报告推送已关闭（REPORT_NOTIFY_ENABLED=false），仅保存报告不推送")
+                return NotificationDispatchResult(
+                    dispatched=False,
+                    success=False,
+                    status="disabled",
+                    message="report notifications disabled by REPORT_NOTIFY_ENABLED",
                 )
             logger.warning("通知路由 %s 未命中任何已配置渠道，跳过静态通知渠道", route_type)
             return NotificationDispatchResult(

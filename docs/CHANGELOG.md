@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 报告推送总开关 `REPORT_NOTIFY_ENABLED`（默认 true）：设为 false 时个股、聚合日报、大盘复盘和合并推送只保存不推送，日志记为跳过而非失败；模拟交易开仓、T+1 待平仓、平仓的飞书提醒由 `PAPER_TRADING_FEISHU_NOTIFY` 单独控制，不受影响；同步 `.env.example`、设置帮助与中英文完整指南。
 - [新功能] 自选分级分析：新增 `WATCHLIST_TIERING_ENABLED`（默认关闭）、`WATCHLIST_REFRESH_TRADING_DAYS=3`、`WATCHLIST_ANOMALY_PCT_CHG=4`、`WATCHLIST_ANOMALY_VOLUME_RATIO=2`；开启后定时批次中有真实/模拟持仓或 active 计划的股票每天必分析，其余自选（含 ETF）按交易日刷新间隔或涨跌幅/量比异动触发，查询失败照常分析，跳过的股票不计入批次失败；多模型批次只分级一次；CLI `--stocks`、Web 手动分析与 `--force-run` 不受影响；同步 `.env.example`、设置帮助与中英文完整指南。
 - [改进] 机会池红灯研究限量：新增 `MARKET_OPPORTUNITY_RISK_OFF_MAX_CANDIDATES=2` 与 `MARKET_OPPORTUNITY_RISK_OFF_MIN_SCORE=80`，`risk_off` 日只把分数达标的前 N 只候选送研究分析，其余降为观察（`risk_off_research_cap`），手动重跑不突破上限，设为 0 时红灯日不送 LLM；绿黄灯日行为不变；同步 `.env.example`、设置帮助与中英文机会池文档。
 - [修复] 模拟账户持仓数 `open_position_count` 会在同一次运行里平掉同一股票的多个批次后残留（先平的批次尚未写库，后平的批次误判“仍有同股持仓”而不扣减），导致无持仓时仍占用“最大持仓数”名额：开仓、平仓后改为按未平仓批次重新计数，日终运行开始时先按实际持仓校正一次（结果字段 `open_position_counts_repaired`）；同步中英文模拟交易文档。

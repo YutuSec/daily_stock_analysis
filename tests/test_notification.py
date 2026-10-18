@@ -236,6 +236,28 @@ class TestNotificationServiceSendToMethods(unittest.TestCase):
         mock_custom.assert_not_called()
 
     @mock.patch("src.notification.get_config")
+    def test_report_notify_disabled_skips_report_route_only(self, mock_get_config: mock.MagicMock):
+        cfg = _make_config(
+            custom_webhook_urls=["https://example.com/webhook"],
+            report_notify_enabled=False,
+        )
+        mock_get_config.return_value = cfg
+
+        service = NotificationService()
+
+        with mock.patch.object(service, "send_to_custom", return_value=True) as mock_custom:
+            report = service.send_with_results("content", route_type="report")
+            self.assertEqual(report.status, "disabled")
+            self.assertFalse(report.dispatched)
+            mock_custom.assert_not_called()
+            self.assertEqual(service.get_channels_for_route("report"), [])
+
+            # 告警和未指定路由的推送不受报告开关影响。
+            self.assertTrue(service.send("alert", route_type="alert"))
+            self.assertTrue(service.send("legacy"))
+        self.assertEqual(mock_custom.call_count, 2)
+
+    @mock.patch("src.notification.get_config")
     def test_send_route_empty_keeps_all_configured_channels(self, mock_get_config: mock.MagicMock):
         cfg = _make_config(
             wechat_webhook_url="https://wechat.example/hook",

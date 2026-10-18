@@ -200,6 +200,24 @@ class TestPipelineSingleStockNotify(unittest.TestCase):
         self.assertEqual(calls[1].kwargs["query_id"], "query-1")
         self.assertEqual(calls[1].kwargs["code"], "600519")
 
+    def test_report_notify_disabled_skips_aggregate_and_single_push(self):
+        pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.config = SimpleNamespace(report_notify_enabled=False)
+        pipeline.notifier = MagicMock()
+        pipeline.notifier.is_available.return_value = True
+        pipeline._generate_aggregate_report = MagicMock(return_value="report")
+        pipeline._build_notification_run_snapshot = MagicMock(return_value={})
+        pipeline._refresh_saved_diagnostic_snapshot = MagicMock()
+
+        with patch("src.core.pipeline.record_notification_run") as record:
+            pipeline._send_notifications([_make_result("600519")], ReportType.SIMPLE)
+            pipeline._send_single_stock_notification(_make_result("600519"), ReportType.SIMPLE)
+
+        pipeline.notifier.get_available_channels.assert_not_called()
+        pipeline.notifier.send.assert_not_called()
+        pipeline.notifier.send_to_context.assert_not_called()
+        self.assertTrue(all(call.kwargs.get("status") == "skipped" for call in record.call_args_list))
+
     def test_process_single_stock_direct_path_does_not_notify_when_failed(self):
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
         pipeline.fetch_and_save_stock_data = MagicMock(return_value=(True, None))
